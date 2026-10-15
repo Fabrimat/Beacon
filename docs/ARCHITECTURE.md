@@ -1,0 +1,970 @@
+# Beacon - Architecture
+
+> Status: draft v0.4 (2026-10-15). Working name "Beacon"; npm scope / GitHub org / domain
+> availability not yet verified (`@beaconmc/*`, `beaconmc` used as placeholders).
+> v0.4 folds in a multi-reviewer architecture review: Beacon is fully independent of
+> ModularMC (migration only, no runtime compatibility); routing simplified to three concepts;
+> project trust, sandbox policy, and daemon transport specified; budgets per phase;
+> speculative features moved to [BACKLOG.md](BACKLOG.md).
+
+Beacon is an open-source, AI-oriented toolchain for Minecraft Bedrock and Education Edition
+content: worlds, add-ons, skin packs. It is an independent alternative to the Regolith +
+ModularMC / system_template workflow, with its own simpler project format and a one-time
+migration path from those tools.
+
+---
+
+## 1. Goals and constraints
+
+**Goals**
+
+- One install, one button, for technical and non-technical users alike (at alpha, section 14).
+- **Extremely optimized: low RAM, fast compilation.** Budgets in section 12.
+- One engine, many frontends: desktop app, CLI, VS Code extension, LSP, MCP.
+- AI-oriented: machine-readable everything, MCP as a first-class frontend,
+  compiler-enforced guardrails.
+- Multi-pack output: one project can emit N behavior/resource packs into one `.mcaddon`
+  (or `.mcworld` / `.mctemplate`).
+- Bedrock and Education Edition as first-class targets from the same project.
+- Native compatibility with Mojang's minecraft-debugger.
+
+**Hard constraints**
+
+- **Independent tool.** Beacon never runs, embeds, or emulates ModularMC, system_template, or
+  Regolith at build time. Those formats are inputs to `beacon migrate` only (5.6).
+- Comply with the Bedrock-OSS [project-config-standard](https://github.com/Bedrock-OSS/project-config-standard).
+  Extensions must be non-destructive: never change the type or meaning of an existing field,
+  and keep what other tools expect on disk (e.g. a `manifest.json` in each `packs.*` folder).
+- Open source, vendor-neutral: no company branding, templates, or internal filters.
+- No fork of VS Code (11.1).
+- No telemetry. Network use is limited to explicit downloads (toolchain, updates, plugins);
+  update checks carry no identifiers and can be disabled.
+- No hosted services: everything runs locally. Release infrastructure (downloads, update
+  channel, winget/brew) is distribution, not a service.
+
+**Non-goals (for now)**
+
+- Java Edition.
+- A general-purpose IDE, and reimplementing TypeScript language features (editors already have them).
+- Everything in [BACKLOG.md](BACKLOG.md) (graph authoring, agent observability panel, game
+  capture, cinematic editor, game inspector, native debug bridge, evals, Blockbench/Snowstorm).
+
+---
+
+## 2. Lessons from the existing workflow
+
+### 2.1 Structural pain
+
+| Pain today | Root cause | Beacon answer |
+|---|---|---|
+| Profiles need tmp-dir resets or one full run per profile | Filters mutate a shared copied tmp dir in sequence | Pure transforms over a VFS; build graph shared across targets |
+| Slow, non-incremental builds | Every run copies everything, every filter re-reads disk | Hash cache with observed-input tracking; watch rebuilds only affected nodes |
+| Go + TS + Python + env vars glue | Tools grew independently | One engine, one process |
+| Build scripts copied into every project | Toolchain lives inside the project | Toolchain is a versioned dependency; `beacon migrate` runs codemods |
+| UUIDs protected only by convention | No tool owns them | Lockfile owned by the tool |
+| Templating inside JSON strings | Templates are strings, not code | Typed content files and generators |
+| Broken cross-file references found in-game | No global view of identifiers | Symbol table; broken refs are diagnostics |
+
+### 2.2 How map files are actually used (study of two production projects, ~100 map files, ~580 entries)
+
+- ~85% of targets use auto-mapping keywords; flat auto-mapping alone is ~80%.
+- 12% of map files are pure static, 62% static + options, 26% "dynamic"; of those, about
+  half only inject data. **~15% contain real logic, and all of it is one-to-many**
+  (one template -> N outputs, driven by a directory glob or a data list).
+- Most-used option by far: conflict policy (~200 uses). Its purpose is almost always to
+  **merge shared registry files**: `item_texture.json`, `terrain_texture.json`,
+  `sound_definitions.json`, `sounds.json`, `blocks.json`, `.lang`, manifest, `tick.json`,
+  `init` functions, the scripts entrypoint.
+- Next: JSON templating (~170), mcfunction/lang subfunctions (~40), per-entry scope (~40),
+  text replacements injecting data into TS source (~20).
+- Recurring workarounds: data injected into `.ts` via placeholder replacement; scope computed
+  by globbing assets (e.g. one sound definition per `.ogg`); paths keyed on the module folder
+  name; near-identical entry lists repeated across modules; the same source listed twice to
+  reach both BP and RP.
+
+Conclusion: routing can be convention + declarations, with code only for one-to-many
+generation. Most conflict policies disappear if registries are **derived** (5.3).
+
+To measure before phase 1 (they size the migrator, 5.6): how many map/scope modules import
+npm packages, and how many write to the source tree during evaluation.
+
+### 2.3 User research (hypothesis, n=1 so far)
+
+Question: "what 3 things would make you switch, and what would make you not even try?"
+Ongoing; answers are anonymized and summarized here. One answer does not set priorities on
+its own; more answers from the team, collaborators, and the wider community are needed.
+
+| # | Profile | Wants | Dealbreaker |
+|---|---|---|---|
+| 1 | Designer / educator, non-coder, runs kids' creative camps | Intuitive setup of build profiles and custom processing steps; a **much simpler way to make cinematics** (all existing tools, the official Editor included, feel convoluted); editing of in-game photos; a tool that can **"see" the game** and show what is happening visually | **CLI-only or many setup steps.** UX/UI quality decides adoption; more power does not compensate |
+
+Implications:
+
+- The alpha (section 14) is app-first with a one-flow install (9). Earlier phases are tools
+  for the team and agents; they are steps toward the alpha, not releases for this persona.
+- Configuration is editable visually: targets, outputs, plugins, and `module.json` as forms in
+  the app that write the same files, with validation. "Custom processing steps" for non-coders
+  map to generators or templates picked from a gallery, not to writing a filter.
+- Cinematic editor, game inspector, and capture are in the backlog. In-game photo editing is
+  out of scope.
+
+### 2.4 First users
+
+The team and its collaborators, on their own production projects. Every phase exit (14) is
+judged first by whether it makes their real work faster or safer. Phases before the alpha are
+not marketed externally.
+
+---
+
+## 3. System overview
+
+```
+              +--------------------------------------------------------------+
+              |                    beacon engine (Rust)                      |
+              |  config | VFS (metadata + lazy content) | build graph | cache  |
+              |  routing | registries | symbols | schemas | package | emit   |
+              |  trust                                                       |
+              |   +----------------------+     +-------------------------+   |
+              |   | JS host (trait)      |     | bundler (esbuild sidecar|   |
+              |   | QuickJS              |     |  -> rolldown later)     |   |
+              |   +----------------------+     +-------------------------+   |
+              +-------------------------------+------------------------------+
+                                              |
+      +-------------+-------------+-----------+-----------+-------------+
+      |             |             |                       |             |
+   desktop app    CLI         `beacon serve` (per-project daemon)     vscode
+   (Tauri,       `beacon`      transports: LSP | MCP | event stream    extension
+    React UI)                                                          (LSP client)
+```
+
+Rules:
+
+- **The engine is a library and a binary.** No frontend reimplements build, validation,
+  or packaging. The CLI works without a daemon (cold path); it uses a running daemon when one
+  exists.
+- **One daemon per project (per worktree)**, `beacon serve`, shared by every client (app,
+  VS Code, agents). Never one daemon per client.
+  - **Transport**: a named pipe on Windows, a Unix domain socket elsewhere, owner-only ACL.
+    LSP and MCP clients that expect stdio launch a thin `beacon serve --stdio` shim that
+    attaches to the running daemon (starting it if needed). TCP is used only where a pipe is
+    impossible (the app's webview), bound to 127.0.0.1, with a bearer token.
+  - **Discovery file** in the per-user runtime directory, never in the project:
+    `%LOCALAPPDATA%\beacon\run\<project-hash>.json` (Windows),
+    `$XDG_RUNTIME_DIR/beacon/` or `~/Library/Caches/beacon/run/` elsewhere, owner-only. It
+    holds pipe path, optional port + token, pid, engine version, protocol version.
+  - **Token**: random per daemon start, constant-time comparison, scoped (read: events and
+    diagnostics; write: edits, build, deploy). Never in query strings, never written into AI
+    client configs.
+  - **HTTP hardening** (any TCP endpoint): `Host` allowlist (`127.0.0.1:<port>`,
+    `localhost:<port>`), reject missing or foreign `Origin`, no CORS headers. Defends against
+    DNS rebinding from a browser.
+  - **Lifecycle**: an exclusive OS lock held for the daemon's whole lifetime (not only at
+    startup) prevents double start; stale discovery files are detected by the lock and a
+    handshake, never by pid alone. A client whose `beacon.version` or protocol version differs
+    from the daemon's restarts it or refuses. Idle shutdown when no clients remain.
+- **Single-writer document model.** The daemon owns the in-memory state of editable
+  documents with version numbers. App, editor plugins, and agents submit edits against a base
+  version; stale edits are rejected and rebased by the client. The daemon writes to disk.
+  When the same file is open in an editor buffer: clean buffer -> the editor reloads; dirty
+  buffer -> the user is asked which version wins.
+- **Contributors**: every content-facing extension point is TypeScript (plugins, generators,
+  app UI, VS Code extension, schemas, templates). Rust is needed only to work on the engine.
+
+---
+
+## 4. Project configuration
+
+### 4.1 `config.json` (the standard) is the only config file
+
+```jsonc
+{
+  "type": "minecraftBedrock",
+  "name": "my-addon",
+  "authors": ["Jane Doe"],
+  "targetVersion": "1.21.100",
+  "namespace": "demo",
+  "packs": {
+    "behaviorPack": "./packs/BP",      // the projected output (4.3)
+    "resourcePack": "./packs/RP",
+    "skinPack": "./packs/skins",       // when a skinpack target exists
+    "worldTemplate": "./packs/WT"      // when a mctemplate target exists
+  },
+  "worlds": ["./worlds/*"],
+
+  "beacon": {                          // tool-specific key, allowed by the standard
+    "version": "0.4.0",
+    "sources": ["./src"],
+    "packMeta": {                      // names and descriptions (versions: 4.2.1)
+      "name": "pack.name",             // lang key or literal
+      "description": "pack.description"
+    },
+    "versionPolicy": "auto",           // auto | manual (4.2.1)
+    "outputs": [ /* 4.3 */ ],
+    "targets": { /* 4.4 */ },
+    "plugins": []
+  }
+}
+```
+
+- Standard fields are read and written in standard form. Regolith-shaped `config.json`
+  (`author`, `regolith.*`) is converted by `beacon migrate`, original kept until confirmed.
+- `packDefinitions` (standard) is read as a symbol-table input. Beacon-derived ids are merged
+  in memory and never written back into `config.json`.
+- **Manifests: one source of truth.** `config.json` + `beacon.lock.json` are the source;
+  every `manifest.json` (including the ones in the `packs.*` folders, kept so other tools work)
+  is **generated output**, tracked in the emit ledger. `beacon check` reports a hand-edited
+  manifest as drift.
+- Every setting is also editable as a form in the app (6.1), writing the same file.
+
+### 4.2 Lockfile: `beacon.lock.json`
+
+Generated, committed, not hand-edited. Holds:
+
+- Pack UUIDs and module UUIDs keyed by **(output id x edition)**, and additionally by target
+  when a target overrides `targetVersion` (script module versions differ). Bedrock and
+  Education builds of the same output never share a UUID.
+- Script module UUID per output (used as the debugger's `targetModuleUuid`).
+- Last released version and content hash per pack (each BP, RP, world template, skin pack).
+- Resolved plugin sources (git URL + full commit SHA + content hash, 5.10) and schema set version.
+- `canonicalVersion` (version of the canonical JSON writer) and the bundler name + version.
+  Changing either changes content hashes, so it is an explicit `beacon migrate` step, never a
+  silent effect of upgrading Beacon.
+
+Output ids are stable keys: renaming an output goes through `beacon rename-output`, which
+moves its lockfile entries instead of minting new UUIDs. UUID rotation: backlog.
+
+**Dev UUIDs.** Dev builds use UUIDs derived deterministically from the lockfile UUID and a
+worktree id (hash of the worktree path), never committed. Two worktrees deployed at once never
+collide in the game, and dev builds never touch release identities.
+
+#### 4.2.1 Pack versions
+
+The game identifies a pack by UUID + version: shipping different content under the same
+pair is the bug to prevent.
+
+- **Each pack is versioned independently** (BP, RP, world template, skin pack have no reason
+  to share a version).
+- Dev builds never change versions (dev folders are not cached by the game; dev UUIDs, 4.2).
+- **`versionPolicy: "auto"`** (default). Release builds (`beacon pack`) compare each pack's
+  content hash with the last released hash in the lockfile: changed -> patch bump;
+  unchanged -> same version. Overrides: `beacon pack --bump minor|major [--pack <id>]`.
+- **`versionPolicy: "manual"`** (e.g. Marketplace submissions with externally controlled
+  versions): `beacon pack --set-version <x.y.z> [--pack <id>]`. `beacon pack` fails if content
+  changed and the version did not. Versions are monotonic per pack in both policies.
+- **Content hash** is computed over the logical content (sorted file list + per-file hashes),
+  never archive bytes, and excludes the pack's own version fields, UUIDs, and timestamps.
+- **Dependency chain**: a BP manifest pins its dependencies' versions, so the BP's hash
+  includes its generated manifest. When an RP is bumped, the dependent BP changes and is
+  bumped too. Bumps are computed in dependency order. The world template is bumped when the
+  world or any embedded pack changes.
+- `min_engine_version` is derived per target from `targetVersion` (Education lags Bedrock).
+  Script module dependency versions (`@minecraft/server` etc.) come from the target's API
+  index, not from pack versioning.
+
+### 4.3 Outputs (multi-pack)
+
+```jsonc
+"outputs": [                                    // array order = stack order (see below)
+  { "id": "game",     "include": ["src/game/**"], "dependsOn": ["mapA", "mapB", "lib"] },
+  { "id": "mapA",     "static": { "bp": "./vendor/mapA/BP", "rp": "./vendor/mapA/RP" } },
+  { "id": "mapB",     "static": { "bp": "./vendor/mapB/BP" }, "namespace": "mapb" },
+  { "id": "lib",      "include": ["src/lib/**"], "namespace": "lib" }
+]
+```
+
+Design inputs: community discussion on multi-pack support in Regolith (no "main pack" exists
+in Minecraft's own model; pack order matters; symlink-based tmp folders are fragile; the
+motivating case is combining several existing maps/add-ons, kept with their own namespaces,
+scripts, and functions, plus new content depending on all of them).
+
+- **All outputs are peers.** There is no main pack. For standard compliance, one output is
+  **projected** into `packs.behaviorPack` / `packs.resourcePack`: `beacon.primaryOutput` if
+  set, otherwise the first output with a BP. That is a projection, not a priority.
+- An output is a **pair**: one BP and/or one RP. A module's BP content goes to the output's
+  BP, its RP content to the output's RP. A module belongs to exactly one output.
+- **Static outputs** include prebuilt packs as-is: their UUIDs and versions are kept, no
+  transforms run on them, but they are validated and **indexed in the symbol table** so other
+  outputs can reference their ids with autocomplete and broken-reference checks. Two packs
+  with the same UUID (static or not) are an error.
+- **Per-output namespace and scripts**: `namespace` overrides the project one; each BP output
+  has its own script entrypoint and script module UUID. Cross-BP script communication is
+  runtime messaging (e.g. `scriptevent`), not shared imports; shared script code is an
+  npm/bundler concern.
+- **Order semantics** (array order, first = highest priority):
+  - **Resource packs**: true stack order; a higher pack overrides files of lower ones.
+  - **Behavior packs**: order is the activation order only; duplicate identifiers across BPs
+    are a conflict, not an override. The symbol table reports cross-output id collisions.
+  - Written to `world_behavior_packs.json` / `world_resource_packs.json` of every emitted
+    world, and used for dev deploy.
+- **Dev deploy and order**: `development_*_packs` folders carry no order of their own; order
+  comes from the world's pack list. The `dev` target therefore manages a **dev world**
+  (`targets.dev.world`, default: a Beacon-created world per project) whose pack lists it
+  writes on every deploy.
+- No folder renaming, no symlinks (the VFS makes them unnecessary).
+- Absent `outputs`: one implicit output mapped to `packs.behaviorPack` / `packs.resourcePack`.
+- **Dependencies are declared** (`dependsOn`); each BP depends on its own RP by default.
+  The symbol graph adds a **lint warning** when an output references ids defined only in an
+  output it does not depend on. It never adds dependencies or fails the build on cycles:
+  identifiers also hide in Molang, mcfunction text, and script strings, and all packs share
+  one runtime namespace.
+- Shared *content* modules across projects: backlog.
+
+### 4.4 Targets (replaces Regolith profiles and per-edition flags)
+
+```jsonc
+"targets": {
+  "dev":      { "edition": "bedrock",   "artifact": "dev", "world": "worlds/dev" },
+  "addon":    { "edition": "bedrock",   "artifact": "mcaddon",    "outputs": ["*"] },
+  "world":    { "edition": "bedrock",   "artifact": "mcworld",    "world": "worlds/main" },
+  "world-nopacks": { "edition": "bedrock", "artifact": "mcworld", "world": "worlds/main", "embedPacks": false },
+  "template": { "edition": "bedrock",   "artifact": "mctemplate", "world": "worlds/main" },
+  "edu":      { "edition": "education", "artifact": "mcworld",    "world": "worlds/main",
+                "targetVersion": "1.21.50" },
+  "edu-dev":  { "edition": "education", "artifact": "dev" },
+  "skins":    { "edition": "bedrock",   "artifact": "skinpack" }
+}
+```
+
+- `targets.<t>.targetVersion` overrides the project one; schemas, symbols, API index, and
+  edition transforms are version-aware per target.
+- `embedPacks: false` warns when the world references packs that will be missing.
+- `beacon build --all` evaluates the shared graph once, then the per-target tail only.
+
+### 4.5 Upstream RFC
+
+Backlog (`additionalPacks`).
+
+---
+
+## 5. Engine
+
+### 5.1 Pipeline
+
+```
+discover -> trust (5.5) -> index (VFS) -> route (5.3) -> generators (JS host)
+         -> derive registries -> symbols + validate
+         -> per target: edition transforms -> manifests/lang
+         -> emit (dev dirs via ledger | archives)
+```
+
+### 5.2 VFS and cache (the RAM budget lives here)
+
+- The VFS holds **path + size + hash for every file**. Content is loaded only for text files
+  under a size cap, only while a transform needs it, then dropped.
+- Binaries (textures, sounds, world `db/`) are never loaded: passed by path/hash and streamed
+  straight to the dev dir or archive (stored, not deflated, for already-compressed formats).
+  Large binaries are hardlinked/reflinked into dev dirs when on the same volume, copied otherwise.
+- Hashing: blake3, with a (mtime, size, file-id) fast path; `--verify-hashes` forces full
+  rehashing.
+- **Cache keyed by observed inputs.** Every read by user code goes through host functions, so
+  the engine records what each generator actually read. The key includes:
+  - file contents read; **directory listings** (sorted names hash) for globs and `readDir`;
+  - **negative lookups** (file probed but not found, failed module resolution);
+  - imported modules transitively (bundled generator metafile, 5.4), npm packages by resolved
+    version + integrity from the package lockfile;
+  - env reads **with their values** (allowlisted, 5.4);
+  - engine, JS prelude, oxc, esbuild, schema set, and `canonicalVersion`; target
+    `targetVersion` and edition; relevant `config.json` options; plugin source hash.
+  - `Date.now`, `Math.random`, `crypto.randomUUID` mark an evaluation uncacheable. External
+    plugins always rerun.
+- **Shared content-addressed cache** (safe for parallel agents): atomic writes (temp +
+  rename), integrity check on read, size cap with LRU GC, cross-process locking.
+- **Determinism**: file walks sorted by byte order of NFC-normalized UTF-8 paths; paths
+  recorded as normalized relative paths; canonical JSON output (key order, number formatting,
+  escaping; versioned as `canonicalVersion`); deterministic merge order for many-to-one
+  targets; deterministic archives (fixed mtimes, entry order, permissions, compression level).
+  Prelude freezes locale and timezone.
+
+### 5.3 Routing: three concepts
+
+Everything a user writes is one of three things. Stop at the first that works.
+
+1. **Convention (zero config).** Folder = module; file suffix = destination
+   (`sword.item.json` -> `BP/items/`, `sword.png` -> `RP/textures/items/`). Covers ~80-85%
+   of files. The suffix table is published and versioned.
+2. **`module.json` (optional, static, JSON Schema).** Exceptions only: explicit paths for
+   non-standard files (fonts, UI, overridden vanilla textures), output assignment,
+   `onConflict` (`skip` for defaults, `merge` for hand-written shared files). Editable by
+   hand with autocomplete, or as a form in the app; both write the same file.
+3. **Generators (`*.gen.ts`).** Code, only for one-to-many. A generator returns an array of
+   content objects:
+
+   ```ts
+   // src/sounds/sounds.gen.ts
+   export default generate(({ assets, ns }) =>
+     assets("./*.ogg").map(f => sound(`${ns}:${f.name}`, { file: f.path })));
+   ```
+
+   - `assets(glob)` returns a typed list (name, path) and registers the glob as an input.
+   - `ctx.module` / `ctx.namespace` / `ctx.edition` / `ctx.target` replace path tricks and
+     env flags.
+   - A **content file** (one game concept split across packs) is a generator returning one item:
+
+     ```ts
+     // src/vehicles/car.entity.ts
+     export default entity("demo:car", {
+       server: { components: { "minecraft:health": { value: 20 } } }, // -> BP/entities
+       client: { geometry: "./car.geo.json", texture: "./car.png" },  // -> RP/entity, RP/textures
+       spawnRule: { /* ... */ },                                      // -> BP/spawn_rules
+       lang: { en_US: "Car", it_IT: "Auto" },                         // -> texts/*.lang
+     });
+     ```
+
+Automatic behaviors (not concepts the user configures):
+
+- **Derived registries.** `item_texture.json`, `terrain_texture.json`, `sound_definitions.json`,
+  `sounds.json`, `.lang` (+ `languages.json`), `tick.json`, and (for targets that still need
+  it) `blocks.json` are **outputs computed from content declarations**, not files modules
+  merge into.
+  - Raw JSON files register too, by convention: a texture with the same stem next to a raw
+    item/block file (`sword.png` beside `sword.item.json`) registers `ns:sword`; explicit
+    entries in `module.json` cover the rest.
+  - A duplicate key across modules is an **error**, overridable in `module.json`.
+  - Non-derivable fields (`texture_name`, `padding`, `num_mip_levels`, sound event maps)
+    have defaults and are overridable in `module.json`; hand-written shared files remain
+    possible with `onConflict: merge`.
+  - `blocks.json` is emitted only for targets older than the version where block JSON
+    supersedes it (cutoff tracked in the schema set).
+- **Hooks with order.** `init` and `tick` functions are declared with a priority; the order
+  becomes the order of the generated arrays. Script entrypoints are aggregated automatically.
+- **Data modules.** `import trophies from "./trophies.data.json"` in game scripts; the bundler
+  inlines it, typed. Replaces text replacements.
+
+The engine has **one content model** (a content item with routing metadata) and **one merge
+primitive**; the three concepts are just three ways of producing content items.
+
+### 5.4 JS host and sandbox
+
+- **What runs**: generators, JS plugins, templates. Only code written for Beacon's API: no
+  Deno or Node API compatibility layer.
+- **Engine**: QuickJS (rquickjs) behind a trait. TS is stripped by oxc (syntax only, no type
+  checking; `isolatedModules` rules apply: no `const enum`, no type-only re-exports without
+  `type`). Pool of runtimes per thread, **one fresh context per evaluation** (no state or
+  prototype leakage between modules).
+- **npm imports**: a generator importing npm packages is pre-bundled by the esbuild sidecar
+  (`platform: neutral`, host-virtual modules external) into a single ESM; the esbuild metafile
+  becomes the import part of the observed inputs. The Rust module loader handles only relative
+  imports, JSON, and host-virtual modules (`beacon:*`). No Node module resolution in Rust.
+  `postinstall`/lifecycle scripts are never run by Beacon.
+- **Host function policy** (the sandbox is exactly this list):
+  - Filesystem: **read-only**, confined to the project root and `node_modules`. Paths are
+    canonicalized and checked after resolution and again at open (TOCTOU); rejected: `..`
+    escapes, absolute and UNC paths, symlinks/junctions leaving the root, Windows 8.3 short
+    names, alternate data streams, reserved device names. Outputs only via returned content
+    items, never direct writes.
+  - Env: allowlist only (target/edition flags Beacon itself sets). No access to user secrets.
+  - No network, no process spawning, no timers beyond a deterministic microtask pump.
+- **Resource limits**: memory limit per runtime, stack limit, interrupt-handler time budget
+  per evaluation, output size cap. A runaway generator becomes a coded diagnostic, never a
+  hung daemon/LSP.
+- **Claim**: capability-restricted, **not** hostile-code-proof. Untrusted projects do not run
+  the host at all (5.5). Host functions are fuzzed in CI.
+- Errors from user TS code are reported at the original source position (oxc/esbuild
+  sourcemaps + QuickJS stack remapping).
+
+### 5.5 Project trust
+
+Opening a project must not execute its code until the user trusts it (same model as VS Code
+Workspace Trust).
+
+- **Restricted mode** (untrusted): parsing, schema validation, symbols, diagnostics, LSP
+  navigation. Never runs: the JS host, external plugins, `legacy_filter`, git-URL plugin
+  fetches, the esbuild sidecar, `npm` resolution, `beacon migrate`'s Python/Deno step.
+- **Trust** is a per-user decision stored in the user profile, never in the project, keyed on
+  the project path + a hash of `config.json`'s plugin list. Adding or changing a plugin asks
+  again.
+- Frontends: the app and VS Code show a trust prompt; CLI uses `--trust` or a prior trust
+  decision; agents/CI pass `--trust` explicitly. Defaults never auto-trust.
+- A project created by `beacon init` from a built-in template is trusted; from a git URL
+  template, it is not, and its plugins are not installed until trusted.
+
+### 5.6 Migration (one-time, never runtime)
+
+- **`beacon migrate`** converts ModularMC, system_template, and Regolith projects into a
+  native Beacon project, with a preview of all changes; the original is kept until confirmed.
+- **Strategy**: evaluate the old map files **once**, record their concrete output (paths,
+  contents, policies), then emit convention + `module.json` + generators + data modules:
+  - static entries and pure data injection -> convention and `module.json`;
+  - conflict policies on registry files -> dropped (derived registries);
+  - one-to-many loops -> generator skeletons, with the evaluated output kept as the
+    equivalence oracle;
+  - env-flag branches (e.g. "education enabled") -> `ctx.edition`.
+- **Runtimes for evaluation, downloaded on demand for that run only** (hash-pinned, 9.2):
+  Deno for ModularMC `_map.ts`, Python via uv for system_template `_map.py`. Never needed at
+  build time.
+- **Equivalence check**: the migrated project must build packs equal to the old tool's output
+  after normalization (parsed JSON equal, text files exact, script bundles compared after
+  sourcemap/path normalization). Differences are listed, not hidden.
+- **Regolith filters** are not emulated. A `legacy_filter` plugin materializes the VFS to a
+  temp dir, runs the executable (trusted code, scrubbed env, temp dir as cwd), and re-ingests
+  the result. Survey the most-used community filters and decide which get native equivalents.
+
+### 5.7 Symbol table
+
+Entity/item/block ids, loot/trade paths, animation/controller/render-controller names, lang
+keys, functions, families/tags (plus the standard's `packDefinitions`). Powers diagnostics,
+cross-output lint and id-collision errors (4.3), LSP navigation/rename on string-literal
+identifiers, MCP queries.
+
+### 5.8 Schemas and types
+
+Vendor an existing community-maintained Bedrock JSON schema set (license to confirm, 13),
+diff and update it per game release, generate TS types for content files from those schemas.
+`@minecraft/*` typings from npm. Versioned per `targetVersion`.
+
+### 5.9 Built-ins
+
+- Manifest and base lang generation (from config + lockfile, 4.1).
+- Skin packs: `skins.json`, `texts/*.lang`, PNGs, `skin_pack` module.
+- Worlds:
+  - `.mcworld`: zip of the world folder root; `world_*_packs.json` written from output order.
+  - `.mctemplate`: `manifest.json` with a `world_template` module and `base_game_version`,
+    `level.dat`, `db/`, `texts/`, `world_icon.jpeg`; template options (e.g.
+    `lock_template_options`) configurable per target.
+  - `level.dat`: little-endian NBT with an 8-byte header; edited by validated round trip.
+  - `.mcstructure` passthrough.
+- **Education Edition transforms** (per `edition: "education"` target): separate UUIDs (4.2);
+  `min_engine_version` and `base_game_version` from the target's `targetVersion`; Education
+  flags in `level.dat`; experimental toggles validated against what the Education version
+  supports; Education lang overlay; schemas/API index for that version. Exact flag names are
+  verified against a real Education world before implementation.
+- Archive writers, pack validation.
+- **Emit ledger** for dev dirs (`.beacon-emit.json`): delete stale files without touching the
+  user's other packs. Writes go to a temp file in the same directory, then atomic replace;
+  sharing violations (game holding a file) retry with backoff and end in a clear diagnostic.
+  Long paths via `\\?\`; case-folding collisions between outputs and reserved names
+  (`con`, `aux`, trailing dot/space) are diagnostics on every OS.
+
+### 5.10 Plugins
+
+- The transform contract is JS-facing: `{ id, inputs, outputs, run(ctx) }`. Built-ins may be
+  native but obey the same declared-inputs/outputs contract.
+- In-process JS plugins run in the JS host under the 5.4 policy.
+- External-process plugins (JSON over stdin/stdout) are **trusted code**, like Regolith filters
+  today: scrubbed env, temp dir as cwd, shown as "runs arbitrary code" when trusting.
+- Sources: local path or git URL. Git plugins are **pinned to a full commit SHA** plus content
+  hash in the lockfile; floating branches are rejected; updates only via
+  `beacon plugin update` with a diff. Plugins declare capabilities (fs write paths, network,
+  exec), shown at trust time. No registry for now.
+
+---
+
+## 6. Frontends
+
+### 6.1 Desktop app
+
+Tauri 2 shell + the React UI (Monaco, three.js previews). Primary entry point at the alpha.
+
+- Project browser, file tree, Monaco, previews, lang table editor.
+- **Play**: build `dev`, deploy, launch Minecraft. Content log, diagnostics, GameTest runner.
+- First-run setup wizard and updater (section 9). Trust prompt (5.5).
+- **Visual settings**: targets, outputs (drag-to-reorder stack order), plugins, pack metadata,
+  and `module.json` as forms writing the same files. Nothing requires the CLI.
+- Event stream content (diagnostics, content log, plugin output) is untrusted and sanitized
+  before rendering in the webview.
+- Platforms: Windows (WebView2, bootstrapper bundled for offline machines) first-class;
+  macOS supported; Linux best effort (WebKitGTK; Bedrock does not run natively on Linux).
+  CI runs on Windows and macOS; Linux builds are tested, not release-gated.
+
+### 6.2 CLI: `beacon`
+
+| Command | Phase (14) |
+|---|---|
+| `build [--target t \| --all]`, `watch`, `check`, `explain`, `--help --json` | 1 |
+| `init`, `add <kind>`, `fix`, `pack`, `dev`, `symbols`, `schema` | 2 |
+| `migrate`, `rename-output`, `plugin update` | 3 |
+| `serve`, `api` | 4 |
+| `test`, `doctor`, `setup` | 5 |
+
+Every command supports `--json`. Non-interactive without a TTY; `--yes` and `--trust` where
+confirmation exists; stable exit codes. JSON outputs other tools depend on (`--help --json`,
+`symbols --json`, `api --json`, diagnostics) are versioned and only change compatibly within
+a major version.
+
+### 6.3 Diagnostics format
+
+**SARIF 2.1** is the machine format (`--json`, LSP conversion, CI annotations, ctxtruth merge),
+with `fixes` for fix-its. Fix-its are text edits shaped like LSP `WorkspaceEdit`, flagged
+safe/unsafe; `beacon fix` applies safe ones by default. A compact text view is the default
+for terminals and agents. Every diagnostic has a stable code; `beacon explain <code>`
+returns the rule, an example, and the fix.
+
+### 6.4 Language server (`beacon serve`)
+
+Covers JSON content, lang, Molang, `module.json`, and cross-file string-literal identifiers.
+Does not reimplement TypeScript features. Usable from VS Code, Zed, Neovim, JetBrains via the
+stdio shim (3).
+
+### 6.5 VS Code extension
+
+Thin: LSP client, build/watch/dev commands, trust prompt, previews (webviews reusing the
+app's React components), content log channel, debugger interop (6.6). Marketplace + Open VSX.
+Before the LSP exists, a problem-matcher snippet gives in-editor errors from `beacon watch --json`.
+
+### 6.6 Script debugging: interop with Mojang's minecraft-debugger
+
+Upstream: [Mojang/minecraft-debugger](https://github.com/Mojang/minecraft-debugger), MIT,
+actively maintained. A VS Code extension bridging DAP to Minecraft's script debugger over TCP
+(default port 19144). Protocol details (`listen`/`connect` roles, wire framing,
+`ProtocolVersion` negotiation, exact `launch.json` field names) are **unverified** and must be
+checked against the upstream repo before implementation.
+
+- **Interop**: correct sourcemaps; `launch.json` generated **per output** with the source-map
+  roots and `targetModuleUuid` from the lockfile (dev UUID for dev builds). The VS Code
+  extension configures the official debugger instead of duplicating it.
+- Native bridge: backlog.
+- Fork policy: port, do not hard-fork; keep Microsoft's copyright header and MIT notice
+  (`NOTICE`); fixes go upstream first; no "Minecraft"/"Mojang" marks in Beacon names.
+
+---
+
+## 7. Visual graph authoring
+
+Moved to [BACKLOG.md](BACKLOG.md) (B1). The engine keeps the hooks it would need
+(generators, single-writer documents, symbol kinds).
+
+---
+
+## 8. AI-oriented design
+
+### 8.0 Agent-first principles (apply to every component)
+
+Every feature is designed for an agent loop (edit -> verify -> fix) first and a human UI
+second; the UI is a view over the same commands.
+
+- **Fast, scoped feedback.** `beacon check` has two tiers:
+  - **fast** (default): schemas, symbols, derived registries, generated-section staleness;
+    incremental, scoped to changed files/modules; p95 < 1 s on the large corpus;
+  - **full** (`--full`): adds TypeScript type checking (tsgo) and other slow checks.
+- **Machine-applicable fixes** (6.3).
+- **Token-efficient by default.** Concise output, `--json` everywhere; MCP results are compact
+  and paginated with stable cursors; schema lookups per component, never whole schemas; symbol
+  queries instead of file reads; `check` over MCP returns the delta since the last call.
+- **Small edit surface.** One file per game concept (5.3) and derived registries mean one
+  change touches one file.
+- **Non-interactive and deterministic.** No prompts without a TTY, stable exit codes,
+  identical output for identical input.
+- **Self-describing.** `beacon schema <component>`, `beacon symbols --find`, generated
+  `AGENTS.md` and skills kept in sync with the project.
+- **Parallel-agent safe.** One daemon per worktree, shared cache safe for concurrent use
+  (5.2), dev UUIDs and dev deploy folders per worktree (4.2) so parallel agents never collide
+  in the game.
+- **The Beacon repo itself is agent-first**: `AGENTS.md`/`CLAUDE.md`, contributor skills, one
+  command to build and test everything, fixtures as executable specs.
+
+### 8.1 MCP
+
+Transport of `beacon serve`: **stdio** via the shim (3). A read-only subset (`check`,
+`symbols.*`, `schema.*`) ships early as a standalone stdio server (phase 2).
+
+- Tool groups: `project.*`, `symbols.*`, `schema.*`, `api.lookup`, `build.*` / `check` /
+  `pack`, `game.*` (deploy, reload, content log, GameTests).
+- Target ~15-20 tools; each with annotations (read-only, destructive, idempotent), JSON
+  schemas, an error model, and result-size caps. Write tools support `dryRun`. Full list in an
+  appendix before phase 4.
+- Outputs containing project or game text (lang strings, content log, chat, docs) are marked
+  **untrusted** (prompt-injection surface). `game.*` deploy/reload require confirmation unless
+  the client was explicitly granted it.
+
+### 8.2 Guardrails (which layer enforces what)
+
+- **Detectable invariant (the backstop).** `beacon check` fails when the lockfile, generated
+  manifests, or generated doc sections were changed without the owning command (each records a
+  hash of what it wrote). This holds no matter which agent or human made the change.
+- **Blocking for Claude Code / Codex sessions.** A Beacon plugin with a `PreToolUse` hook
+  that **denies** direct edits to protected files (lockfile, generated manifests, generated
+  sections) and points to the right command; a `Stop` hook runs `beacon check`.
+- **Policy.** "A task is done only when `beacon check` passes" lives in the generated
+  `AGENTS.md`; it is a convention, enforced only by the hooks above.
+- `beacon build --dry-run` shows the emitted diff.
+- Toolchain downloads are hash-pinned and signed (9.2).
+
+### 8.3 Generated agent context
+
+`beacon init` / `migrate` generate `AGENTS.md` (+ `CLAUDE.md` pointer) and skills from the
+actual project, between `<!-- beacon:begin ... -->` markers. Generated regions are short and
+deterministic (they are loaded every session). Regenerated on demand; `beacon check` fails if
+stale.
+
+### 8.4 Truth checks: no invented or outdated APIs, no stale agent docs
+
+Two distinct problems, two homes.
+
+**(a) Content and code correctness: inside the engine** (`beacon check`, LSP, MCP).
+
+- **Versioned API index**, built in CI from official sources and shipped compact, selected per
+  target `targetVersion`: script module metadata and vanilla data from Mojang's
+  `bedrock-samples`, `@minecraft/*` typings from npm, the vendored JSON schema set.
+- JSON: unknown or misspelled components, outdated/deprecated `format_version`, experimental
+  components without the matching toggle in the standard's `experimentalGameplay`.
+- Scripts: members that do not exist (invented APIs), `@deprecated` or removed APIs across
+  versions, beta APIs without the beta module, manifest script-module versions mismatching
+  the npm typings.
+- Molang queries and mcfunction commands checked against the version's grammar; vanilla
+  identifiers checked against vanilla data.
+- Prevention over correction: MCP `api.lookup` / `schema.*` give agents the exact signature
+  and component shape **before** they write code.
+
+**(b) Agent-facing docs: [ctxtruth](https://github.com/Fabrimat/ctxtruth)** (MIT, separate
+public tool by the same author, run alongside Beacon, not inside it).
+
+- ctxtruth extracts claims from `AGENTS.md`, `CLAUDE.md`, `README.md`, editor rule files and
+  docs, and verifies them deterministically and offline: paths, package scripts, shell
+  commands, TS symbols, type-checked snippets, package versions. Unknown never becomes an
+  error. Outputs `agent` / `json` / `sarif` / PR comment; `--new-only` for PR drift.
+- Beacon publishes **`ctxtruth-bedrock`**, a plugin for ctxtruth's plugin API (`apiVersion: 1`,
+  types from `ctxtruth/plugin`). Default export: `(options) => plugin`, `name: "bedrock"`.
+
+  | Check | Matches | `environment` | Verifies against |
+  |---|---|---|---|
+  | `bedrock/commands` | `commands: ["beacon"]` (shell fences + inline code) | true | `beacon --help --json`: subcommands and flags exist |
+  | `bedrock/config` | inline code / prose facts (namespace, editions, `targetVersion`, output ids) | false | `config.json` via `ctx.readFile`, evaluated at every commit |
+  | `bedrock/ids` | inline code matching namespaced ids, component names, `@minecraft/*` members | true | `beacon symbols --json` and `beacon api --json` for the current checkout |
+
+  - `verify` is batched: each Beacon CLI call happens once per `verify`, no module-level cache
+    (base and head alternate in one process).
+  - Uses the `beacon` from the environment (option `beacon`), never a binary inside the analyzed
+    checkout. `environment: true` checks become unknown on past commits, so `--new-only` and
+    `blame` never attribute false drift.
+  - The plugin declares `ignoreRegions` for `<!-- beacon:begin ... -->` / `<!-- beacon:end ... -->`,
+    so users need no extra config.
+  - Requires on the Beacon side: stable `--help --json`, `symbols --json`, `api --json` outputs
+    (versioned JSON output policy, 6.2).
+- Division of labor: Beacon **generates** the generated sections of agent docs (8.3, between
+  `<!-- beacon:begin ... -->` markers) and fails `beacon check` if they are stale; ctxtruth
+  **verifies** everything written by hand.
+- ctxtruth needs Node; Beacon users do not. It is therefore optional for end users and
+  standard in contributor/CI/agent environments: `beacon check --context` runs the built-in
+  generated-section check always, and merges ctxtruth's SARIF when ctxtruth is available.
+  ctxtruth is never part of a phase exit criterion.
+
+### 8.5 In-game verification
+
+`beacon test`: GameTests on BDS with structured results (Beta APIs toggle and
+`server.properties` configured by Beacon; the runner drives the BDS console or a script
+entrypoint). BDS downloaded with explicit, logged EULA acceptance, never redistributed.
+Verifies behavior and scripts, never rendering. Eval suite, game capture, inspector: backlog.
+
+---
+
+## 9. Distribution and install
+
+1. Install the app: `winget install beacon` / `brew install --cask beacon` / `.exe` `.dmg` `.AppImage`.
+2. First-run wizard (defaults pre-selected, one "Continue"): detect Minecraft installs
+   (Bedrock, Preview, Education; UWP vs GDK folder layouts), put `beacon` on PATH, offer
+   (only if detected) the VS Code / Cursor / Windsurf extension and MCP registration for AI
+   clients (config diff shown first; registers the stdio command, never a URL or token).
+3. Create or open a project (trust prompt if not created locally), press **Play**.
+
+The VS Code extension and `beacon setup` run the same wizard. `beacon doctor` fixes drift.
+
+### 9.0 Project creation (`beacon init`): same flow from CLI, VS Code, and app
+
+Project creation is fully doable from the **CLI** and the **VS Code UI**, without the app.
+
+- **One engine, one declarative question spec.** The engine exposes the init steps as data
+  (field, type, default, validation, condition). Each frontend only renders it:
+  - CLI: interactive prompts on a TTY; `beacon init --name x --namespace y ...` or `--yes`
+    for defaults; `--from init.json` for agents (non-interactive).
+  - VS Code: "Beacon: New Project" opening a one-page form webview.
+  - App: the same form.
+- **Questions**: folder, name, namespace (validated, not `minecraft`), authors,
+  `targetVersion` (from the vendored schema versions), editions, artifacts (-> targets),
+  starter template (minimal add-on, world, skin pack, or a git URL: untrusted, 5.5), outputs
+  (single by default), git init, agent setup (`AGENTS.md`/`CLAUDE.md`, MCP registration,
+  diff shown before writing).
+- **Result**: standard-compliant `config.json` with the `beacon` key, `beacon.lock.json`
+  with UUIDs, folder skeleton, `.gitignore` (including `.beacon/`), `.vscode/` (`launch.json`
+  per output, recommended extensions), agent context files. Then a first `beacon build dev`.
+- **Existing folders**: opening a Regolith/ModularMC/system_template project offers
+  **Migrate** (5.6), with a preview of the changes.
+- One release train for all components. Projects pin `beacon.version`.
+
+### 9.1 Dependencies
+
+- **Users**: none besides Beacon and Minecraft. Deno or Python (via uv) only on demand, only
+  for the `beacon migrate` run that needs them.
+- **Contributors (engine)**: Rust stable. Clean engine build is minutes; this is contributor
+  velocity, distinct from user compile time.
+- **Contributors (everything else)**: Node LTS + pnpm.
+- Key engine crates: oxc (strip/parse), rquickjs, esbuild sidecar binary (rolldown when its
+  crate API stabilizes; a swap changes content hashes, 4.2), tower-lsp, MCP Rust SDK, zip
+  writer, blake3, notify.
+- Type checking (tsgo) only in `beacon check --full` and CI, optional download, never on the
+  build/watch path.
+
+### 9.2 Download trust
+
+- Every downloaded binary (esbuild, tsgo, BDS, Deno, uv + Python builds, updates) is pinned
+  by hash **embedded in the Beacon binary** for that release, never fetched from the same host
+  as the file. Releases are signed (minisign or sigstore; key and rotation documented in
+  `SECURITY.md`). TLS is transport only.
+- First download asks for confirmation on a TTY / in the app; `--yes` or a config flag for
+  non-interactive use.
+- Code signing (Windows, Apple notarization), winget/brew manifests, update channel are
+  prerequisites of the alpha.
+
+### 9.3 Watch mode
+
+`notify`-based. Handles Windows `ReadDirectoryChangesW` buffer overflow with a full rescan;
+debounces and coalesces editor atomic saves; re-stats before reading and waits for size
+stability on files being written (image editors, Blockbench). Ignores `.beacon/` and emit
+directories inside the project. Falls back to polling on network drives and synced folders
+(OneDrive), documented. Does not follow symlinks/junctions out of the project.
+
+---
+
+## 10. Repository layout
+
+```
+beacon/
+  crates/
+    engine/          config, vfs, graph, cache, routing, registries, symbols, trust, package, emit
+    jshost/          JS host trait + QuickJS impl, host functions, module loader
+    serve/           daemon: LSP + MCP + event stream, stdio shim
+    cli/
+  packages/          (TypeScript)
+    runtime-api/     generator/content API (generate(), entity(), block(), assets(), ...)
+    schemas/         vendored schemas + generated types
+    ctxtruth-bedrock/
+  apps/
+    desktop/         Tauri + React
+    vscode/
+  templates/minimal/
+  fixtures/
+    synthetic/       public corpus generated from the 2.2 statistics (CI, perf budgets)
+  docs/  ARCHITECTURE.md  BACKLOG.md  rfcs/
+```
+
+Production projects of the team are **never** in the repo and never run in CI: they are
+tested locally by maintainers with a documented script (`pnpm fixtures:local <path>`) that
+runs migrate + build + equivalence check and reports budgets.
+
+Apache-2.0, DCO sign-off, CI: build, tests, synthetic corpus, perf budgets, BDS GameTests.
+
+---
+
+## 11. Key decisions
+
+### 11.1 No VS Code fork
+
+Monthly rebases on Code-OSS/Electron, losing the Microsoft Marketplace and every VS Code-based
+editor that installs the extension from Open VSX. The app covers what a fork would add.
+
+### 11.2 Rust engine + embedded QuickJS
+
+- The resident processes (daemon beside a multi-GB game, LSP inside the editor, MCP) are where
+  RAM matters. Node idles at ~40-50 MB and grows with a real project's VFS; a Rust daemon fits
+  in tens. "TS first, Rust later" is rejected: the VFS/cache model is shaped by the language
+  and the rewrite never happens.
+- **No compatibility layer to carry.** Since Beacon runs only code written for its own API
+  (1, 5.4), the JS host needs no Deno/Node emulation. QuickJS fits that workload (data
+  building, not CPU-bound loops) at a small RAM and binary cost.
+- **Perf fallback**: if generator evaluation time on the synthetic corpus misses the phase-1
+  budgets, swap the trait implementation to V8 (deno_core). This is a perf fallback only, and
+  it relaxes the binary and idle-RSS budgets (V8 adds tens of MB per isolate and to the
+  binary); which budgets change is decided at that point, not hidden.
+- Phase 0 spike measures real per-context RSS and evaluation time of representative generators
+  instead of quoted figures.
+- Bundling: esbuild sidecar, kept as one long-lived incremental service process in the daemon
+  (no per-change spawn); rolldown later. Narrow interface: entry points + externals +
+  sourcemap -> files.
+- App shell: Tauri, for install size and idle RAM.
+
+### 11.3 `config.json` only
+
+Standard file plus a `beacon` key. Programmatic needs go through generators and plugins.
+
+### 11.4 Apache-2.0
+
+Patent grant and contributor clarity.
+
+### 11.5 SARIF for diagnostics
+
+Existing standard, consumed by VS Code and CI, supports fixes, already emitted by ctxtruth.
+No invented diagnostics schema.
+
+---
+
+## 12. Performance budgets
+
+Measured on the public synthetic corpus in CI (large size: ~3,000 files, ~60 MB assets,
+~20k LOC scripts) and reported by the local fixture script on production projects.
+
+**Measurement rules**: RSS = sum over the process tree (Beacon + sidecars), because that is
+what users see; on Windows, private working set. Idle = 30 s after the last build with no
+client activity. Latencies are p95 over 50 runs, warm OS file cache unless stated. CI runs on
+Windows with Defender enabled.
+
+| Metric | Budget | Enforced from phase |
+|---|---|---|
+| Watch: single JSON change -> dev dir updated | p95 < 100 ms | 1 |
+| Watch: single TS change -> dev dir updated | p95 < 300 ms | 1 |
+| Build, warm cache / cold (no type-check) | < 2 s / < 5 s | 1 |
+| Peak RSS during build (assets never loaded) | < 150 MB | 1 |
+| Idle RSS, `watch` | < 40 MB | 1 |
+| CLI start to first output (p50, warm) | < 50 ms | 1 |
+| Binary size | < 30 MB (+ ~10 MB esbuild sidecar) | 1 |
+| `check` fast tier, single-file change | p95 < 1 s | 2 |
+| Idle RSS, `serve` (LSP + MCP + symbols + schemas) | < 100 MB | 4 |
+| App idle RAM | < 150 MB | 5 |
+
+Schemas and the API index are memory-mapped or lazily loaded; JS runtimes are dropped when
+idle. A PR exceeding a budget beyond tolerance fails CI. Budgets are revisited once the phase 0
+spike has real numbers.
+
+---
+
+## 13. Third-party licensing checklist
+
+- [ ] Code ported from Mojang/minecraft-debugger (MIT, (c) Microsoft): keep headers, add to
+      `NOTICE`; check `webview-ui` dependency licenses before reusing UI.
+- [ ] Check whether upstream minecraft-debugger contributions require a Microsoft CLA.
+- [ ] Vendored schema set: confirm license and attribution.
+- [ ] Runtime libraries bundled into generated add-ons: permissive, or optional with
+      obligations documented.
+- [ ] Fonts/assets: OFL / CC0 / permissive only.
+- [ ] BDS: confirm EULA terms for automated download in CI.
+- [ ] `LICENSE` (Apache-2.0), `CONTRIBUTING.md`, `SECURITY.md`, DCO, no-telemetry statement.
+
+---
+
+## 14. Roadmap
+
+The phases are a process toward the **alpha**, which is the end of phase 5. Users of phases
+1-4 are the team and its collaborators (2.4).
+
+| Phase | Deliverable | Exit criterion |
+|---|---|---|
+| 0 | Repo, CI (Windows + macOS), synthetic corpus generator, perf harness, local fixture script; QuickJS spike on representative generators; corpus measurements from 2.2; name/org/domain | Perf harness reports every phase-1 metric; spike numbers recorded; go/no-go on QuickJS |
+| 1 | Rust CLI `build/watch/check --json` (SARIF); VFS + cache; convention routing; `module.json`; generators in the JS host (sandbox policy, limits, esbuild pre-bundle); project trust; lockfile UUIDs + manifests + base lang; emit ledger; `.mcpack`/`.mcaddon`, one output | A new project made by hand builds and runs in-game; synthetic corpus builds; phase-1 budgets met |
+| 2 | Derived registries, content files, hooks, data modules; targets with **Education Edition** transforms; **multi-pack** (outputs, static outputs, order, dev world); all archive types (`mcworld`, `mctemplate`, skin pack); `beacon init` / `add` / `pack` with `versionPolicy`; `AGENTS.md` generation; read-only stdio MCP | One `beacon build --all` produces Bedrock + Education artifacts for a multi-pack project; the team builds a real release of a new project with Beacon |
+| 3 | `beacon migrate` (ModularMC + system_template, Deno/uv on demand, equivalence check); `legacy_filter`; `rename-output`, `plugin update`; Claude Code guardrail plugin (8.2) | Both production projects migrate locally and build equivalent packs, both editions, with no other tool at build time |
+| 4 | `beacon serve` (daemon, stdio shim, LSP) + VS Code extension + debugger interop + versioned API index + full MCP + `ctxtruth-bedrock` | Rename of an entity id updates all references; breakpoints hit in TS source via the official debugger; `serve` idle budget met |
+| 5 (**alpha**) | Desktop app (Play, visual settings and `module.json` forms, trust prompt) + setup wizard + `beacon test` on BDS + signing/distribution + updater | Clean Windows machine: install -> Play in under 5 minutes, no other installs; a non-coder completes it unaided |
+
+After the alpha: [BACKLOG.md](BACKLOG.md), prioritized with evidence from the team and
+collaborators.
+
+---
+
+## 15. Risks and open questions
+
+- **Generator perf in QuickJS**: heavy one-to-many generators are interpreted. Mitigation:
+  phase 0 spike, budgets on the corpus, V8 perf fallback behind the trait (11.2).
+- **Migration coverage**: real `_map.ts` / `_map.py` files may use features the migrator
+  cannot translate into generators. Mitigation: evaluated output kept as the oracle,
+  untranslated parts emitted as generator skeletons with diagnostics, never silently dropped.
+- **Format churn**: schemas and the API index must be updated every game release; automate
+  diffing.
+- **Education Edition specifics**: exact `level.dat` flags and manifest differences to be
+  verified on real Education worlds before phase 2 implementation.
+- **Windows realities**: files held open by the game, UWP vs GDK paths, long paths,
+  case-insensitivity, junctions, AV scanning. Covered by the emit ledger, watch rules (9.3),
+  and Windows CI.
+- **Ecosystem loss**: Regolith community filters run only through `legacy_filter`.
+- **Scope vs team**: phases 1-4 serve the team before the alpha; the backlog stays out until
+  the alpha ships.
+- **BDS in CI**: EULA acceptance flow to confirm.
+- **Open**: rolldown adoption timing (changes content hashes); Molang tooling scope; whether
+  skin packs need anything beyond the built-in.
