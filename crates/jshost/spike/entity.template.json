@@ -1,0 +1,13 @@
+{
+  "format_version": "1.21.0",
+  "minecraft:entity": {
+    "description": { "identifier": "", "is_spawnable": true, "is_summonable": true },
+    "components": {
+      "minecraft:health": { "value": 20, "max": 20 },
+      "minecraft:movement": { "value": 0.25 },
+      "minecraft:collision_box": { "width": 0.6, "height": 1.8 },
+      "minecraft:physics": {}
+    },
+    "events": {}
+  }
+}

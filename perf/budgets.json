@@ -1,0 +1,10 @@
+[
+  { "id": "watch_json_p95_ms",   "label": "Watch: single JSON change -> dev dir updated (p95)", "budget": 100,   "unit": "ms", "phase": 1, "tolerance_pct": 10 },
+  { "id": "watch_ts_p95_ms",     "label": "Watch: single TS change -> dev dir updated (p95)",   "budget": 300,   "unit": "ms", "phase": 1, "tolerance_pct": 10 },
+  { "id": "build_warm_ms",       "label": "Build, warm (p50)",                                  "budget": 2000,  "unit": "ms", "phase": 1, "tolerance_pct": 10 },
+  { "id": "build_cold_ms",       "label": "Build, cold / empty out dir (p50)",                  "budget": 5000,  "unit": "ms", "phase": 1, "tolerance_pct": 10 },
+  { "id": "peak_rss_build_mb",   "label": "Peak RSS during build",                              "budget": 150,   "unit": "MB", "phase": 1, "tolerance_pct": 10 },
+  { "id": "idle_rss_watch_mb",   "label": "Idle RSS, watch",                                    "budget": 40,    "unit": "MB", "phase": 1, "tolerance_pct": 10 },
+  { "id": "cli_start_p50_ms",    "label": "CLI start to first output (p50)",                    "budget": 50,    "unit": "ms", "phase": 1, "tolerance_pct": 20 },
+  { "id": "binary_size_mb",      "label": "Binary size",                                        "budget": 30,    "unit": "MB", "phase": 1, "tolerance_pct": 5 }
+]

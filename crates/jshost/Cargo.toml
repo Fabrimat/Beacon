@@ -1,0 +1,16 @@
+[package]
+name = "beacon-jshost"
+description = "QuickJS host for Beacon generators (spike-level seed)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rquickjs = { version = "0.14", features = ["loader"] }
+oxc = { version = "=0.146.0", features = ["transformer", "codegen", "semantic"] }
+serde_json = "1"
+globset = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation"] }

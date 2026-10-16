@@ -1,0 +1,4 @@
+[alias]
+corpus = "run --release -p beacon-corpus --"
+perf = "run --release -p beacon-perf --"
+spike = "run --release -p beacon-jshost --bin spike --"
