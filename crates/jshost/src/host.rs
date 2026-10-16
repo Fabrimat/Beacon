@@ -842,6 +842,19 @@ fn eval(
                 .catch(&c)
                 .map_err(|e| classify(g, limits, &closure, e))
         });
+        // QuickJS's OOM message differs by platform (macOS can surface a plain error); heap
+        // usage near the limit, read before GC and outside `context.with`, is the signal.
+        let r = r.map_err(|mut d| {
+            let used = rt.rt.memory_usage().malloc_size.max(0) as usize;
+            if d.code == Code::GeneratorError && used >= limits.memory / 10 * 9 {
+                d.code = Code::GeneratorOutOfMemory;
+                d.message = format!(
+                    "generator exceeded its {} MiB memory limit",
+                    limits.memory >> 20
+                );
+            }
+            d
+        });
         drop(context);
         rt.rt.run_gc(); // an OOM'd context's garbage must not starve the next run
         if rt.rt.is_job_pending() {

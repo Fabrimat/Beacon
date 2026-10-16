@@ -6,11 +6,14 @@ use beacon_engine::route::{load, route};
 use beacon_engine::vfs::Index;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-fn corpus() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/corpus-medium");
-    if !root.join("config.json").exists() {
+/// Fresh corpus per run: a shared `target/corpus-medium` can be left half-written or
+/// marker-less by other tools or CI caches.
+fn corpus() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("corpus");
+    {
         let st = std::process::Command::new(env!("CARGO"))
             .args([
                 "run",
@@ -28,12 +31,12 @@ fn corpus() -> PathBuf {
             .unwrap();
         assert!(st.success());
     }
-    root
+    (dir, root)
 }
 
 #[test]
 fn routes_medium_corpus() {
-    let root = corpus();
+    let (_tmp, root) = corpus();
     let cfg = load(&root).unwrap();
     let packs: Vec<RelPath> = [&cfg.packs.behavior_pack, &cfg.packs.resource_pack]
         .into_iter()

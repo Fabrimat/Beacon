@@ -113,7 +113,7 @@ jobs:
           out = ["archive " + hashlib.sha256(open(f, "rb").read()).hexdigest()]
           with zipfile.ZipFile(f) as z:
               out += sorted(f"{n} {hashlib.sha256(z.read(n)).hexdigest()}" for n in z.namelist())
-          open("determinism.txt", "w").write("\n".join(out) + "\n")
+          open("determinism.txt", "wb").write(("\n".join(out) + "\n").encode())
           PY
           cat determinism.txt
 
@@ -132,4 +132,4 @@ jobs:
       - name: Compare
         run: |
           ls -R .
-          diff determinism-Windows/determinism.txt determinism-macOS/determinism.txt
+          diff --strip-trailing-cr determinism-Windows/determinism.txt determinism-macOS/determinism.txt
