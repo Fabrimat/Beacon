@@ -1,0 +1,24 @@
+[package]
+name = "beacon-engine"
+description = "Beacon engine: config, VFS, routing, content model, diagnostics, emit"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+blake3 = "1"
+globset = "0.4.20"
+getrandom = "0.4.3"
+dirs = "7.0.0"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
