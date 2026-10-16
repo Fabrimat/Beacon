@@ -8,19 +8,37 @@ use crate::build::{Attempt, trim_rel};
 use crate::config::{Artifact, CONFIG_FILE};
 use crate::diag::{Code, Diagnostic};
 use crate::model::{Body, Pack};
+use crate::packlist;
 use crate::path::RelPath;
 use crate::world::{self, LevelSpec};
 use serde_json::json;
 use std::collections::BTreeMap;
 
 pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
-    if has_errors(&a.diags) {
-        return; // never ship an artifact from a failed build
-    }
-    let plan = cx.plan;
-    let (Some(def), Some(kind)) = (&plan.def, plan.artifact) else {
+    let Some(kind) = cx.plan.artifact else { return };
+    let Some(entries) = assemble(cx, a, kind) else {
         return;
     };
+    let ext = if kind == Artifact::McTemplate {
+        "mctemplate"
+    } else {
+        "mcworld"
+    };
+    publish(cx, a, ext, &entries);
+}
+
+/// The zip entries of a world artifact of `kind` (`McWorld` or `McTemplate`), `None` after a
+/// diagnostic. Shared with `marketplace`, whose `Content/world_template/` is the template.
+pub(crate) fn assemble(
+    cx: &ArtifactCx,
+    a: &mut Attempt,
+    kind: Artifact,
+) -> Option<Vec<(RelPath, Body)>> {
+    if has_errors(&a.diags) {
+        return None; // never ship an artifact from a failed build
+    }
+    let plan = cx.plan;
+    let def = plan.def.as_ref()?;
     let cfg_at = |d: Diagnostic| d.at(RelPath::parse(CONFIG_FILE).expect("const"), None, None);
     let not_found = |msg: String| Diagnostic::new(Code::WorldNotFound, msg);
     let Some(world_dir) = def.world.as_deref().map(trim_rel) else {
@@ -28,21 +46,21 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
             "target {:?}: no `world` folder",
             plan.target
         ))));
-        return;
+        return None;
     };
     let Ok(world_rel) = RelPath::parse(world_dir) else {
         a.diags.push(cfg_at(not_found(format!(
             "target {:?}: bad world folder {world_dir:?}",
             plan.target
         ))));
-        return;
+        return None;
     };
     let files = world::collect(cx.vfs, &world_rel);
     if !files.iter().any(|(r, _)| r.as_str() == "level.dat") {
         a.diags.push(not_found(format!(
             "world folder {world_dir:?} does not exist or has no level.dat"
         )));
-        return;
+        return None;
     }
     let level = world::read_level_dat(cx.vfs, &world_rel).and_then(|bytes| {
         world::transform_level_dat(
@@ -63,27 +81,26 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
                 Code::LevelDatInvalid,
                 format!("{world_dir}/level.dat: {e}"),
             ));
-            return;
+            return None;
         }
     };
 
-    // pack lists (output order) and the embedded packs' zip folders
-    let (mut bps, mut rps) = (Vec::new(), Vec::new());
+    // pack lists (output order, static packs included) and the embedded packs' zip folders
+    let refs = packlist::refs(
+        cx.cfg,
+        Some(cx.lock),
+        cx.vfs,
+        &plan.outputs,
+        plan.edition,
+        None,
+        &|o, p| cx.packs.contains_key(&(o.clone(), p)),
+    );
     let mut embedded: Vec<(RelPath, &Body)> = Vec::new();
     for o in &plan.outputs {
         for p in [Pack::Behavior, Pack::Resource] {
             let Some(pack_files) = cx.packs.get(&(o.clone(), p)) else {
                 continue;
             };
-            // ponytail: static outputs have no lock entry yet (workstream B1 adds their refs)
-            if let Some(r) = cx.lock.pack_ref(o, p, plan.edition, None) {
-                if p == Pack::Behavior {
-                    &mut bps
-                } else {
-                    &mut rps
-                }
-                .push(r);
-            }
             if !def.embed_packs {
                 continue;
             }
@@ -105,7 +122,7 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
             }
         }
     }
-    if !def.embed_packs && (!bps.is_empty() || !rps.is_empty()) {
+    if !def.embed_packs && !refs.is_empty() {
         a.diags.push(cfg_at(Diagnostic::new(
             Code::EmbedPacksMissing,
             format!(
@@ -117,7 +134,7 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
 
     // generated world files; they replace same-named world files
     let rel = |s: &str| RelPath::parse(s).expect("static path");
-    let (bp_list, rp_list) = world::pack_lists(&bps, &rps);
+    let (bp_list, rp_list) = packlist::lists(&refs);
     let mut gen_files: Vec<(RelPath, Body)> = vec![
         (rel("level.dat"), Body::Bytes(level)),
         (
@@ -142,7 +159,7 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
                 "no lock entry for world {world_dir:?} ({:?})",
                 plan.edition
             )));
-            return;
+            return None;
         };
         let meta = cx.cfg.beacon.pack_meta.as_ref();
         let name = meta.and_then(|m| m.name.as_deref()).unwrap_or(&cx.cfg.name);
@@ -201,7 +218,19 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
     for (p, b) in &embedded {
         entries.insert(p, b);
     }
-    let entries: Vec<(RelPath, &Body)> = entries.into_iter().map(|(p, b)| (p.clone(), b)).collect();
+    Some(
+        entries
+            .into_iter()
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect(),
+    )
+}
+
+/// Writes `entries` as `dist/<name>-<target>.<ext>` (or `--out`) through the containment and
+/// link checks.
+pub(crate) fn publish(cx: &ArtifactCx, a: &mut Attempt, ext: &str, entries: &[(RelPath, Body)]) {
+    let plan = cx.plan;
+    let entries: Vec<(RelPath, &Body)> = entries.iter().map(|(p, b)| (p.clone(), b)).collect();
 
     let dir = cx
         .out
@@ -213,11 +242,6 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
         a.diags.push(fail(format!("{}: {e}", dir.display())));
         return;
     }
-    let ext = if kind == Artifact::McTemplate {
-        "mctemplate"
-    } else {
-        "mcworld"
-    };
     let path = dir.join(format!("{}-{}.{ext}", cx.name, safe_name(&plan.target)));
     if !contained(&dir, &path) {
         a.diags.push(escape(&dir, &path));

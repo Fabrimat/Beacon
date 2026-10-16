@@ -265,7 +265,7 @@ fn lang(
 }
 
 /// Removes `//` and `/* */` comments outside strings (newlines kept for line numbers).
-fn strip_comments(b: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_comments(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let (mut i, mut in_str) = (0, false);
     while i < b.len() {

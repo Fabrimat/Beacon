@@ -4,3 +4,4 @@
 /.ci-esbuild
 *.log
 !fixtures/**/db/*.log
+/.beacon-home

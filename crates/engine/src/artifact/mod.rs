@@ -12,7 +12,7 @@ mod store;
 mod world;
 
 use crate::build::{Attempt, Plan};
-use crate::config::{CONFIG_FILE, ProjectConfig};
+use crate::config::ProjectConfig;
 use crate::diag::{Code, Diagnostic, Severity};
 use crate::emit::{self, Ledger};
 use crate::lock::Lockfile;
@@ -131,21 +131,6 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
         Some(SkinPack) => skin::write(cx, a),
         Some(Marketplace) => store::write(cx, a),
     }
-}
-
-/// Placeholder for artifact kinds whose writer is not built yet.
-fn unsupported(cx: &ArtifactCx, a: &mut Attempt) {
-    let kind = cx.plan.artifact.map_or("packs", |k| k.name());
-    a.diags.push(
-        Diagnostic::new(
-            Code::ConfigField,
-            format!(
-                "target {:?}: artifact '{kind}' not supported yet",
-                cx.plan.target
-            ),
-        )
-        .at(RelPath::parse(CONFIG_FILE).expect("const"), None, None),
-    );
 }
 
 /// Defence in depth (config validation already rejects path-like ids and `packs.*` escapes):

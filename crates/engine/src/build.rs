@@ -26,7 +26,7 @@ use crate::manifest::{self, ManifestInput};
 use crate::model::{Body, ContentItem, Dest, Edition, GenCtx, Merge, OutputId, Pack, Version};
 use crate::path::{Hash, RelPath, Vfs};
 use crate::vfs::Index;
-use crate::{merge, registry, route, sarif, statics};
+use crate::{merge, packlist, registry, route, sarif, statics};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind};
@@ -308,11 +308,12 @@ fn plans(
     (out, diags)
 }
 
-/// Adds `texts/languages.json` to every pack that has `texts/*.lang` and no such file.
-fn languages(items: &mut Vec<ContentItem>) {
+/// Adds `texts/languages.json` to every pack that has `texts/*.lang` and no such file
+/// (static packs are included as-is: never).
+fn languages(items: &mut Vec<ContentItem>, is_static: &dyn Fn(&OutputId) -> bool) {
     let mut langs: BTreeMap<(OutputId, Pack), Vec<String>> = BTreeMap::new();
     let mut present = BTreeSet::new();
-    for i in items.iter() {
+    for i in items.iter().filter(|i| !is_static(&i.dest.output)) {
         let p = i.dest.path.as_str();
         if p == "texts/languages.json" {
             present.insert((i.dest.output.clone(), i.dest.pack));
@@ -634,6 +635,9 @@ impl Session {
         // world template and skin pack identities, from every target (like editions)
         let (mut worlds, mut skins) = (Vec::new(), Vec::new());
         for t in cfg.beacon.targets.values() {
+            if let (Artifact::Marketplace, Some(d)) = (t.artifact, &t.skins) {
+                skins.push((trim_rel(d).to_owned(), t.edition)); // store zip embeds the skin pack
+            }
             let (list, dir) = match t.artifact {
                 Artifact::McTemplate | Artifact::Marketplace => (&mut worlds, &t.world),
                 Artifact::SkinPack => (&mut skins, &t.skins),
@@ -687,6 +691,7 @@ impl Session {
         };
 
         let mut built = Vec::with_capacity(plans.len());
+        let mut blocked = Vec::with_capacity(plans.len());
         for plan in &plans {
             let mut items: Vec<ContentItem> = routed
                 .items
@@ -774,14 +779,39 @@ impl Session {
             a.diags.extend(d);
             let (mut merged, d) = merge::resolve(items, &vfs);
             a.diags.extend(d);
-            languages(&mut merged);
+            languages(&mut merged, &is_static);
+            // two packs with one UUID: report it, and write nothing for this plan
+            let present: BTreeSet<(&OutputId, Pack)> = merged
+                .iter()
+                .map(|i| (&i.dest.output, i.dest.pack))
+                .collect();
+            let refs = packlist::refs(
+                &cfg,
+                lock.as_ref(),
+                &vfs,
+                &plan.outputs,
+                plan.edition,
+                (plan.artifact == Some(Artifact::Dev)).then_some(self.root.as_path()),
+                &|o, p| present.contains(&(o, p)),
+            );
+            let dups = packlist::duplicates(&refs);
+            blocked.push(!dups.is_empty());
+            a.diags.extend(
+                dups.into_iter()
+                    .map(|d| d.at(RelPath::parse(CONFIG_FILE).expect("const"), None, None)),
+            );
             built.push(merged);
         }
         // only an attempt that saw a consistent snapshot writes anything
         if let Some(lock) = lock.as_ref().filter(|_| emit)
             && !vfs.changed.load(Ordering::Relaxed)
         {
-            for (plan, merged) in plans.iter().zip(&built) {
+            for ((plan, merged), _) in plans
+                .iter()
+                .zip(&built)
+                .zip(&blocked)
+                .filter(|(_, blocked)| !**blocked)
+            {
                 let cx = ArtifactCx::new(
                     &self.root,
                     plan,

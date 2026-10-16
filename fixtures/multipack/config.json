@@ -4,7 +4,7 @@
   "authors": [
     "Beacon"
   ],
-  "targetVersion": "1.26.60",
+  "targetVersion": "1.26.50",
   "namespace": "multipack",
   "packs": {
     "behaviorPack": "./packs/BP",

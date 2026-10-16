@@ -133,3 +133,54 @@ jobs:
         run: |
           ls -R .
           diff --strip-trailing-cr determinism-Windows/determinism.txt determinism-macOS/determinism.txt
+
+  # In-game smoke on a real Bedrock Dedicated Server (8.5). The repo owner accepted the Minecraft
+  # EULA (https://minecraft.net/eula) for automated BDS use on 2026-10-16; `--accept-eula` below
+  # records that acceptance in <tools>/bds-eula.log on every run. The BDS zip is downloaded only
+  # from minecraft.net, blake3-pinned in crates/bds, cached here by hash, never redistributed.
+  bds-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      BEACON_HOME: ${{ github.workspace }}/.beacon-home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/cache@v4
+        with:
+          path: .beacon-home/tools/03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+          key: bds-win-03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+
+      - name: Install esbuild
+        shell: bash
+        run: |
+          npm i --prefix .ci-esbuild esbuild@0.28.2
+          echo "BEACON_ESBUILD=$(pwd -W)/.ci-esbuild/node_modules/@esbuild/win32-x64/esbuild.exe" >> "$GITHUB_ENV"
+
+      - name: Build beacon
+        run: cargo build --release -p beacon-cli
+
+      # fixtures/minimal has no world target, so multipack's `world` target is used. Fixtures
+      # target a released game version (<= the pinned BDS), so packs load as-is.
+      - name: Build the multipack world
+        shell: bash
+        run: |
+          cp -r fixtures/multipack "$RUNNER_TEMP/multipack"
+          target/release/beacon.exe build --project "$RUNNER_TEMP/multipack" --target world --trust --out smoke-out
+
+      - name: BDS smoke
+        run: >-
+          cargo bds smoke
+          --world smoke-out/beacon-multipack-world.mcworld
+          --expect BEACON_SMOKE_OK:2
+          --accept-eula --yes
+          --log bds-smoke.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bds-smoke-log
+          path: |
+            bds-smoke.log
+            .beacon-home/tools/bds-eula.log

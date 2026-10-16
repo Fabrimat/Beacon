@@ -33,6 +33,7 @@ pub mod lock;
 pub mod manifest;
 pub mod merge;
 pub mod nbt;
+mod packlist;
 pub mod registry;
 pub mod route;
 pub mod sarif;

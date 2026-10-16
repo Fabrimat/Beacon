@@ -2,7 +2,7 @@
   "type": "minecraftBedrock",
   "name": "beacon-minimal",
   "authors": ["Beacon"],
-  "targetVersion": "1.26.60",
+  "targetVersion": "1.26.50",
   "namespace": "minimal",
   "packs": {
     "behaviorPack": "./packs/BP",

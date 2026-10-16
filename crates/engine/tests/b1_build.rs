@@ -313,7 +313,12 @@ fn per_target_min_engine_and_stub_artifacts() {
         let r = session(opts(p.path(), Some(t)), p.path(), &runs).build();
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
         let packs = p.path().join("out/development_behavior_packs");
-        let dir = std::fs::read_dir(packs).unwrap().next().unwrap().unwrap();
+        // two dev targets of one edition deploy to `<name>-<target>-<worktree8>` folders
+        let dir = std::fs::read_dir(packs)
+            .unwrap()
+            .flatten()
+            .find(|d| d.file_name().to_string_lossy().contains(&format!("-{t}-")))
+            .unwrap();
         let m: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap())
                 .unwrap();
