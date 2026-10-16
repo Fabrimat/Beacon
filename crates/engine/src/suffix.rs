@@ -18,12 +18,21 @@
 //!   [`TEXTURE_FOLDERS`], keeping the path below it: `entities/car/body.png` ->
 //!   `RP/textures/entity/car/body.png`. No such ancestor: `Code::UnknownSuffix`.
 //! - Any `.ts` / `.js` / `.d.ts` inside a module is code (`scripts/` entries, generator
-//!   helpers): never routed and never `UnknownSuffix`. `*.gen.ts` are generators.
+//!   helpers): never routed and never `UnknownSuffix`. Files with a [`CONTENT_SUFFIXES`]
+//!   suffix (`*.gen.ts`, content files such as `*.entity.ts`) are generators.
 //! - `*.data.json` are data modules and `module.json` is config: never routed.
 
 use crate::model::{Merge, Pack};
 
-pub const TABLE_VERSION: u32 = 1;
+pub const TABLE_VERSION: u32 = 2;
+
+/// Generator files: `*.gen.ts` and content files (one `*.entity.ts` = one entity, 5.3).
+pub const CONTENT_SUFFIXES: &[&str] = &[".gen.ts", ".entity.ts", ".item.ts", ".block.ts"];
+
+/// The file is evaluated by the JS host ([`CONTENT_SUFFIXES`]).
+pub fn is_generator(name: &str) -> bool {
+    CONTENT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {

@@ -124,6 +124,7 @@ fn session(o: &Opts, a: &BuildArgs) -> Session {
         out: a.out.clone(),
         frozen: a.frozen,
         trusted: a.trust || trust::is_trusted(&o.project, &plugins(&o.project)),
+        release: None,
     };
     // Restricted mode never runs the sidecar (5.5), and `find` itself executes the binary
     // (`--version`), which may be project-shipped (`node_modules`): only look when trusted.

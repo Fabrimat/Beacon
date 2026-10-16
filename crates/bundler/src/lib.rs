@@ -5,7 +5,8 @@
 use beacon_engine::diag::{Code, Diagnostic};
 use beacon_engine::host::{BundleRequest, BundleResult, Bundler};
 use beacon_engine::path::RelPath;
-use std::collections::BTreeSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,13 @@ impl Bundler for Esbuild {
             res.diagnostics
                 .push(Diagnostic::new(Code::BundleError, msg))
         };
+        let defines = match define_args(req.define) {
+            Ok(d) => d,
+            Err(e) => {
+                fail(&mut res, e);
+                return res;
+            }
+        };
         let tmp = match tempfile::tempdir() {
             Ok(t) => t,
             Err(e) => {
@@ -124,6 +132,7 @@ impl Bundler for Esbuild {
                 "--sourcefile=beacon-entry.js",
             ])
             .args(["--log-level=warning", "--color=false"])
+            .args(defines)
             .arg(format!("--metafile={}", meta.display()))
             .arg(format!("--outfile={}", out.display()));
         if req.sourcemap {
@@ -199,6 +208,27 @@ impl Bundler for Esbuild {
     }
 }
 
+/// The target's `define` as compile-time constants: `--define:beacon.define.<K>=<json>`.
+/// Keys must be plain JS identifiers (they become part of the esbuild flag).
+fn define_args(define: &BTreeMap<String, Value>) -> Result<Vec<String>, String> {
+    define
+        .iter()
+        .map(|(k, v)| {
+            let ident = k
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+            if ident {
+                Ok(format!("--define:beacon.define.{k}={v}"))
+            } else {
+                Err(format!("define key {k:?} is not a JavaScript identifier"))
+            }
+        })
+        .collect()
+}
+
 /// Parses `✘ [ERROR] msg` / `X [ERROR] msg` blocks plus the `    path:line:col:` line after.
 /// The caller falls back to the whole stderr when nothing parses.
 fn parse_errors(stderr: &str) -> Vec<Diagnostic> {
@@ -245,6 +275,26 @@ mod tests {
             .err()
             .expect("err");
         assert_eq!(e.code, Code::BundlerMissing);
+    }
+
+    #[test]
+    fn define_flags() {
+        let d: BTreeMap<String, Value> =
+            serde_json::from_str(r#"{"BETA_MODE":true,"name":"a \"q\"","n":1.5,"o":{"x":[1]}}"#)
+                .unwrap();
+        assert_eq!(
+            define_args(&d).unwrap(),
+            [
+                "--define:beacon.define.BETA_MODE=true",
+                r#"--define:beacon.define.n=1.5"#,
+                r#"--define:beacon.define.name="a \"q\"""#,
+                r#"--define:beacon.define.o={"x":[1]}"#,
+            ]
+        );
+        for bad in ["a.b", "1x", "a=b", "", "a-b"] {
+            let d = BTreeMap::from([(bad.to_string(), Value::Bool(true))]);
+            assert!(define_args(&d).is_err(), "{bad}");
+        }
     }
 
     #[test]

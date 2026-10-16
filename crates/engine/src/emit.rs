@@ -191,6 +191,7 @@ pub fn emit_known(
         let bytes = match body {
             Body::Json(v) => Some(canonical::to_vec(v)),
             Body::Text(t) => Some(t.clone().into_bytes()),
+            Body::Bytes(b) => Some(b.clone()),
             Body::Passthrough(_) => None,
         };
         let hash = match (&bytes, body) {

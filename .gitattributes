@@ -3,3 +3,9 @@
 *.ogg binary
 *.jpg binary
 *.mcstructure binary
+*.jpeg binary
+level.dat binary
+*.ldb binary
+**/db/*.log binary
+**/db/CURRENT binary
+**/db/MANIFEST-* binary

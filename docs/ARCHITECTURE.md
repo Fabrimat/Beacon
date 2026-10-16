@@ -621,9 +621,9 @@ Tauri 2 shell + the React UI (Monaco, three.js previews). Primary entry point at
 | Command | Phase (14) |
 |---|---|
 | `build [--target t \| --all]`, `watch`, `check`, `explain`, `--help --json` | 1 |
-| `init`, `add <kind>`, `fix`, `pack`, `dev`, `symbols`, `schema` | 2 |
-| `migrate`, `rename-output`, `plugin update` | 3 |
-| `serve`, `api` | 4 |
+| `init`, `pack`, `fix`, `mcp` | 2 |
+| `add <kind>`, `migrate`, `rename-output`, `plugin update` | 3 |
+| `serve`, `api`, `dev`, `symbols`, `schema` | 4 |
 | `test`, `doctor`, `setup` | 5 |
 
 Every command supports `--json`. Non-interactive without a TTY; `--yes` and `--trust` where

@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Output id from `beacon.outputs[].id`; the implicit single output is `"main"`.
 pub type OutputId = String;
 
+/// A pack version (`[major, minor, patch]`), as written in manifests.
+pub type Version = [u32; 3];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Pack {
     #[serde(rename = "BP")]
@@ -32,6 +35,8 @@ pub enum Body {
     /// Generated or merged JSON; written with the canonical writer.
     Json(Value),
     Text(String),
+    /// Generated binary (e.g. an edited `level.dat`); hashed and written like `Text`.
+    Bytes(Vec<u8>),
 }
 
 /// What happens when several items share a `Dest` (the one merge primitive).

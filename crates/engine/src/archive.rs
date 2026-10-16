@@ -1,5 +1,5 @@
 //! Workstream A2: deterministic archives (5.2): sorted entries, fixed mtime and permissions,
-//! fixed deflate level; already-compressed formats (png, ogg, jpg) stored.
+//! fixed deflate level; already-compressed formats (png, ogg, jpg, LevelDB `.ldb`) stored.
 
 use crate::canonical;
 use crate::model::Body;
@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::Path;
 use zip::{CompressionMethod, DateTime, System, ZipWriter, write::SimpleFileOptions};
 
-const STORED: [&str; 5] = ["png", "ogg", "jpg", "jpeg", "wav"];
+const STORED: &[&str] = &["png", "ogg", "jpg", "jpeg", "wav", "ldb"];
 
 /// Writes a zip at `out` with `entries` (zip path -> body). `.mcpack` = one pack at the zip
 /// root; `.mcaddon` = each pack in its own top-level folder (caller builds the paths).
@@ -42,6 +42,7 @@ pub fn write_zip(out: &Path, entries: &[(RelPath, &Body)], vfs: &dyn Vfs) -> std
                 }
                 Body::Json(v) => zip.write_all(&canonical::to_vec(v))?,
                 Body::Text(t) => zip.write_all(t.as_bytes())?,
+                Body::Bytes(b) => zip.write_all(b)?,
             }
         }
         zip.finish().map_err(io)?.flush()

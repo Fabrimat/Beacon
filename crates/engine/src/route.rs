@@ -4,7 +4,7 @@ use crate::config::{CONFIG_FILE, MODULE_FILE, ModuleJson, OnConflict, ProjectCon
 use crate::diag::{Code, Diagnostic};
 use crate::model::{Body, ContentItem, Dest, Generator, Merge, OutputId, Pack};
 use crate::path::{RelPath, Vfs};
-use crate::suffix::{is_unrouted, route_file};
+use crate::suffix::{is_generator, is_unrouted, route_file};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -184,6 +184,9 @@ pub struct Routed {
     /// Per BP output: game-script entries = every module's top-level `scripts/*.ts`
     /// (not `.d.ts`), sorted. Phase-2 hooks replace this rule.
     pub script_entries: BTreeMap<OutputId, Vec<RelPath>>,
+    /// Parsed `module.json` per module folder (default when absent); modules whose
+    /// `module.json` is invalid are missing.
+    pub modules: BTreeMap<RelPath, ModuleJson>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -292,6 +295,7 @@ fn route_module(
             Err(e) => return mj_err(r, format!("cannot read module.json: {e}"), None, None),
         }
     }
+    r.modules.insert(module.clone(), mj.clone());
 
     // output
     let output: &str = match &mj.output {
@@ -361,7 +365,7 @@ fn route_module(
             None => route_file(name, namespace, rel).map(|(p, d, m)| (p, d, policy(m))),
         };
         let Some((pack, dest, merge)) = routed else {
-            if fname.ends_with(".gen.ts") {
+            if is_generator(fname) {
                 r.generators.push(Generator {
                     path: file.clone(),
                     module: module.clone(),

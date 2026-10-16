@@ -295,3 +295,44 @@ fn bundles_with_external_inputs_are_not_reused() {
     s.build();
     assert_eq!(bundles.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn per_target_min_engine_and_stub_artifacts() {
+    let p = project(&[]);
+    write(
+        p.path(),
+        "config.json",
+        r#"{"type":"minecraftBedrock","name":"b1 test","targetVersion":"1.21.100","namespace":"demo",
+          "beacon":{"targets":{
+            "a":{"edition":"bedrock","artifact":"dev"},
+            "b":{"edition":"bedrock","artifact":"dev","targetVersion":"1.21.50"},
+            "w":{"edition":"bedrock","artifact":"mcworld","world":"worlds/main"}}}}"#,
+    );
+    let runs = Arc::new(AtomicUsize::new(0));
+    let min_engine = |t: &str| {
+        let r = session(opts(p.path(), Some(t)), p.path(), &runs).build();
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let packs = p.path().join("out/development_behavior_packs");
+        let dir = std::fs::read_dir(packs).unwrap().next().unwrap().unwrap();
+        let m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap())
+                .unwrap();
+        m["header"]["min_engine_version"].clone()
+    };
+    assert_eq!(min_engine("a"), serde_json::json!([1, 21, 100]));
+    assert_eq!(min_engine("b"), serde_json::json!([1, 21, 50]));
+
+    let r = session(opts(p.path(), Some("w")), p.path(), &runs).build();
+    assert!(r.diagnostics.iter().any(|d| d.code == Code::ConfigField
+        && d.message.contains("artifact 'mcworld' not supported yet")));
+
+    write(
+        p.path(),
+        "config.json",
+        r#"{"type":"minecraftBedrock","name":"x","targetVersion":"1.21.100","namespace":"demo",
+          "beacon":{"targets":{"z":{"edition":"bedrock","artifact":"zip"}}}}"#,
+    );
+    let r = session(opts(p.path(), None), p.path(), &runs).build();
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert_eq!(r.diagnostics[0].code, Code::ConfigField);
+}

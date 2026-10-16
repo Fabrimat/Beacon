@@ -24,7 +24,7 @@ const BEACON: &str = r#"{"scriptModules":{"@minecraft/server":"2.0.0"},"packMeta
 fn setup() -> (tempfile::TempDir, ProjectConfig, Lockfile) {
     let d = tempfile::tempdir().unwrap();
     let c = cfg(BEACON);
-    let l = Lockfile::ensure(d.path(), &c, &["main".to_string()], false).unwrap();
+    let l = Lockfile::ensure(d.path(), &c, &["main".to_string()], &[], &[], false).unwrap();
     (d, c, l)
 }
 
@@ -42,6 +42,10 @@ fn input<'a>(
         lock: l,
         output: out,
         edition,
+        target_version: match edition {
+            Edition::Bedrock => &c.target_version,
+            Edition::Education => "1.21.50",
+        },
         dev_worktree: dev,
         script_entry: script,
         has_bp: true,

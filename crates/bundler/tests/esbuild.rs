@@ -67,6 +67,7 @@ fn bundles_two_entries() {
         entries: &entries,
         sourcemap: true,
         minify: false,
+        define: &Default::default(),
     };
     let t0 = Instant::now();
     let res = esbuild.bundle(&req);
@@ -107,6 +108,7 @@ fn syntax_error_has_span() {
         entries: &entries,
         sourcemap: false,
         minify: false,
+        define: &Default::default(),
     });
     assert!(res.code.is_none());
     let d = &res.diagnostics[0];
@@ -142,9 +144,39 @@ console.log(x);
         entries: &entries,
         sourcemap: false,
         minify: false,
+        define: &Default::default(),
     });
     assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
     assert!(res.code.unwrap().contains("SHARED"));
     assert!(res.external_inputs);
     assert_eq!(res.inputs, [rp("src/a.js")].into());
+}
+
+#[test]
+fn define_becomes_constant() {
+    let Some(inst) = install() else { return };
+    let esbuild = Esbuild::find(inst).expect("find");
+    let t = tempfile::tempdir().unwrap();
+    std::fs::write(
+        t.path().join("a.js"),
+        "if (beacon.define.BETA_MODE) console.log('BETA_ON', beacon.define.label);\n",
+    )
+    .unwrap();
+    let entries = [rp("a.js")];
+    let define = serde_json::from_str(r#"{"BETA_MODE":true,"label":"a \"b\" c"}"#).unwrap();
+    let res = esbuild.bundle(&BundleRequest {
+        root: t.path(),
+        entries: &entries,
+        sourcemap: false,
+        minify: false,
+        define: &define,
+    });
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    let code = res.code.unwrap();
+    assert!(code.contains("BETA_ON"), "{code}");
+    assert!(!code.contains("beacon.define"), "{code}");
+    assert!(
+        code.contains(r#"a \"b\" c"#) || code.contains(r#"'a "b" c'"#),
+        "{code}"
+    );
 }

@@ -9,6 +9,9 @@
 //! config::load -> vfs::index -> route::route -> (jshost: generators) -> merge::resolve
 //!   -> lock + manifest -> emit::emit (dir via ledger) | archive::write (.mcpack/.mcaddon)
 //! ```
+//!
+//! Phase-2 seams: `statics::items` after routing, `registry::derive` before merge, and one
+//! writer per artifact kind in `artifact/`.
 
 // contract
 pub mod config;
@@ -21,6 +24,7 @@ pub mod suffix;
 
 // owned by workstreams
 pub mod archive;
+mod artifact;
 pub mod build;
 mod cache;
 pub mod canonical;
@@ -28,7 +32,9 @@ pub mod emit;
 pub mod lock;
 pub mod manifest;
 pub mod merge;
+pub mod registry;
 pub mod route;
 pub mod sarif;
+pub mod statics;
 pub mod trust;
 pub mod vfs;

@@ -3,14 +3,15 @@
 use crate::canonical;
 use crate::config::{LOCK_FILE, ProjectConfig};
 use crate::diag::{Code, Diagnostic};
-use crate::model::{Edition, OutputId, Pack};
+use crate::model::{Edition, OutputId, Pack, Version};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// `beacon.lock.json`. Pack + module UUIDs per (output x edition), or one `shared` set when
 /// `sharedEditionUuids`; script module UUID per output. Entries of outputs that disappeared
-/// are kept (identities survive; `rename-output` is phase 3).
-// ponytail: last released version/hash and plugin sources are phase 2/3 fields.
+/// are kept (identities survive; `rename-output` is phase 3). World templates and skin packs
+/// are keyed by project-relative folder and are never shared across editions.
+// ponytail: plugin sources are a phase 3 field.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lockfile {
@@ -20,6 +21,12 @@ pub struct Lockfile {
     pub bundler: Option<String>,
     #[serde(default)]
     pub outputs: BTreeMap<OutputId, OutputLock>,
+    /// World template identities, keyed by world folder (`worlds/main`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worlds: BTreeMap<String, EditionMap>,
+    /// Skin pack identities, keyed by skins folder.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skins: BTreeMap<String, EditionMap>,
 }
 
 impl Default for Lockfile {
@@ -28,8 +35,32 @@ impl Default for Lockfile {
             canonical_version: canonical::CANONICAL_VERSION,
             bundler: None,
             outputs: BTreeMap::new(),
+            worlds: BTreeMap::new(),
+            skins: BTreeMap::new(),
         }
     }
+}
+
+/// Per-edition identities of one world template or skin pack.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditionMap {
+    #[serde(default)]
+    pub editions: BTreeMap<Edition, PackLock>,
+}
+
+/// Last release of a pack (4.2.1).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Release {
+    pub version: Version,
+    /// Content hash at that release, hex.
+    pub hash: String,
+}
+
+/// A manifest dependency on a pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackRef {
+    pub uuid: String,
+    pub version: Version,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -54,6 +85,8 @@ pub struct EditionLock {
 pub struct PackLock {
     pub header: String,
     pub module: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
 }
 
 fn uuid4() -> String {
@@ -80,6 +113,7 @@ fn new_pack() -> PackLock {
     PackLock {
         header: uuid4(),
         module: uuid4(),
+        release: None,
     }
 }
 
@@ -92,13 +126,16 @@ fn new_edition() -> EditionLock {
 
 impl Lockfile {
     /// Loads the lockfile (or starts empty), adds missing entries for `outputs` (new random
-    /// UUIDs) for every edition of `cfg.beacon.targets` (Bedrock if none), and saves it
+    /// UUIDs) for every edition of `cfg.beacon.targets` (Bedrock if none), plus one entry per
+    /// (folder, edition) in `worlds` (world templates) and `skins` (skin packs), and saves it
     /// (canonical JSON, atomically) if it changed. With `frozen`, a needed change is
     /// `Code::LockfileFrozen` instead.
     pub fn ensure(
         root: &Path,
         cfg: &ProjectConfig,
         outputs: &[OutputId],
+        worlds: &[(String, Edition)],
+        skins: &[(String, Edition)],
         frozen: bool,
     ) -> Result<Lockfile, Diagnostic> {
         let path = root.join(LOCK_FILE);
@@ -133,6 +170,15 @@ impl Lockfile {
                 for e in &editions {
                     o.editions.entry(*e).or_insert_with(new_edition);
                 }
+            }
+        }
+        for (map, list) in [(&mut lock.worlds, worlds), (&mut lock.skins, skins)] {
+            for (dir, e) in list {
+                map.entry(dir.clone())
+                    .or_default()
+                    .editions
+                    .entry(*e)
+                    .or_insert_with(new_pack);
             }
         }
         if loaded.as_ref() != Some(&lock) {
@@ -189,6 +235,28 @@ impl Lockfile {
 
     pub fn set_bundler(&mut self, version: Option<String>) {
         self.bundler = version;
+    }
+
+    /// Version of a pack: its last release, else `[1, 0, 0]`.
+    pub fn version_of(&self, output: &str, pack: Pack, edition: Edition) -> Version {
+        self.pack_lock(output, pack, edition)
+            .and_then(|p| p.release.as_ref())
+            .map_or([1, 0, 0], |r| r.version)
+    }
+
+    /// Header UUID (dev UUID when `dev` is the worktree root) and version of a pack.
+    pub fn pack_ref(
+        &self,
+        output: &str,
+        pack: Pack,
+        edition: Edition,
+        dev: Option<&Path>,
+    ) -> Option<PackRef> {
+        let uuid = self.pack_uuid(output, pack, edition)?;
+        Some(PackRef {
+            uuid: dev.map_or_else(|| uuid.clone(), |w| dev_uuid(&uuid, w)),
+            version: self.version_of(output, pack, edition),
+        })
     }
 }
 

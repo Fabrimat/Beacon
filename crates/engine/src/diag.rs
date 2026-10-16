@@ -124,15 +124,33 @@ codes! {
     NonPortablePath = "BCN0013", Error;
     /// A module is not covered by any output's `include` globs.
     ModuleWithoutOutput = "BCN0014", Error;
+    /// A target's `world` folder (or a `worlds` glob match) does not exist or is not a world
+    /// (no `level.dat`).
+    WorldNotFound = "BCN0015", Error;
+    /// A static output's `bp`/`rp` folder is missing, outside the project, or has no valid
+    /// `manifest.json`.
+    StaticPackInvalid = "BCN0016", Error;
+    /// Two packs (generated or static) share a header UUID; the game loads only one of them.
+    DuplicatePackUuid = "BCN0017", Error;
     /// The same `.lang` key is defined twice across modules.
     LangDuplicateKey = "BCN0020", Error;
     /// JSON deep merge found two different scalar values for the same key.
     MergeConflict = "BCN0021", Error;
     /// A file taking part in a merge could not be read, or is not valid JSON.
     MergeInputInvalid = "BCN0022", Error;
+    /// A `module.json` `hooks` entry names a function file that does not exist in the module.
+    /// Fix: use the module-relative path without extension (`functions/loop`).
+    HookUnknownFunction = "BCN0024", Error;
     /// A symlink, junction, or other reparse point inside the project was skipped. User code
     /// never sees files outside the project root.
     ReparsePointSkipped = "BCN0030", Note;
+    /// A world's `level.dat` could not be read or edited (bad header or NBT, or a `levelDat`
+    /// override with an unknown path or the wrong type).
+    LevelDatInvalid = "BCN0031", Error;
+    /// `embedPacks: false`: the world references packs that the artifact will not contain.
+    EmbedPacksMissing = "BCN0032", Warning;
+    /// The `marketplace` target's `art` folder lacks expected store or marketing art.
+    ArtMissing = "BCN0033", Warning;
     /// A generator threw, failed to compile, or returned something that is not content.
     GeneratorError = "BCN0040", Error;
     /// A generator exceeded its time budget.
@@ -149,12 +167,28 @@ codes! {
     BundlerMissing = "BCN0060", Error;
     /// The game-script bundle failed.
     BundleError = "BCN0061", Error;
+    /// esbuild was found outside the pinned download (PATH or `node_modules`); its version is
+    /// not the one Beacon pins, so bundles may differ across machines.
+    BundlerUnpinned = "BCN0062", Note;
+    /// A pinned tool download failed (network, HTTP status, or disk).
+    DownloadFailed = "BCN0063", Error;
+    /// A downloaded file does not match its pinned blake3 hash; it was discarded.
+    DownloadHashMismatch = "BCN0064", Error;
+    /// A download is needed but was not confirmed. Pass `--yes`, or run on a TTY to be asked.
+    DownloadNeedsConfirm = "BCN0065", Error;
     /// `beacon.lock.json` would change but `--frozen` was given.
     LockfileFrozen = "BCN0070", Error;
     /// `beacon.lock.json` is not valid.
     LockfileInvalid = "BCN0071", Error;
     /// A `manifest.json` in a `packs.*` folder was edited by hand; it is generated output.
     ManifestDrift = "BCN0072", Warning;
+    /// A pack's content changed since its last release but its version did not
+    /// (`versionPolicy: "manual"`). Fix: `beacon pack --set-version <x.y.z>`.
+    PackVersionStale = "BCN0073", Error;
+    /// A new pack version is not greater than the last released one; versions are monotonic.
+    PackVersionNotMonotonic = "BCN0074", Error;
+    /// A pack changed since its last release; the next `beacon pack` will bump its version.
+    PackReleaseBehind = "BCN0075", Warning;
     /// A file could not be written (locked by the game, permissions, path too long).
     EmitFailed = "BCN0080", Error;
     /// The emit ledger is missing or corrupt; no stale files were deleted.
@@ -163,6 +197,9 @@ codes! {
     /// writes would land wherever it points. Untrusted builds refuse to write through it
     /// (error); trusted builds write and warn (e.g. a pack folder junctioned into com.mojang).
     OutputIsLink = "BCN0082", Warning;
+    /// Generated agent docs (`AGENTS.md`) are out of date with the project. Fix: regenerate
+    /// them (`beacon fix`).
+    AgentDocsStale = "BCN0090", Error;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

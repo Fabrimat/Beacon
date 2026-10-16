@@ -1,0 +1,105 @@
+{
+  "type": "minecraftBedrock",
+  "name": "beacon-multipack",
+  "authors": [
+    "Beacon"
+  ],
+  "targetVersion": "1.26.60",
+  "namespace": "multipack",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP",
+    "skinPack": "./packs/skins",
+    "worldTemplate": "./packs/WT"
+  },
+  "worlds": [
+    "./worlds/*"
+  ],
+  "beacon": {
+    "sources": [
+      "./src"
+    ],
+    "packMeta": {
+      "name": "Beacon Multipack",
+      "description": "Multi-pack Beacon example project",
+      "icon": "./pack_icon.png"
+    },
+    "outputs": [
+      {
+        "id": "game",
+        "include": [
+          "src/game/**"
+        ],
+        "dependsOn": [
+          "lib",
+          "vendor"
+        ]
+      },
+      {
+        "id": "lib",
+        "include": [
+          "src/lib/**"
+        ],
+        "namespace": "lib"
+      },
+      {
+        "id": "vendor",
+        "static": {
+          "bp": "./vendor/pack/BP",
+          "rp": "./vendor/pack/RP"
+        }
+      }
+    ],
+    "targets": {
+      "dev": {
+        "edition": "bedrock",
+        "artifact": "dev",
+        "world": "worlds/main"
+      },
+      "addon": {
+        "edition": "bedrock",
+        "artifact": "mcaddon"
+      },
+      "world": {
+        "edition": "bedrock",
+        "artifact": "mcworld",
+        "world": "worlds/main"
+      },
+      "edu": {
+        "edition": "education",
+        "artifact": "mcworld",
+        "world": "worlds/main",
+        "targetVersion": "1.21.50",
+        "experiments": [
+          "cameras"
+        ]
+      },
+      "template": {
+        "edition": "bedrock",
+        "artifact": "mctemplate",
+        "world": "worlds/main"
+      },
+      "skins": {
+        "edition": "bedrock",
+        "artifact": "skinpack",
+        "skins": "skins"
+      },
+      "store": {
+        "edition": "bedrock",
+        "artifact": "marketplace",
+        "world": "worlds/main",
+        "art": "art"
+      },
+      "beta": {
+        "edition": "bedrock",
+        "artifact": "dev",
+        "define": {
+          "BETA_MODE": true
+        }
+      }
+    },
+    "scriptModules": {
+      "@minecraft/server": "2.10.0"
+    }
+  }
+}

@@ -12,6 +12,8 @@ pub struct ManifestInput<'a> {
     pub lock: &'a Lockfile,
     pub output: &'a OutputId,
     pub edition: Edition,
+    /// The target's `targetVersion` (else the project's): `min_engine_version`.
+    pub target_version: &'a str,
     /// Dev build: dev UUIDs derived from this worktree root; versions unchanged.
     pub dev_worktree: Option<&'a Path>,
     /// BP-relative path of the script bundle entry (e.g. `scripts/main.js`), if any: adds the
@@ -25,15 +27,8 @@ pub struct ManifestInput<'a> {
 const VERSION: [u32; 3] = [1, 0, 0];
 
 fn min_engine(m: &ManifestInput) -> Vec<u32> {
-    let edition_version = m
-        .cfg
-        .beacon
-        .targets
-        .values()
-        .find(|t| t.edition == m.edition && t.target_version.is_some())
-        .and_then(|t| t.target_version.as_deref());
-    let mut v: Vec<u32> = edition_version
-        .unwrap_or(&m.cfg.target_version)
+    let mut v: Vec<u32> = m
+        .target_version
         .split('.')
         .filter_map(|p| p.parse().ok())
         .take(3)

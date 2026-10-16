@@ -1,0 +1,76 @@
+{
+  "bundler": "esbuild 0.28.2",
+  "canonicalVersion": 1,
+  "outputs": {
+    "game": {
+      "editions": {
+        "bedrock": {
+          "BP": {
+            "header": "0467293d-4582-44f5-8513-5ffd006d7780",
+            "module": "9727aae0-0a07-4057-aa2c-09b1e17957c5"
+          },
+          "RP": {
+            "header": "07d44bca-206a-45b0-ae5c-cc3e58392c67",
+            "module": "933d6dfa-ce5d-4981-bd6a-9c65f7fd3cd2"
+          }
+        },
+        "education": {
+          "BP": {
+            "header": "cbeacdff-7941-44ae-886c-33c8515a0208",
+            "module": "f0fb6f4e-90e5-4bed-9b66-4faa7ff509c0"
+          },
+          "RP": {
+            "header": "ce236dfa-d7ac-4664-a75e-cd698d74d466",
+            "module": "a31cc0ea-f5c3-492f-904c-5d7220a9c8f1"
+          }
+        }
+      },
+      "scriptModule": "c3275426-2fce-450e-af62-7465f468be32"
+    },
+    "lib": {
+      "editions": {
+        "bedrock": {
+          "BP": {
+            "header": "ebbcc92d-2bb8-4ca9-84eb-75cf689915a2",
+            "module": "39a2c2b7-4456-401c-9753-975ec8032f9a"
+          },
+          "RP": {
+            "header": "aaee1a2c-3c55-4f89-8111-213756bea291",
+            "module": "8470b7be-5869-489f-a49c-adc8d6549133"
+          }
+        },
+        "education": {
+          "BP": {
+            "header": "538d0589-25b4-4f4a-a157-65d5e76f681a",
+            "module": "e3fcc1f2-c310-4031-94ac-23b3b2976757"
+          },
+          "RP": {
+            "header": "39d8425e-b620-4f30-8a31-22a6040ae701",
+            "module": "b154f6f7-56ee-40e6-9312-2cdc2c17bb09"
+          }
+        }
+      },
+      "scriptModule": "0589c54c-8e89-4de6-9489-45e4c59119bf"
+    }
+  },
+  "skins": {
+    "skins": {
+      "editions": {
+        "bedrock": {
+          "header": "96195000-f78f-4beb-a778-08a29491d1cd",
+          "module": "e669e369-1eba-4922-8e92-0986cc8cfa69"
+        }
+      }
+    }
+  },
+  "worlds": {
+    "worlds/main": {
+      "editions": {
+        "bedrock": {
+          "header": "936421be-e91d-45bb-84e8-baa00378e8f9",
+          "module": "ea0abc56-21b9-4ded-98f2-ef21aa585777"
+        }
+      }
+    }
+  }
+}

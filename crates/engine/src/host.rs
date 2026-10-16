@@ -5,7 +5,8 @@
 use crate::diag::Diagnostic;
 use crate::model::{ContentItem, GenCtx, Generator, ObservedInputs};
 use crate::path::{RelPath, Vfs};
-use std::collections::BTreeSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub struct GenResult {
@@ -29,6 +30,9 @@ pub struct BundleRequest<'a> {
     pub entries: &'a [RelPath],
     pub sourcemap: bool,
     pub minify: bool,
+    /// The target's `define`, exposed to scripts as `beacon.define.<K>` (compile-time
+    /// constants: `--define:beacon.define.<K>=<json>`).
+    pub define: &'a BTreeMap<String, Value>,
 }
 
 pub struct BundleResult {

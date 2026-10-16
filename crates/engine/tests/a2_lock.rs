@@ -15,7 +15,7 @@ fn creates_is_stable_and_never_removes() {
     let c = cfg(
         r#"{"targets":{"a":{"edition":"bedrock","artifact":"dev"},"b":{"edition":"education","artifact":"dev"}}}"#,
     );
-    let l = Lockfile::ensure(d.path(), &c, &outs(&["main", "lib"]), false).unwrap();
+    let l = Lockfile::ensure(d.path(), &c, &outs(&["main", "lib"]), &[], &[], false).unwrap();
     let bed = l
         .pack_uuid("main", Pack::Behavior, Edition::Bedrock)
         .unwrap();
@@ -39,11 +39,11 @@ fn creates_is_stable_and_never_removes() {
     std::thread::sleep(std::time::Duration::from_millis(30));
     // stable: same result, no rewrite (also under frozen)
     assert_eq!(
-        Lockfile::ensure(d.path(), &c, &outs(&["main", "lib"]), true).unwrap(),
+        Lockfile::ensure(d.path(), &c, &outs(&["main", "lib"]), &[], &[], true).unwrap(),
         l
     );
     // output disappearing keeps its entry
-    let l2 = Lockfile::ensure(d.path(), &c, &outs(&["main"]), false).unwrap();
+    let l2 = Lockfile::ensure(d.path(), &c, &outs(&["main"]), &[], &[], false).unwrap();
     assert_eq!(l2, l);
     assert_eq!(std::fs::read(&path).unwrap(), before.0);
     assert_eq!(
@@ -57,14 +57,14 @@ fn creates_is_stable_and_never_removes() {
 fn frozen_and_invalid() {
     let d = tempfile::tempdir().unwrap();
     let c = cfg("{}");
-    let e = Lockfile::ensure(d.path(), &c, &outs(&["main"]), true).unwrap_err();
+    let e = Lockfile::ensure(d.path(), &c, &outs(&["main"]), &[], &[], true).unwrap_err();
     assert_eq!(e.code, Code::LockfileFrozen);
     assert!(!d.path().join(LOCK_FILE).exists());
-    Lockfile::ensure(d.path(), &c, &outs(&["main"]), false).unwrap();
-    let e = Lockfile::ensure(d.path(), &c, &outs(&["main", "new"]), true).unwrap_err();
+    Lockfile::ensure(d.path(), &c, &outs(&["main"]), &[], &[], false).unwrap();
+    let e = Lockfile::ensure(d.path(), &c, &outs(&["main", "new"]), &[], &[], true).unwrap_err();
     assert_eq!(e.code, Code::LockfileFrozen);
     std::fs::write(d.path().join(LOCK_FILE), "{nope").unwrap();
-    let e = Lockfile::ensure(d.path(), &c, &outs(&["main"]), false).unwrap_err();
+    let e = Lockfile::ensure(d.path(), &c, &outs(&["main"]), &[], &[], false).unwrap_err();
     assert_eq!(e.code, Code::LockfileInvalid);
 }
 
@@ -74,7 +74,7 @@ fn shared_edition_uuids() {
     let c = cfg(
         r#"{"sharedEditionUuids":true,"targets":{"a":{"edition":"bedrock","artifact":"dev"},"b":{"edition":"education","artifact":"dev"}}}"#,
     );
-    let l = Lockfile::ensure(d.path(), &c, &outs(&["main"]), false).unwrap();
+    let l = Lockfile::ensure(d.path(), &c, &outs(&["main"]), &[], &[], false).unwrap();
     for p in [Pack::Behavior, Pack::Resource] {
         assert_eq!(
             l.pack_uuid("main", p, Edition::Bedrock).unwrap(),
@@ -102,4 +102,50 @@ fn dev_uuid_deterministic_per_worktree() {
     assert_ne!(u, rel);
     assert_eq!(&u[14..15], "4");
     assert!("89ab".contains(&u[19..20]));
+}
+
+#[test]
+fn worlds_skins_versions_and_old_lockfiles() {
+    // phase-1 lockfiles parse and re-serialize byte-identically
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/minimal");
+    let bytes = std::fs::read(std::path::Path::new(fixture).join(LOCK_FILE)).unwrap();
+    let old: Lockfile = serde_json::from_slice(&bytes).unwrap();
+    let again = beacon_engine::canonical::to_vec(&serde_json::to_value(&old).unwrap());
+    assert_eq!(again, bytes);
+
+    let d = tempfile::tempdir().unwrap();
+    let c = cfg("{}");
+    let w = [
+        ("worlds/main".to_string(), Edition::Bedrock),
+        ("worlds/main".to_string(), Edition::Education),
+    ];
+    let s = [("skins".to_string(), Edition::Bedrock)];
+    let l = Lockfile::ensure(d.path(), &c, &outs(&["main"]), &w, &s, false).unwrap();
+    let wm = &l.worlds["worlds/main"].editions;
+    assert_ne!(wm[&Edition::Bedrock].header, wm[&Edition::Education].header);
+    assert_eq!(l.skins["skins"].editions.len(), 1);
+    assert_eq!(
+        Lockfile::ensure(d.path(), &c, &outs(&["main"]), &w, &s, true).unwrap(),
+        l
+    );
+
+    assert_eq!(
+        l.version_of("main", Pack::Behavior, Edition::Bedrock),
+        [1, 0, 0]
+    );
+    let r = l
+        .pack_ref("main", Pack::Resource, Edition::Bedrock, None)
+        .unwrap();
+    assert_eq!(
+        Some(r.uuid.clone()),
+        l.pack_uuid("main", Pack::Resource, Edition::Bedrock)
+    );
+    let dev = l
+        .pack_ref("main", Pack::Resource, Edition::Bedrock, Some(d.path()))
+        .unwrap();
+    assert_eq!(dev.uuid, dev_uuid(&r.uuid, d.path()));
+    assert!(
+        l.pack_ref("nope", Pack::Resource, Edition::Bedrock, None)
+            .is_none()
+    );
 }

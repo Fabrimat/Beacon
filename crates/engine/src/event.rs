@@ -5,6 +5,8 @@
 //! returns first; the ledger is tiny, so the gap is negligible). The perf harness waits
 //! for these lines. The first line is `"event":"ready"` after the initial build.
 
+use crate::model::{Edition, Version};
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BuildEvent {
     /// `ready` (initial build done, watching) | `built` (a rebuild finished).
@@ -27,4 +29,20 @@ pub struct BuildReport {
     pub artifacts: Vec<String>,
     /// SARIF 2.1 log (see `sarif`).
     pub sarif: serde_json::Value,
+    /// Versions of the packs this build released (4.2.1); empty for non-release builds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<PackVersion>,
+}
+
+/// One pack's version in a release build.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PackVersion {
+    /// `"<output>/BP"` | `"<output>/RP"` | `"world:<path>"` | `"skins:<path>"`.
+    pub pack: String,
+    pub edition: Edition,
+    pub version: Version,
+    /// The version changed in this build.
+    pub bumped: bool,
+    /// Content hash (4.2.1), hex.
+    pub hash: String,
 }

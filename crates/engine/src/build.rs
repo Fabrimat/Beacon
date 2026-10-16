@@ -11,20 +11,22 @@
 //! Destinations: no target = the "packs" build (primary output projected to `packs.*`, the
 //! others to `.beacon/out/<id>/BP|RP`; `--out <dir>` = `<dir>/<id>/BP|RP`). `dev` targets go to
 //! the edition's `com.mojang` (`BEACON_COM_MOJANG`, else detected; `--out` replaces it);
-//! `mcpack`/`mcaddon` to `dist/` (or `--out`).
+//! `mcpack`/`mcaddon` to `dist/` (or `--out`). Each artifact kind is written by its module in
+//! `artifact/`.
 
+use crate::artifact::{self, ArtifactCx};
 use crate::cache::GenCache;
-use crate::config::{CONFIG_FILE, ProjectConfig, STATE_DIR};
+use crate::config::{Artifact, CONFIG_FILE, ProjectConfig, STATE_DIR, TargetDef};
 use crate::diag::{Code, Diagnostic, Severity};
 use crate::emit::Ledger;
-use crate::event::BuildReport;
+use crate::event::{BuildReport, PackVersion};
 use crate::host::{BundleRequest, Bundler, GeneratorHost};
 use crate::lock::Lockfile;
 use crate::manifest::{self, ManifestInput};
-use crate::model::{Body, ContentItem, Dest, Edition, GenCtx, Merge, OutputId, Pack};
+use crate::model::{Body, ContentItem, Dest, Edition, GenCtx, Merge, OutputId, Pack, Version};
 use crate::path::{Hash, RelPath, Vfs};
 use crate::vfs::Index;
-use crate::{archive, emit, merge, route, sarif};
+use crate::{merge, registry, route, sarif, statics};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind};
@@ -43,6 +45,26 @@ pub struct BuildOptions {
     pub frozen: bool,
     /// Run generators and the bundler. Untrusted = restricted mode (5.5).
     pub trusted: bool,
+    /// Release build (`beacon pack`, 4.2.1). `None` = pack versions are never touched.
+    pub release: Option<ReleaseOptions>,
+}
+
+/// Version changes of a release build (4.2.1).
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseOptions {
+    /// `--bump`: at least this bump for changed packs (`auto` policy).
+    pub bump: Option<Bump>,
+    /// `--set-version` (`manual` policy).
+    pub set_version: Option<Version>,
+    /// `--pack <id>`: only this pack.
+    pub only: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bump {
+    Patch,
+    Minor,
+    Major,
 }
 
 pub struct BuildOutcome {
@@ -69,7 +91,7 @@ pub struct Session {
     bundler: Option<Box<dyn Bundler>>,
     index: Option<Index>,
     cache: GenCache,
-    bundles: HashMap<(OutputId, bool), BundleMemo>,
+    bundles: HashMap<BundleKey, BundleMemo>,
     generation: u64,
     /// Index excludes of the current index (a change means a rescan).
     excl: Vec<RelPath>,
@@ -102,30 +124,45 @@ struct BundleMemo {
     out: Bundled,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Packs,
-    Dev,
-    McPack,
-    McAddon,
+/// (output, sourcemap, hash of the target's `define`).
+type BundleKey = (OutputId, bool, Hash);
+
+/// One target to build (or the packs build).
+pub(crate) struct Plan {
+    pub target: String,
+    /// `None` = the packs build (no `--target`).
+    pub artifact: Option<Artifact>,
+    pub edition: Edition,
+    pub outputs: Vec<OutputId>,
+    /// The target's `targetVersion`, else the project's.
+    pub target_version: String,
+    pub define: BTreeMap<String, Value>,
+    /// The target's definition; `None` for the packs build.
+    #[allow(dead_code)] // read by the phase-2 writers (world, skin, store)
+    pub def: Option<TargetDef>,
 }
 
-struct Plan {
-    target: String,
-    kind: Kind,
-    edition: Edition,
-    outputs: Vec<OutputId>,
-    define: BTreeMap<String, Value>,
+impl Plan {
+    /// Dev-like builds carry source maps.
+    fn sourcemap(&self) -> bool {
+        self.artifact.is_none_or(|a| a == Artifact::Dev)
+    }
+
+    fn define_hash(&self) -> Hash {
+        *blake3::hash(&serde_json::to_vec(&self.define).expect("define json")).as_bytes()
+    }
 }
 
 #[derive(Default)]
-struct Attempt {
-    diags: Vec<Diagnostic>,
-    emitted: usize,
-    artifacts: Vec<String>,
-    inputs: BTreeSet<RelPath>,
-    generators_run: usize,
-    changed: bool,
+pub(crate) struct Attempt {
+    pub diags: Vec<Diagnostic>,
+    pub emitted: usize,
+    pub artifacts: Vec<String>,
+    /// Release builds: the version of every pack written.
+    pub packs: Vec<PackVersion>,
+    pub inputs: BTreeSet<RelPath>,
+    pub generators_run: usize,
+    pub changed: bool,
 }
 
 /// The index as the build sees it; remembers whether a read found a file changed since
@@ -181,121 +218,13 @@ pub fn canon(p: &Path) -> PathBuf {
     abs
 }
 
-/// Defence in depth (config validation already rejects path-like ids and `packs.*` escapes):
-/// `dir` must be strictly below `base`, lexically, with no `..`/root/prefix components.
-fn contained(base: &Path, dir: &Path) -> bool {
-    dir.strip_prefix(base).is_ok_and(|r| {
-        r.components().next().is_some()
-            && r.components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
-    })
-}
-
-/// Links inside the project on the way to an output (`packs/BP -> ~/.config`, a linked
-/// `.beacon`, `dist` or in-project `--out`) would let a committed project redirect writes
-/// anywhere. Untrusted: refuse (error). Trusted: allowed with a warning naming the target
-/// (pack folders are often junctioned into com.mojang). Outputs outside the project
-/// (com.mojang, an outside `--out`) are paths the user chose; the project cannot plant links
-/// there, so they are not checked.
-fn link_ok(root: &Path, dir: &Path, trusted: bool, diags: &mut Vec<Diagnostic>) -> bool {
-    if !contained(root, dir) {
-        return true;
-    }
-    let Some(link) = emit::link_below(root, dir) else {
-        return true;
-    };
-    let target = std::fs::read_link(&link).map_or_else(|_| "?".into(), |t| t.display().to_string());
-    let mut d = Diagnostic::new(
-        Code::OutputIsLink,
-        format!("output dir {} is a link to {target}", link.display()),
-    );
-    if !trusted {
-        d.severity = Severity::Error;
-        d.message += "; refusing to write through it in an untrusted project";
-    }
-    diags.push(d);
-    trusted
-}
-
-fn escape(base: &Path, dir: &Path) -> Diagnostic {
-    Diagnostic::new(
-        Code::Internal,
-        format!(
-            "refusing to write {}: not inside {}",
-            dir.display(),
-            base.display()
-        ),
-    )
-}
-
-fn has_errors(d: &[Diagnostic]) -> bool {
-    d.iter().any(|d| d.severity == Severity::Error)
-}
-
-fn pack_name(p: Pack) -> &'static str {
-    match p {
-        Pack::Behavior => "BP",
-        Pack::Resource => "RP",
-    }
-}
-
 /// `./packs/BP/` -> `packs/BP`.
-fn trim_rel(s: &str) -> &str {
+pub(crate) fn trim_rel(s: &str) -> &str {
     let mut s = s;
     while let Some(r) = s.strip_prefix("./") {
         s = r;
     }
     s.trim_end_matches('/')
-}
-
-/// File/folder name from the project name: `[A-Za-z0-9 ._-]`, others become `_`.
-fn safe_name(s: &str) -> String {
-    let n: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || " ._-".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let n = n.trim_matches(|c| c == '.' || c == ' ');
-    if n.is_empty() {
-        "pack".into()
-    } else {
-        n.into()
-    }
-}
-
-/// `com.mojang` of an edition: `BEACON_COM_MOJANG`, else the GDK then UWP install (Bedrock),
-/// or the Education install. `None` when not found.
-fn com_mojang(edition: Edition) -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("BEACON_COM_MOJANG") {
-        return Some(p.into());
-    }
-    let roaming = dirs::data_dir()?;
-    let candidates = match edition {
-        Edition::Bedrock => vec![
-            roaming.join("Minecraft Bedrock/Users/Shared/games/com.mojang"),
-            dirs::data_local_dir()?
-                .join("Packages/Microsoft.MinecraftUWP_8wekyb3d8bbwe/LocalState/games/com.mojang"),
-        ],
-        Edition::Education => vec![roaming.join("Minecraft Education Edition/games/com.mojang")],
-    };
-    candidates.into_iter().find(|p| p.is_dir())
-}
-
-/// First 8 hex chars of a hash of the worktree path (dev folder suffix, 4.2).
-fn worktree8(root: &Path) -> String {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.into());
-    let s = root.to_string_lossy();
-    let s = if cfg!(windows) {
-        s.to_lowercase()
-    } else {
-        s.into_owned()
-    };
-    blake3::hash(s.as_bytes()).to_hex()[..8].to_owned()
 }
 
 fn plans(
@@ -322,16 +251,25 @@ fn plans(
     };
     if names.is_empty() {
         let bedrock = targets.is_empty() || targets.values().any(|t| t.edition == Edition::Bedrock);
+        let edition = if bedrock {
+            Edition::Bedrock
+        } else {
+            Edition::Education
+        };
+        // no target: the first targetVersion given for this edition, else the project's
+        let target_version = targets
+            .values()
+            .filter(|t| t.edition == edition)
+            .find_map(|t| t.target_version.clone())
+            .unwrap_or_else(|| cfg.target_version.clone());
         let plan = Plan {
             target: PACKS_TARGET.into(),
-            kind: Kind::Packs,
-            edition: if bedrock {
-                Edition::Bedrock
-            } else {
-                Edition::Education
-            },
+            artifact: None,
+            edition,
             outputs: all.to_vec(),
+            target_version,
             define: BTreeMap::new(),
+            def: None,
         };
         return (vec![plan], diags);
     }
@@ -345,15 +283,6 @@ fn plans(
                 None,
             )
         };
-        let kind = match t.artifact.as_str() {
-            "dev" => Kind::Dev,
-            "mcpack" => Kind::McPack,
-            "mcaddon" => Kind::McAddon,
-            a => {
-                diags.push(bad(format!("artifact {a:?} is not supported yet")));
-                continue;
-            }
-        };
         let outputs = match &t.outputs {
             Some(list) if !list.iter().any(|o| o == "*") => {
                 for o in list.iter().filter(|o| !all.contains(o)) {
@@ -365,10 +294,15 @@ fn plans(
         };
         out.push(Plan {
             target: name.clone(),
-            kind,
+            artifact: Some(t.artifact),
             edition: t.edition,
             outputs,
+            target_version: t
+                .target_version
+                .clone()
+                .unwrap_or_else(|| cfg.target_version.clone()),
             define: t.define.clone(),
+            def: Some(t.clone()),
         });
     }
     (out, diags)
@@ -539,6 +473,7 @@ impl Session {
                 emitted,
                 artifacts: a.artifacts,
                 sarif: sarif::to_sarif(&a.diags),
+                packs: a.packs,
             },
             diagnostics: a.diags,
             generation: self.generation,
@@ -624,8 +559,11 @@ impl Session {
             idx: &index,
             changed: AtomicBool::new(false),
         };
-        let routed = route::route(&cfg, &vfs);
-        a.diags.extend(routed.diagnostics);
+        let mut routed = route::route(&cfg, &vfs);
+        a.diags.append(&mut routed.diagnostics);
+        let (st, d) = statics::items(&cfg, &vfs);
+        routed.items.extend(st);
+        a.diags.extend(d);
         a.inputs = index.files().into_iter().cloned().collect();
 
         let has_code = !routed.generators.is_empty()
@@ -648,8 +586,8 @@ impl Session {
             a.diags.push(d);
         }
 
-        // script bundles, once per (output, sourcemap)
-        let mut bundles: BTreeMap<(OutputId, bool), Bundled> = BTreeMap::new();
+        // script bundles, once per (output, sourcemap, define)
+        let mut bundles: BTreeMap<BundleKey, Bundled> = BTreeMap::new();
         if trusted {
             let paths = {
                 let mut h = blake3::Hasher::new();
@@ -660,12 +598,12 @@ impl Session {
                 *h.finalize().as_bytes()
             };
             for plan in &plans {
-                let sourcemap = matches!(plan.kind, Kind::Packs | Kind::Dev);
+                let (sourcemap, define) = (plan.sourcemap(), plan.define_hash());
                 for o in &plan.outputs {
                     let Some(entries) = routed.script_entries.get(o) else {
                         continue;
                     };
-                    let key = (o.clone(), sourcemap);
+                    let key = (o.clone(), sourcemap, define);
                     if bundles.contains_key(&key) {
                         continue;
                     }
@@ -684,6 +622,7 @@ impl Session {
                         paths,
                         &key,
                         entries,
+                        &plan.define,
                     );
                     a.diags.extend(b.diagnostics.iter().cloned());
                     a.inputs.extend(b.inputs.iter().cloned());
@@ -692,8 +631,28 @@ impl Session {
             }
         }
 
+        // world template and skin pack identities, from every target (like editions)
+        let (mut worlds, mut skins) = (Vec::new(), Vec::new());
+        for t in cfg.beacon.targets.values() {
+            let (list, dir) = match t.artifact {
+                Artifact::McTemplate | Artifact::Marketplace => (&mut worlds, &t.world),
+                Artifact::SkinPack => (&mut skins, &t.skins),
+                _ => continue,
+            };
+            if let Some(d) = dir {
+                list.push((trim_rel(d).to_owned(), t.edition));
+            }
+        }
+        // static outputs keep their own UUIDs and manifests (4.3): nothing to mint
+        let is_static = |id: &OutputId| {
+            cfg.beacon
+                .outputs
+                .iter()
+                .any(|o| &o.id == id && o.static_packs.is_some())
+        };
+        let minted: Vec<OutputId> = outputs.iter().filter(|o| !is_static(o)).cloned().collect();
         let lock = if emit {
-            match Lockfile::ensure(&self.root, &cfg, &outputs, self.opts.frozen) {
+            match Lockfile::ensure(&self.root, &cfg, &minted, &worlds, &skins, self.opts.frozen) {
                 Ok(mut l) => {
                     let version = self.bundler.as_ref().and_then(|b| b.version());
                     if !bundles.is_empty() && version.is_some() && l.bundler != version {
@@ -754,10 +713,10 @@ impl Session {
                     a.diags.extend(d);
                 }
             }
-            let sourcemap = matches!(plan.kind, Kind::Packs | Kind::Dev);
+            let key = |o: &OutputId| (o.clone(), plan.sourcemap(), plan.define_hash());
             let mut scripted = BTreeSet::new();
             for o in &plan.outputs {
-                let Some(b) = bundles.get(&(o.clone(), sourcemap)) else {
+                let Some(b) = bundles.get(&key(o)) else {
                     continue;
                 };
                 let Some(code) = &b.code else { continue };
@@ -786,7 +745,7 @@ impl Session {
                 scripted.insert(o.clone());
             }
             if let Some(lock) = &lock {
-                for o in &plan.outputs {
+                for o in plan.outputs.iter().filter(|o| !is_static(o)) {
                     let has = |p: Pack| {
                         items
                             .iter()
@@ -801,196 +760,59 @@ impl Session {
                         lock,
                         output: o,
                         edition: plan.edition,
-                        dev_worktree: (plan.kind == Kind::Dev).then_some(self.root.as_path()),
+                        target_version: &plan.target_version,
+                        dev_worktree: (plan.artifact == Some(Artifact::Dev))
+                            .then_some(self.root.as_path()),
                         script_entry: scripted.contains(o).then_some(SCRIPT_ENTRY),
                         has_bp,
                         has_rp,
                     }));
                 }
             }
+            let (derived, d) = registry::derive(&cfg, &routed, plan, &items, &vfs);
+            items.extend(derived);
+            a.diags.extend(d);
             let (mut merged, d) = merge::resolve(items, &vfs);
             a.diags.extend(d);
             languages(&mut merged);
             built.push(merged);
         }
         // only an attempt that saw a consistent snapshot writes anything
-        if emit && lock.is_some() && !vfs.changed.load(Ordering::Relaxed) {
+        if let Some(lock) = lock.as_ref().filter(|_| emit)
+            && !vfs.changed.load(Ordering::Relaxed)
+        {
             for (plan, merged) in plans.iter().zip(&built) {
-                self.write(plan, &cfg, &outputs, merged, &vfs, &mut a);
+                let cx = ArtifactCx::new(
+                    &self.root,
+                    plan,
+                    &cfg,
+                    lock,
+                    &outputs,
+                    merged,
+                    &vfs,
+                    self.opts.trusted,
+                    self.opts.out.as_deref(),
+                    &mut self.ledgers,
+                );
+                artifact::write(&cx, &mut a);
             }
         }
         a.changed = vfs.changed.load(Ordering::Relaxed);
         self.index = Some(index);
         a
     }
-
-    fn write(
-        &mut self,
-        plan: &Plan,
-        cfg: &ProjectConfig,
-        outputs: &[OutputId],
-        merged: &[ContentItem],
-        vfs: &(dyn Vfs + Sync),
-        a: &mut Attempt,
-    ) {
-        let mut packs: BTreeMap<(&OutputId, Pack), Vec<(RelPath, &Body)>> = BTreeMap::new();
-        for i in merged {
-            packs
-                .entry((&i.dest.output, i.dest.pack))
-                .or_default()
-                .push((i.dest.path.clone(), &i.body));
-        }
-        // projected output (4.3): `primaryOutput`, else the first with a BP (else any pack)
-        let primary = cfg.beacon.primary_output.clone().or_else(|| {
-            let with = |p: Option<Pack>| {
-                outputs.iter().find(|o| {
-                    packs
-                        .keys()
-                        .any(|(k, kp)| k == o && p.is_none_or(|p| p == *kp))
-                })
-            };
-            with(Some(Pack::Behavior)).or(with(None)).cloned()
-        });
-        let name = safe_name(&cfg.name);
-        let multi = packs.keys().map(|k| k.0).collect::<BTreeSet<_>>().len() > 1;
-        let fail = |what: String| Diagnostic::new(Code::EmitFailed, what);
-        let ledgers = &mut self.ledgers;
-        let (root, trusted) = (&self.root, self.opts.trusted);
-        let mut dir_emit =
-            |base: &Path, dir: PathBuf, files: &[(RelPath, &Body)], a: &mut Attempt| {
-                if !contained(base, &dir) {
-                    a.diags.push(escape(base, &dir));
-                    return;
-                }
-                if !link_ok(root, &dir, trusted, &mut a.diags) {
-                    return;
-                }
-                let (r, d, ledger) = emit::emit_known(&dir, files, vfs, ledgers.get(&dir));
-                if d.iter().any(|d| d.code == Code::EmitFailed) {
-                    ledgers.remove(&dir); // verify the disk again next time
-                } else {
-                    ledgers.insert(dir, ledger);
-                }
-                a.emitted += r.written;
-                a.diags.extend(d);
-            };
-        match plan.kind {
-            Kind::Packs => {
-                for ((o, p), files) in &packs {
-                    let projected = match p {
-                        Pack::Behavior => &cfg.packs.behavior_pack,
-                        Pack::Resource => &cfg.packs.resource_pack,
-                    };
-                    let state_out = self.root.join(STATE_DIR).join("out");
-                    let (base, dir) = match (&self.opts.out, projected) {
-                        (Some(out), _) => (out.clone(), out.join(o.as_str()).join(pack_name(*p))),
-                        (None, Some(rel)) if primary.as_ref() == Some(*o) => {
-                            (self.root.clone(), self.root.join(trim_rel(rel)))
-                        }
-                        _ => (
-                            state_out.clone(),
-                            state_out.join(o.as_str()).join(pack_name(*p)),
-                        ),
-                    };
-                    dir_emit(&base, dir, files, a);
-                }
-            }
-            Kind::Dev => {
-                let Some(base) = self.opts.out.clone().or_else(|| com_mojang(plan.edition)) else {
-                    a.diags.push(fail(format!(
-                        "target {:?}: com.mojang for {:?} was not found; set BEACON_COM_MOJANG or pass --out",
-                        plan.target, plan.edition
-                    )));
-                    return;
-                };
-                let wt = worktree8(&self.root);
-                for ((o, p), files) in &packs {
-                    let folder = if !multi || primary.as_ref() == Some(*o) {
-                        format!("{name}-{wt} {}", pack_name(*p))
-                    } else {
-                        format!("{name}-{o}-{wt} {}", pack_name(*p))
-                    };
-                    let parent = match p {
-                        Pack::Behavior => "development_behavior_packs",
-                        Pack::Resource => "development_resource_packs",
-                    };
-                    dir_emit(&base, base.join(parent).join(folder), files, a);
-                }
-            }
-            Kind::McPack | Kind::McAddon => {
-                if has_errors(&a.diags) {
-                    return; // never ship an artifact from a failed build
-                }
-                let dir = self
-                    .opts
-                    .out
-                    .clone()
-                    .unwrap_or_else(|| self.root.join("dist"));
-                if !link_ok(&self.root, &dir, trusted, &mut a.diags) {
-                    return;
-                }
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    a.diags.push(fail(format!("{}: {e}", dir.display())));
-                    return;
-                }
-                let label = |o: &str, p: Pack| {
-                    if multi {
-                        format!("{o}-{}", pack_name(p))
-                    } else {
-                        pack_name(p).to_owned()
-                    }
-                };
-                let base = format!("{name}-{}", safe_name(&plan.target));
-                let mut zips: Vec<(String, Vec<(RelPath, &Body)>)> = Vec::new();
-                if plan.kind == Kind::McPack {
-                    for ((o, p), files) in &packs {
-                        let file = if packs.len() == 1 {
-                            format!("{base}.mcpack")
-                        } else {
-                            format!("{base}-{}.mcpack", label(o, *p))
-                        };
-                        zips.push((file, files.clone()));
-                    }
-                } else {
-                    let mut all = Vec::new();
-                    for ((o, p), files) in &packs {
-                        let folder = format!("{name} {}", label(o, *p));
-                        for (path, body) in files {
-                            match RelPath::parse(&folder).and_then(|f| f.join(path.as_str())) {
-                                Ok(zp) => all.push((zp, *body)),
-                                Err(e) => a.diags.push(fail(e.to_string())),
-                            }
-                        }
-                    }
-                    zips.push((format!("{base}.mcaddon"), all));
-                }
-                for (file, entries) in zips {
-                    let path = dir.join(file);
-                    if !contained(&dir, &path) {
-                        a.diags.push(escape(&dir, &path));
-                        continue;
-                    }
-                    if !link_ok(&self.root, &path, trusted, &mut a.diags) {
-                        continue;
-                    }
-                    match archive::write_zip(&path, &entries, vfs) {
-                        Ok(()) => a.artifacts.push(path.display().to_string()),
-                        Err(e) => a.diags.push(fail(format!("{}: {e}", path.display()))),
-                    }
-                }
-            }
-        }
-    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bundle(
-    memo: &mut HashMap<(OutputId, bool), BundleMemo>,
+    memo: &mut HashMap<BundleKey, BundleMemo>,
     bundler: &dyn Bundler,
     root: &Path,
     index: &Index,
     paths: Hash,
-    key: &(OutputId, bool),
+    key: &BundleKey,
     entries: &[RelPath],
+    define: &BTreeMap<String, Value>,
 ) -> Bundled {
     if let Some(m) = memo.get(key)
         && m.entries == entries
@@ -1004,6 +826,7 @@ fn bundle(
         entries,
         sourcemap: key.1,
         minify: false,
+        define,
     });
     let external = r.external_inputs;
     let out = Bundled {
@@ -1036,21 +859,4 @@ fn bundle(
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::contained;
-    use std::path::Path;
-
-    #[test]
-    fn containment_is_lexical_and_strict() {
-        let b = Path::new("/r/base");
-        assert!(contained(b, &b.join("main").join("BP")));
-        assert!(!contained(b, b));
-        assert!(!contained(b, &b.join("..").join("x")));
-        assert!(!contained(b, &b.join("a").join("..").join("..").join("x")));
-        assert!(!contained(b, Path::new("/r/other")));
-        assert!(!contained(b, Path::new("/r/basement")));
-    }
 }

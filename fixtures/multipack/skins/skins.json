@@ -1,0 +1,13 @@
+{
+  "geometry": "skinpacks/skins.json",
+  "serialize_name": "beacon_multipack",
+  "localization_name": "beacon_multipack",
+  "skins": [
+    {
+      "localization_name": "steve_blue",
+      "geometry": "geometry.humanoid.custom",
+      "texture": "skin.png",
+      "type": "free"
+    }
+  ]
+}

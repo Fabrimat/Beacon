@@ -1,0 +1,12 @@
+[package]
+name = "beacon-fetch"
+description = "Beacon pinned downloads: fetch a file by URL, verify its blake3 hash, cache it by hash"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# rustls (ring + webpki roots): pure-Rust TLS, no system OpenSSL on any OS
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+blake3 = "1"

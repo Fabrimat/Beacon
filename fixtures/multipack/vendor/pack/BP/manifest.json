@@ -1,0 +1,17 @@
+﻿{
+  // prebuilt vendor pack: UUIDs and versions are kept as-is
+  "format_version": 2,
+  "header": {
+    "name": "Vendor BP",
+    "description": "Prebuilt vendor behavior pack",
+    "uuid": "6b1d3c1e-2f4a-4c7b-9d3e-1a2b3c4d5e6f",
+    "version": [1, 2, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    { "type": "data", "uuid": "0f9e8d7c-6b5a-4f3e-8d2c-1b0a9f8e7d6c", "version": [1, 2, 0] }
+  ],
+  "dependencies": [
+    { "uuid": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "version": [1, 2, 0] } /* vendor RP */
+  ]
+}

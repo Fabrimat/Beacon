@@ -129,6 +129,7 @@ fn bytes(i: &ContentItem, vfs: &dyn Vfs) -> Result<Vec<u8>, String> {
         Body::Passthrough(p) => vfs.read(p).map_err(|e| format!("cannot read {p}: {e}")),
         Body::Json(v) => Ok(v.to_string().into_bytes()),
         Body::Text(t) => Ok(t.clone().into_bytes()),
+        Body::Bytes(b) => Ok(b.clone()),
     }
 }
 

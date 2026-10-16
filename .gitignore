@@ -3,3 +3,4 @@
 /corpus
 /.ci-esbuild
 *.log
+!fixtures/**/db/*.log
