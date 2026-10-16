@@ -64,7 +64,7 @@ fn open_nofollow(p: &Path) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(p)
     {
-        Err(e) if e.kind() == ErrorKind::FilesystemLoop => Err(changed()),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(changed()),
         r => r,
     }
 }
