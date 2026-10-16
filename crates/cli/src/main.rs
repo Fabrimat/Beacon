@@ -2,21 +2,21 @@
 //! The pipeline is `beacon_engine::build::Session`; this crate wires in the QuickJS host and
 //! the esbuild bundler.
 
+mod watch;
+
 use beacon_bundler::Esbuild;
 use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
-use beacon_engine::config::{CONFIG_FILE, LOCK_FILE};
+use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, Severity, exit};
 use beacon_engine::event::BuildEvent;
 use beacon_engine::host::Bundler;
 use beacon_engine::{sarif, trust};
 use beacon_jshost::{Host, Limits};
 use clap::{CommandFactory, Parser, Subcommand};
-use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use std::{fs, process, sync::mpsc};
+use std::{fs, process};
 
 #[derive(Parser)]
 #[command(
@@ -125,9 +125,13 @@ fn session(o: &Opts, a: &BuildArgs) -> Session {
         frozen: a.frozen,
         trusted: a.trust || trust::is_trusted(&o.project, &plugins(&o.project)),
     };
-    // a missing esbuild is reported by the session, only if the project has scripts
-    let bundler = Esbuild::find(&o.project)
-        .ok()
+    // Restricted mode never runs the sidecar (5.5), and `find` itself executes the binary
+    // (`--version`), which may be project-shipped (`node_modules`): only look when trusted.
+    // A missing esbuild is reported by the session, only if the project has scripts.
+    let bundler = opts
+        .trusted
+        .then(|| Esbuild::find(&o.project).ok())
+        .flatten()
         .map(|e| Box::new(e) as Box<dyn Bundler>);
     Session::new(
         &o.project,
@@ -200,63 +204,6 @@ fn report(o: &Opts, event: &'static str, r: &BuildOutcome) {
         }
     }
     let _ = io::stdout().flush();
-}
-
-/// Minimal watch: every relevant change (debounced) is a full `Session::build`; the session's
-/// index fast path and caches keep it incremental.
-// ponytail: no overflow rescan / size-stability wait / polling fallback yet (9.3, B2).
-fn watch(o: &Opts, a: &BuildArgs) -> i32 {
-    let mut s = session(o, a);
-    let mut ignored = s.output_dirs();
-    ignored.push(s.root().join(".git"));
-    let (tx, rx) = mpsc::channel();
-    let watcher = notify::recommended_watcher(tx)
-        .and_then(|mut w| w.watch(s.root(), RecursiveMode::Recursive).map(|_| w));
-    let _watcher = match watcher {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("error: cannot watch {}: {e}", s.root().display());
-            return exit::INTERNAL;
-        }
-    };
-    // the build itself (re)writes the lockfile (+ its temp file)
-    let root = s.root().to_path_buf();
-    let own_lock = |p: &Path| {
-        p.parent() == Some(root.as_path())
-            && p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(LOCK_FILE))
-    };
-    let relevant = |ev: &notify::Result<notify::Event>| match ev {
-        // e.g. an event buffer overflow: rebuild (the build re-indexes everything)
-        Err(_) => true,
-        Ok(ev) => {
-            !matches!(ev.kind, EventKind::Access(_))
-                && ev
-                    .paths
-                    .iter()
-                    .any(|p| !ignored.iter().any(|i| p.starts_with(i)) && !own_lock(p))
-        }
-    };
-    let r = s.build();
-    report(o, "ready", &r);
-    if exit_code(&r.diagnostics) == exit::UNTRUSTED {
-        return exit::UNTRUSTED;
-    }
-    while let Ok(ev) = rx.recv() {
-        if !relevant(&ev) {
-            continue;
-        }
-        // debounce: coalesce bursts (editor atomic saves) until 10 ms of quiet
-        loop {
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(_) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return exit::OK,
-            }
-        }
-        report(o, "built", &s.build());
-    }
-    exit::OK
 }
 
 fn check(o: &Opts, trusted: bool) -> i32 {
@@ -340,7 +287,7 @@ fn main() {
     };
     let code = match cli.cmd {
         Cmd::Build(a) => build(&o, &a),
-        Cmd::Watch(a) => watch(&o, &a),
+        Cmd::Watch(a) => watch::run(&o, &a),
         Cmd::Check { trust } => check(&o, trust),
         Cmd::Explain { code } => explain(&code, cli.json),
         Cmd::Trust { yes } => trust_cmd(&o, yes),

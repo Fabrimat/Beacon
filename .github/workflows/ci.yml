@@ -21,6 +21,18 @@ jobs:
       # Toolchain pinned by rust-toolchain.toml (rustup honours it).
       - uses: Swatinem/rust-cache@v2
 
+      # The platform-native esbuild binary (never an npm shim); beacon finds it via BEACON_ESBUILD.
+      - name: Install esbuild
+        shell: bash
+        run: |
+          npm i --prefix .ci-esbuild esbuild@0.28.2
+          arch=$([ "$RUNNER_ARCH" = ARM64 ] && echo arm64 || echo x64)
+          case "$RUNNER_OS" in
+            Windows) p=win32-$arch/esbuild.exe ;;
+            macOS) p=darwin-$arch/bin/esbuild ;;
+          esac
+          echo "BEACON_ESBUILD=$(pwd -W 2>/dev/null || pwd)/.ci-esbuild/node_modules/@esbuild/$p" >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -30,29 +42,94 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Corpus (medium)
-        run: cargo corpus --size medium --out target/corpus-medium
+      - name: Corpus (large)
+        run: cargo corpus --size large --out target/corpus-large
 
       - name: Build beacon
         run: cargo build --release -p beacon-cli
 
-      # Report-only for now; no --enforce.
-      - name: Perf (report-only)
+      - name: Spike
+        run: cargo spike
+
+      # Enforces every phase-1 budget in perf/budgets.json.
+      - name: Perf (enforced, phase 1)
         shell: bash
         run: >-
           cargo perf run
           --beacon target/release/beacon${{ runner.os == 'Windows' && '.exe' || '' }}
-          --project target/corpus-medium
+          --project target/corpus-large
           --runs 20
           --idle-secs 5
+          --enforce
+          --phase 1
           --json perf-${{ runner.os }}.json
 
-      - name: Spike
-        run: cargo spike
-
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: results-${{ runner.os }}
           path: |
             perf-*.json
             docs/spikes/quickjs.md
+
+  # Same fixture, same flags, on every OS: the .mcaddon must be byte-identical
+  # (.gitattributes forces LF, so source bytes match).
+  determinism:
+    name: determinism (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install esbuild
+        shell: bash
+        run: |
+          npm i --prefix .ci-esbuild esbuild@0.28.2
+          arch=$([ "$RUNNER_ARCH" = ARM64 ] && echo arm64 || echo x64)
+          case "$RUNNER_OS" in
+            Windows) p=win32-$arch/esbuild.exe ;;
+            macOS) p=darwin-$arch/bin/esbuild ;;
+          esac
+          echo "BEACON_ESBUILD=$(pwd -W 2>/dev/null || pwd)/.ci-esbuild/node_modules/@esbuild/$p" >> "$GITHUB_ENV"
+
+      - name: Build beacon
+        run: cargo build --release -p beacon-cli
+
+      - name: Build fixtures/minimal as .mcaddon and hash it
+        shell: bash
+        run: |
+          target/release/beacon${{ runner.os == 'Windows' && '.exe' || '' }} build \
+            --project fixtures/minimal --target addon --trust --out det-out
+          python - <<'PY'
+          import glob, hashlib, zipfile
+          fs = glob.glob("det-out/**/*.mcaddon", recursive=True)
+          if len(fs) != 1:
+              raise SystemExit(f"expected exactly one .mcaddon under det-out, found {fs}")
+          f = fs[0]
+          out = ["archive " + hashlib.sha256(open(f, "rb").read()).hexdigest()]
+          with zipfile.ZipFile(f) as z:
+              out += sorted(f"{n} {hashlib.sha256(z.read(n)).hexdigest()}" for n in z.namelist())
+          open("determinism.txt", "w").write("\n".join(out) + "\n")
+          PY
+          cat determinism.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ runner.os }}
+          path: determinism.txt
+
+  determinism-compare:
+    needs: determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: determinism-*
+      - name: Compare
+        run: |
+          ls -R .
+          diff determinism-Windows/determinism.txt determinism-macOS/determinism.txt

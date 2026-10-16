@@ -7,7 +7,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Returns one item per `Dest` (sorted by dest) plus diagnostics: `RouteCollision`,
-/// `CaseFoldCollision` (dest paths equal after case folding within one pack),
+/// `CaseFoldCollision` (dest paths equal after case folding within one pack; only the dest
+/// with the first origin is kept, the others are dropped: they would overwrite each other on
+/// Windows/macOS),
 /// `LangDuplicateKey`, `MergeConflict`. Passthrough bodies taking part in a JSON or lang merge
 /// are read through `vfs` (JSON with `//` and `/* */` comments must parse).
 pub fn resolve(items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec<Diagnostic>) {
@@ -24,7 +26,15 @@ pub fn resolve(items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec
             .or_default()
             .push(d);
     }
+    let first = |d: &Dest| groups[d].iter().map(|i| &i.origin).min();
+    let mut drop: Vec<Dest> = Vec::new();
     for ds in folded.values().filter(|v| v.len() > 1) {
+        let keep = ds.iter().min_by_key(|d| first(d)).copied();
+        drop.extend(
+            ds.iter()
+                .filter(|d| Some(**d) != keep)
+                .map(|d| (*d).clone()),
+        );
         let mut d = Diagnostic::new(
             Code::CaseFoldCollision,
             format!(
@@ -42,6 +52,9 @@ pub fn resolve(items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec
             };
         }
         diags.push(d);
+    }
+    for d in &drop {
+        groups.remove(d);
     }
 
     let out = groups
@@ -69,6 +82,9 @@ fn join<'a>(it: impl Iterator<Item = &'a str>) -> String {
 
 /// Resolves one `Dest` group (already sorted by origin).
 fn group(g: Vec<ContentItem>, vfs: &dyn Vfs, diags: &mut Vec<Diagnostic>) -> ContentItem {
+    if g.len() == 1 {
+        return g.into_iter().next().expect("len 1"); // the common case: no clone
+    }
     let mut live: Vec<ContentItem> = g
         .iter()
         .filter(|i| i.merge != Merge::Skip)

@@ -266,3 +266,32 @@ fn generations_count_up() {
     );
     assert!(r.inputs.contains(&rp("src/m/items/sword.png")));
 }
+
+/// A bundle that imported something outside the root is rebuilt every time.
+#[test]
+fn bundles_with_external_inputs_are_not_reused() {
+    use beacon_engine::host::{BundleRequest, BundleResult, Bundler};
+    struct External(Arc<AtomicUsize>);
+    impl Bundler for External {
+        fn bundle(&self, req: &BundleRequest) -> BundleResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut r = FakeBundler.bundle(req);
+            r.external_inputs = true;
+            r
+        }
+        fn version(&self) -> Option<String> {
+            None
+        }
+    }
+    let p = project(SCRIPTED);
+    let (runs, bundles) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let mut s = beacon_engine::build::Session::new(
+        p.path(),
+        opts(p.path(), None),
+        Box::new(FakeHost(runs.clone())),
+        Some(Box::new(External(bundles.clone()))),
+    );
+    s.build();
+    s.build();
+    assert_eq!(bundles.load(Ordering::SeqCst), 2);
+}

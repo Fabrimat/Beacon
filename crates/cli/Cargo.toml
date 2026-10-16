@@ -17,6 +17,7 @@ beacon-bundler = { path = "../bundler" }
 clap = { version = "4", features = ["derive"] }
 notify = "8"
 serde_json = "1"
+ctrlc = "3"
 
 [dev-dependencies]
 tempfile = "3"

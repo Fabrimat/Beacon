@@ -1,4 +1,5 @@
 /target
 /out
 /corpus
+/.ci-esbuild
 *.log

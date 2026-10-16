@@ -84,6 +84,7 @@ impl Bundler for FakeBundler {
             code: Some(format!("// {} entries\n", req.entries.len())),
             map: req.sourcemap.then(|| "{}".into()),
             inputs: req.entries.iter().cloned().collect(),
+            external_inputs: false,
             diagnostics: vec![],
         }
     }

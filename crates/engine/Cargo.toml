@@ -14,6 +14,7 @@ blake3 = "1"
 globset = "0.4.20"
 getrandom = "0.4.3"
 dirs = "7.0.0"
+dunce = "1"
 zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

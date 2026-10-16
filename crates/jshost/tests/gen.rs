@@ -132,6 +132,41 @@ fn corpus_sounds() {
 }
 
 #[test]
+fn assets_relative_to_generator_folder() {
+    let g = |glob: &str| {
+        format!(
+            "generate(({{ assets }}) => assets(\"{glob}\").map(f => sound(`demo:${{f.name}}`, {{ file: f.path }})));"
+        )
+    };
+    let vfs = Fake::default()
+        .with("src/s/top.ogg", "x")
+        .with("src/s/sounds/a.ogg", "x")
+        .with("src/s/sounds/sub/deep.ogg", "x")
+        .with("src/s/sounds/sounds.gen.ts", &g("./*.ogg"))
+        .with("src/s/sounds/up.gen.ts", &g("../*.ogg"))
+        .with("src/s/sounds/rec.gen.ts", &g("./**/*.ogg"))
+        .with("src/s/sounds/esc.gen.ts", &g("../../*.ogg"));
+    let run_in_module = |p: &str| {
+        let mut g = gen_for(p);
+        g.module = rp("src/s");
+        Host::new(Limits::default()).run(&g, &ctx_for(&g), &vfs)
+    };
+    let names = |p: &str| {
+        let r = run_in_module(p);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        r.items.len()
+    };
+    assert_eq!(names("src/s/sounds/sounds.gen.ts"), 1);
+    assert_eq!(names("src/s/sounds/up.gen.ts"), 1);
+    assert_eq!(names("src/s/sounds/rec.gen.ts"), 2);
+    assert!(
+        !run_in_module("src/s/sounds/esc.gen.ts")
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
 fn corpus_mobs() {
     let vfs = Fake::default().with("src/d/mobs.gen.ts", MOBS).with(
         "src/d/mobs.data.json",

@@ -20,7 +20,7 @@ pub fn write_zip(out: &Path, entries: &[(RelPath, &Body)], vfs: &dyn Vfs) -> std
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     let res = (|| {
-        let mut zip = ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(&tmp)?));
+        let mut zip = ZipWriter::new(std::io::BufWriter::new(crate::emit::create_fresh(&tmp)?));
         for (path, body) in sorted {
             let ext = path.as_str().rsplit('.').next().unwrap_or("");
             let stored = STORED.iter().any(|s| ext.eq_ignore_ascii_case(s));

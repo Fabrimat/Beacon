@@ -115,7 +115,9 @@ fn case_fold_collision_across_dests() {
         &Mem::default(),
     );
     assert_eq!(codes(&d), [Code::CaseFoldCollision]);
-    assert_eq!(out.len(), 2);
+    // only the first (by origin) is kept: both would land on one file on Windows/macOS
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].dest.path.as_str(), "items/Sword.json");
     // different pack: fine
     let mut other = item("items/sword.json", "src/b/s.json", Merge::Error);
     other.dest.pack = Pack::Resource;

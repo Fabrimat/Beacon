@@ -24,7 +24,7 @@ use std::time::Instant;
 
 /// Bump when the host's semantics change (runtime API, prelude, content conversion, input
 /// recording): it invalidates every cached generator result.
-pub const HOST_ABI: &str = "1";
+pub const HOST_ABI: &str = "2";
 
 pub struct Host {
     limits: Limits,
@@ -393,14 +393,25 @@ fn walk(
     }
 }
 
-/// `assets(glob)`: module-relative glob over the generator's module, sorted.
+/// `assets(glob)`: glob relative to the generator's folder (like imports), sorted. `../` may
+/// climb up to the module root, never above; recursion stays inside the module. Result `path`
+/// is module-relative (what `sound({ file })` and friends route on).
 fn list_assets(
     vfs: &dyn Vfs,
     module: &RelPath,
+    gen_dir: &RelPath,
     inputs: &mut ObservedInputs,
     glob: &str,
 ) -> Result<String, String> {
-    let glob = glob.strip_prefix("./").unwrap_or(glob);
+    let mut glob = glob.strip_prefix("./").unwrap_or(glob);
+    let mut base = gen_dir.clone();
+    while let Some(rest) = glob.strip_prefix("../") {
+        if base == *module {
+            return Err("assets(): `../` climbs out of the module".into());
+        }
+        base = base.parent().unwrap_or_else(|| module.clone());
+        glob = rest;
+    }
     let m = globset::GlobBuilder::new(glob)
         .literal_separator(true)
         .build()
@@ -412,14 +423,23 @@ fn list_assets(
         glob.matches('/').count()
     };
     let mut found = vec![];
-    walk(vfs, module, "", 0, max, &m, inputs, &mut found);
+    walk(vfs, &base, "", 0, max, &m, inputs, &mut found);
     found.sort();
+    let prefix = match base.as_str().strip_prefix(module.as_str()) {
+        Some(r) if !r.is_empty() => &r[1..],
+        _ => "",
+    };
     let list: Vec<_> = found
         .iter()
         .map(|p| {
-            let file = module.join(p).map_or(String::new(), |f| f.to_string());
+            let path = if prefix.is_empty() {
+                p.clone()
+            } else {
+                format!("{prefix}/{p}")
+            };
+            let file = module.join(&path).map_or(String::new(), |f| f.to_string());
             let name = p.rsplit('/').next().unwrap_or(p);
-            json!({ "name": name.split('.').next(), "path": p, "file": file })
+            json!({ "name": name.split('.').next(), "path": path, "file": file })
         })
         .collect();
     Ok(Value::Array(list).to_string())
@@ -787,6 +807,7 @@ fn eval(
         let r = context.with(|c| {
             let sc = scope.clone();
             let module = g.module.clone();
+            let gen_dir = g.path.parent().unwrap_or_else(|| module.clone());
             let run = || -> rquickjs::Result<String> {
                 let globals = c.globals();
                 globals.set(
@@ -800,7 +821,7 @@ fn eval(
                         };
                         // SAFETY: `Some` only while the owning `run` is on the stack.
                         let vfs = unsafe { &*vfs };
-                        list_assets(vfs, &module, &mut sc.inputs.borrow_mut(), &glob)
+                        list_assets(vfs, &module, &gen_dir, &mut sc.inputs.borrow_mut(), &glob)
                             .map_err(|m| Exception::throw_message(&c, &m))
                     }),
                 )?;

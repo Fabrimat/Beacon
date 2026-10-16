@@ -14,13 +14,22 @@ packs.
 ## Development
 
 ```sh
+cargo build --release -p beacon-cli
+beacon=target/release/beacon        # beacon.exe on Windows
+$beacon build --project fixtures/minimal --target addon --trust
+
 cargo test --workspace
-cargo corpus --size small --out target/corpus-small
+cargo corpus --size large --out target/corpus-large
 cargo spike
-cargo perf run --beacon target/release/beacon --project target/corpus-small
+cargo perf run --beacon $beacon --project target/corpus-large --runs 20 --enforce --phase 1
 ```
 
-On Windows the beacon binary is `target/release/beacon.exe`.
+Script bundling needs a native [esbuild](https://esbuild.github.io/) binary (0.28.2 is what CI
+uses). Beacon looks for it in `BEACON_ESBUILD`, then `node_modules/@esbuild/<platform>`, then
+`PATH`; point `BEACON_ESBUILD` at the platform-native binary (not an npm `.cmd` shim), e.g.
+`npm i --prefix .ci-esbuild esbuild@0.28.2` and
+`.ci-esbuild/node_modules/@esbuild/win32-x64/esbuild.exe`. The perf harness always passes
+`--trust` and inherits `BEACON_ESBUILD`.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`.
 

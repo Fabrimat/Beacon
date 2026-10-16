@@ -78,6 +78,7 @@ fn bundles_two_entries() {
     let want: std::collections::BTreeSet<_> =
         ["src/a.js", "src/b.js", "src/helper.js"].map(rp).into();
     assert_eq!(res.inputs, want);
+    assert!(!res.external_inputs);
     assert!(res.map.expect("map").contains("\"mappings\""));
 
     let mut ms: Vec<_> = (0..10)
@@ -112,4 +113,38 @@ fn syntax_error_has_span() {
     assert_eq!(d.code, Code::BundleError);
     let sp = d.span.as_ref().expect("span");
     assert_eq!((sp.path.as_str(), sp.line), ("bad.js", Some(2)));
+}
+
+#[test]
+fn outside_root_imports_are_flagged() {
+    let Some(inst) = install() else { return };
+    let esbuild = Esbuild::find(inst).expect("find");
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(t.path().join("shared")).unwrap();
+    std::fs::write(
+        t.path().join("shared/x.js"),
+        "export const x = 'SHARED';
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/a.js"),
+        "import { x } from '../../shared/x.js';
+console.log(x);
+",
+    )
+    .unwrap();
+    let entries = [rp("src/a.js")];
+    let res = esbuild.bundle(&BundleRequest {
+        root: &root,
+        entries: &entries,
+        sourcemap: false,
+        minify: false,
+    });
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    assert!(res.code.unwrap().contains("SHARED"));
+    assert!(res.external_inputs);
+    assert_eq!(res.inputs, [rp("src/a.js")].into());
 }

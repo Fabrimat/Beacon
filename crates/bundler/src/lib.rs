@@ -92,6 +92,8 @@ impl Bundler for Esbuild {
             code: None,
             map: None,
             inputs: BTreeSet::new(),
+            // until the metafile proves otherwise: unknown inputs are never reused
+            external_inputs: true,
             diagnostics: vec![],
         };
         let fail = |res: &mut BundleResult, msg: String| {
@@ -170,14 +172,24 @@ impl Bundler for Esbuild {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         {
-            res.inputs = v["inputs"]
+            res.external_inputs = false;
+            for k in v["inputs"]
                 .as_object()
                 .into_iter()
                 .flatten()
-                .map(|(k, _)| k.as_str())
-                .filter(|k| !matches!(*k, "<stdin>" | "beacon-entry.js") && !k.starts_with("../"))
-                .filter_map(|k| RelPath::parse(k).ok())
-                .collect();
+                .map(|(k, _)| k)
+            {
+                if matches!(k.as_str(), "<stdin>" | "beacon-entry.js") {
+                    continue;
+                }
+                // `../x` (outside the root) or an absolute / unparsable path: not trackable
+                match RelPath::parse(k).ok().filter(|_| !k.starts_with("../")) {
+                    Some(p) => {
+                        res.inputs.insert(p);
+                    }
+                    None => res.external_inputs = true,
+                }
+            }
         }
         res
     }

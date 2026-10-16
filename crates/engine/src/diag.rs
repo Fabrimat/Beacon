@@ -159,6 +159,10 @@ codes! {
     EmitFailed = "BCN0080", Error;
     /// The emit ledger is missing or corrupt; no stale files were deleted.
     LedgerMissing = "BCN0081", Warning;
+    /// An output folder (or a folder between it and its base) is a symlink or junction, so
+    /// writes would land wherever it points. Untrusted builds refuse to write through it
+    /// (error); trusted builds write and warn (e.g. a pack folder junctioned into com.mojang).
+    OutputIsLink = "BCN0082", Warning;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

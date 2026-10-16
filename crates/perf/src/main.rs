@@ -12,7 +12,9 @@
 //! set. Peak is the max of tree samples taken while the build runs (a very short build can
 //! finish between samples). Both `run` and `local` work on a temp copy of the project; the
 //! original is never written. Later-phase metrics are added to budgets.json when measurable.
-//! Cold build = empty out dir; the OS file cache stays warm.
+//! Drives the real `beacon` (always `--trust`; `BEACON_ESBUILD` is inherited). Cold build = no
+//! `.beacon/` and no `packs/`; the OS file cache stays warm. Watch latency = byte-changing edit
+//! of an `*.item.json` / `scripts/*.ts` -> timestamp of the next `built` event of `watch --json`.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -125,20 +127,24 @@ fn proc_mem(pid: u32, sys: &System) -> u64 {
 struct Ctx<'a> {
     beacon: &'a Path,
     project: &'a Path,
-    out: &'a Path,
 }
 
 impl Ctx<'_> {
+    /// `beacon <sub> --trust --project <copy>`; `BEACON_ESBUILD` is inherited from the env.
     fn cmd(&self, sub: &str) -> Command {
         let mut c = Command::new(self.beacon);
-        c.args([sub, "--trust", "--project"])
-            .arg(self.project)
-            .arg("--out")
-            .arg(self.out);
+        c.args([sub, "--trust", "--project"]).arg(self.project);
         c.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         c
+    }
+
+    /// Cold = no `.beacon/` cache and no `packs/` output (the OS file cache stays warm).
+    fn clean(&self) {
+        for d in [".beacon", "packs"] {
+            let _ = fs::remove_dir_all(self.project.join(d));
+        }
     }
 
     /// Run a build; returns (wall ms, peak RSS MB sampled over the tree).
@@ -147,20 +153,14 @@ impl Ctx<'_> {
         let mut g = Guard(self.cmd("build").spawn().map_err(|e| e.to_string())?);
         let mut sys = System::new();
         let mut peak = 0f64;
-        let mut n = 0u32;
         let status = loop {
             if let Some(s) = g.0.try_wait().map_err(|e| e.to_string())? {
                 break s;
             }
             if sample {
-                // Full tree walk is slow (process snapshot); between walks sample the root only.
-                let mb = if n % 16 == 15 {
-                    tree_rss_mb(&mut sys, g.0.id())
-                } else {
-                    proc_mem(g.0.id(), &sys) as f64 / 1048576.0
-                };
-                peak = peak.max(mb);
-                n += 1;
+                // Whole tree every poll, so a short-lived esbuild child is not missed.
+                peak = peak.max(tree_rss_mb(&mut sys, g.0.id()));
+                thread::sleep(Duration::from_millis(5));
             }
         };
         let wall = ms(t.elapsed());
@@ -170,78 +170,112 @@ impl Ctx<'_> {
         Ok((wall, peak))
     }
 
-    /// Start `beacon watch`, wait for `ready`.
-    fn watch(&self) -> Result<Guard, String> {
+    /// Start `beacon watch --json`, wait for the `ready` event. Events arrive timestamped.
+    fn watch(&self) -> Result<(Guard, mpsc::Receiver<(Instant, String)>), String> {
         let mut c = self.cmd("watch");
-        c.stdout(Stdio::piped());
+        c.arg("--json").stdout(Stdio::piped());
         let mut g = Guard(c.spawn().map_err(|e| e.to_string())?);
         let out = g.0.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
-        // Keeps draining stdout for the child's lifetime so it can never block on a full pipe.
+        // Drains stdout for the child's lifetime (it can never block on a full pipe); only
+        // JSON-object lines with an `event` field are forwarded, anything else is ignored.
         thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                // Receiver is gone after `ready`; keep draining so later lines never block.
-                let _ = tx.send(line);
+                let at = Instant::now();
+                if let Some(ev) = event_of(&line) {
+                    let _ = tx.send((at, ev));
+                }
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(l) if l.trim() == "ready" => return Ok(g),
+                Ok((_, e)) if e == "ready" => return Ok((g, rx)),
                 Ok(_) => {}
-                Err(_) => return Err("beacon watch never printed `ready`".into()),
+                Err(_) => return Err("beacon watch never emitted a `ready` event".into()),
             }
         }
     }
 }
 
-fn find_src(dir: &Path, ext: &str) -> Option<PathBuf> {
+/// The `event` name of a `BuildEvent` JSON line; `None` for any other output.
+fn event_of(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    Some(v.get("event")?.as_str()?.to_string())
+}
+
+fn find_src(dir: &Path, want: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .collect();
     entries.sort();
-    for p in &entries {
-        if p.is_file() && p.extension().is_some_and(|e| e == ext) {
-            return Some(p.clone());
-        }
+    if let Some(f) = entries.iter().find(|p| p.is_file() && want(p)) {
+        return Some(f.clone());
     }
     entries
         .iter()
         .filter(|p| p.is_dir())
-        .find_map(|p| find_src(p, ext))
+        .find_map(|p| find_src(p, want))
 }
 
-/// Edit `file` `runs` times under a running watcher; returns latencies in ms.
+/// Puts the edited file back on every exit path.
+struct Restore(PathBuf, String);
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, &self.1);
+    }
+}
+
+fn name_ends(p: &Path, suffix: &str) -> bool {
+    p.file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with(suffix))
+}
+
+/// Edit `file` `runs` times under a running watcher; latency = edit -> next `built` event.
 fn watch_latency(ctx: &Ctx, ext: &str, runs: usize) -> Result<Vec<f64>, String> {
     let src = ctx.project.join("src");
-    let file = find_src(&src, ext).ok_or(format!("no .{ext} file under {}", src.display()))?;
-    let dst = ctx.out.join(file.strip_prefix(&src).unwrap());
-    let _w = ctx.watch()?;
+    let file = if ext == "json" {
+        find_src(&src, &|p| name_ends(p, ".item.json"))
+    } else {
+        find_src(&src, &|p| {
+            name_ends(p, ".ts")
+                && !name_ends(p, ".gen.ts")
+                && p.parent()
+                    .is_some_and(|d| d.file_name().is_some_and(|n| n == "scripts"))
+        })
+    }
+    .ok_or(format!("no matching .{ext} file under {}", src.display()))?;
+    let orig = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    let _restore = Restore(file.clone(), orig.clone());
+    let (_w, rx) = ctx.watch()?;
     let mut lat = Vec::new();
     for i in 0..runs {
+        // Every edit changes the bytes and keeps the file valid.
         let body = if ext == "json" {
-            format!("{{\"beacon_perf\":{i}}}\n")
+            format!("{orig}{}", " ".repeat(i + 1))
         } else {
-            format!("export const beaconPerf = {i};\n")
+            format!(
+                "{orig}
+export const beaconPerf{i} = {i};
+"
+            )
         };
-        let t = Instant::now();
+        thread::sleep(Duration::from_millis(50));
+        while rx.try_recv().is_ok() {} // trailing events of the previous edit
         fs::write(&file, &body).map_err(|e| e.to_string())?;
+        let t = Instant::now();
         loop {
-            if fs::read_to_string(&dst).is_ok_and(|c| c == body) {
-                break;
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok((at, e)) if e == "built" => {
+                    lat.push(ms(at.saturating_duration_since(t)));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => return Err(format!("no `built` event after editing {}", file.display())),
             }
-            if t.elapsed() > Duration::from_secs(10) {
-                return Err(format!(
-                    "watch did not update {} within 10 s",
-                    dst.display()
-                ));
-            }
-            thread::sleep(Duration::from_micros(200));
         }
-        lat.push(ms(t.elapsed()));
-        thread::sleep(Duration::from_millis(20)); // let trailing duplicate events settle
     }
     Ok(lat)
 }
@@ -255,25 +289,24 @@ struct Opts {
     phase: u32,
 }
 
-fn measure(o: &Opts, project: &Path, out: &Path) -> Result<Vec<(&'static str, f64)>, String> {
+fn measure(o: &Opts, project: &Path) -> Result<Vec<(&'static str, f64)>, String> {
     let ctx = Ctx {
         beacon: &o.beacon,
         project,
-        out,
     };
     let mut m = Vec::new();
 
-    let (mut cold, mut warm, mut peak) = (vec![], vec![], 0f64);
+    let (mut cold, mut warm) = (vec![], vec![]);
     for _ in 0..o.runs {
-        let _ = fs::remove_dir_all(out);
+        ctx.clean();
         let (t, _) = ctx.build(false)?;
         cold.push(t);
         let (t, _) = ctx.build(false)?;
         warm.push(t);
     }
     // Peak RSS: sampling slows the loop, so it gets its own cold build (not timed).
-    let _ = fs::remove_dir_all(out);
-    peak = peak.max(ctx.build(true)?.1);
+    ctx.clean();
+    let peak = ctx.build(true)?.1;
     m.push(("build_cold_ms", percentile(&cold, 50.0)));
     m.push(("build_warm_ms", percentile(&warm, 50.0)));
     m.push(("peak_rss_build_mb", peak));
@@ -287,9 +320,8 @@ fn measure(o: &Opts, project: &Path, out: &Path) -> Result<Vec<(&'static str, f6
         percentile(&watch_latency(&ctx, "ts", o.runs)?, 95.0),
     ));
 
-    // Idle: the watcher's initial build is the last build; wait, then sample the tree.
-    let _ = fs::remove_dir_all(out);
-    let w = ctx.watch()?;
+    // Idle: wait for `ready` (initial build done), settle, then sample the whole tree.
+    let (w, _rx) = ctx.watch()?;
     thread::sleep(o.idle);
     m.push((
         "idle_rss_watch_mb",
@@ -313,6 +345,12 @@ fn measure(o: &Opts, project: &Path, out: &Path) -> Result<Vec<(&'static str, f6
 
     let size = fs::metadata(&o.beacon).map_err(|e| e.to_string())?.len();
     m.push(("binary_size_mb", size as f64 / 1048576.0));
+    if let Some(e) = env::var_os("BEACON_ESBUILD").and_then(|e| fs::metadata(e).ok()) {
+        println!(
+            "note: esbuild sidecar {:.1} MB (separate from binary_size_mb)",
+            e.len() as f64 / 1048576.0
+        );
+    }
     Ok(m)
 }
 
@@ -362,7 +400,7 @@ fn run_harness(o: &Opts, project: &Path, work: &Path) -> Result<bool, String> {
     let copy = work.join("project");
     let r = copy_tree(project, &copy)
         .map_err(|e| format!("copy project: {e}"))
-        .and_then(|()| measure(o, &copy, &work.join("out")))
+        .and_then(|()| measure(o, &copy))
         .and_then(|m| report(o, m));
     let _ = fs::remove_dir_all(work);
     Ok(r? || !o.enforce)
@@ -470,8 +508,38 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_against_stub() {
+    fn end_to_end_against_minimal_fixture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if env::var_os("BEACON_ESBUILD").is_none() {
+            let sub = if cfg!(windows) {
+                "win32-x64/esbuild.exe"
+            } else {
+                "darwin-arm64/bin/esbuild"
+            };
+            let dir = root.join("target/esbuild-test");
+            let exe = dir.join("node_modules/@esbuild").join(sub);
+            if !exe.is_file() {
+                // Same install as crates/bundler/tests.
+                let mut c = if cfg!(windows) {
+                    let mut c = Command::new("cmd");
+                    c.args(["/C", "npm"]);
+                    c
+                } else {
+                    Command::new("npm")
+                };
+                let _ = c
+                    .args(["i", "--no-audit", "--no-fund", "--prefix"])
+                    .arg(&dir)
+                    .arg("esbuild@0.28.2")
+                    .status();
+            }
+            if !exe.is_file() {
+                eprintln!("SKIP SKIP SKIP: no esbuild (set BEACON_ESBUILD); e2e test NOT run");
+                return;
+            }
+            // SAFETY: no other test in this crate reads or writes the environment concurrently.
+            unsafe { env::set_var("BEACON_ESBUILD", exe.canonicalize().unwrap()) };
+        }
         let cargo = env::var("CARGO").unwrap_or("cargo".into());
         let st = Command::new(cargo)
             .args(["build", "-p", "beacon-cli"])
@@ -486,16 +554,8 @@ mod tests {
         };
         let tmp = env::temp_dir().join(format!("beacon-perf-test-{}", process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        let src = tmp.join("project/src");
-        fs::create_dir_all(src.join("scripts")).unwrap();
-        fs::write(src.join("manifest.json"), "{}").unwrap();
-        fs::write(
-            src.join("scripts/main.ts"),
-            "export {};
-",
-        )
-        .unwrap();
-        fs::write(src.join("a.txt"), "a").unwrap();
+        let project = tmp.join("project");
+        copy_tree(&root.join("fixtures/minimal"), &project).unwrap();
         let json = tmp.join("report.json");
         let o = Opts {
             beacon: root.join("target/debug").join(exe),
@@ -505,7 +565,7 @@ mod tests {
             enforce: false,
             phase: 1,
         };
-        run_harness(&o, &tmp.join("project"), &tmp.join("work")).unwrap();
+        run_harness(&o, &project, &tmp.join("work")).unwrap();
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
         let budgets: Vec<Budget> = serde_json::from_str(BUDGETS).unwrap();
@@ -516,8 +576,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {}", b.id));
             assert!(row["value"].is_number(), "{} not numeric", b.id);
         }
-        // original project files restored
-        assert_eq!(fs::read_to_string(src.join("manifest.json")).unwrap(), "{}");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn event_lines_only() {
+        assert_eq!(
+            event_of(r#"{"event":"built","ms":1}"#).as_deref(),
+            Some("built")
+        );
+        assert_eq!(event_of("wrote x"), None);
+        assert_eq!(event_of(r#"{"a":1}"#), None);
     }
 }

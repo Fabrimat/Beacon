@@ -420,6 +420,7 @@ Everything a user writes is one of three things. Stop at the first that works.
    ```
 
    - `assets(glob)` returns a typed list (name, path) and registers the glob as an input.
+     `./` is the generator's own folder (like imports); `../` climbs at most to the module root.
    - `ctx.module` / `ctx.namespace` / `ctx.edition` / `ctx.target` replace path tricks and
      env flags.
    - A **content file** (one game concept split across packs) is a generator returning one item:

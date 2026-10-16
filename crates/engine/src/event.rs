@@ -1,7 +1,8 @@
 //! Contract: machine output of `build --json` and `watch --json` (6.2).
 //!
 //! `watch --json` prints one [`BuildEvent`] per line on stdout after every completed build,
-//! **after** the output files are flushed and before the ledger write. The perf harness waits
+//! i.e. after the output files are flushed **and** the ledger is written (the build call
+//! returns first; the ledger is tiny, so the gap is negligible). The perf harness waits
 //! for these lines. The first line is `"event":"ready"` after the initial build.
 
 #[derive(Debug, Clone, serde::Serialize)]

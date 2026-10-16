@@ -37,6 +37,9 @@ pub struct BundleResult {
     pub map: Option<String>,
     /// Metafile inputs under root (for watch); `<stdin>` and externals filtered out.
     pub inputs: BTreeSet<RelPath>,
+    /// Some input lay outside the root (`../shared/x.ts`) and is not in `inputs`: the engine
+    /// cannot see when it changes, so such a bundle is never reused.
+    pub external_inputs: bool,
     /// `BundlerMissing` | `BundleError`, with spans from esbuild's errors.
     pub diagnostics: Vec<Diagnostic>,
 }

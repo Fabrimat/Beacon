@@ -199,6 +199,82 @@ fn check_is_restricted_and_reports_sarif() {
     assert!(stderr(&o).contains("BCN0011"), "{}", stderr(&o));
 }
 
+/// Restricted mode never runs the esbuild sidecar (5.5), not even `esbuild --version` to
+/// locate it: a project-shipped or env-given binary must not execute for an untrusted project.
+#[test]
+fn untrusted_never_runs_the_bundler() {
+    let h = tempfile::tempdir().unwrap();
+    let p = project(true);
+    write(
+        p.path(),
+        "src/m/scripts/main.ts",
+        "export {};
+",
+    );
+    let tools = tempfile::tempdir().unwrap();
+    let marker = tools.path().join("ran");
+    let fake = if cfg!(windows) {
+        let f = tools.path().join("esbuild.cmd");
+        std::fs::write(
+            &f,
+            format!(
+                "@echo off
+echo x> \"{}\"
+echo 0.0.0
+",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        f
+    } else {
+        let f = tools.path().join("esbuild");
+        std::fs::write(
+            &f,
+            format!(
+                "#!/bin/sh
+echo x > '{}'
+echo 0.0.0
+",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        f
+    };
+    let ps = p.path().to_str().unwrap();
+    let out = p.path().join("out");
+    let run = |args: &[&str]| {
+        cmd(h.path(), args)
+            .env("BEACON_ESBUILD", &fake)
+            .output()
+            .unwrap()
+    };
+    let o = run(&["build", "--project", ps, "--out", out.to_str().unwrap()]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let o = run(&["check", "--project", ps]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!marker.exists(), "the bundler ran for an untrusted project");
+    // control: trusted, it is located (and run)
+    run(&[
+        "build",
+        "--trust",
+        "--project",
+        ps,
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        marker.exists(),
+        "control: the fake esbuild should run when trusted"
+    );
+}
+
 /// A junction (Windows) or symlink (unix) pointing outside the project, and one forming a
 /// cycle, must be neither followed nor copied.
 #[test]

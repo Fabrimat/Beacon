@@ -20,6 +20,7 @@ struct Stat {
     id: (u64, u64),
 }
 
+#[derive(Clone)]
 struct Entry {
     /// Real OS path (macOS may hand out NFD names, so never rebuild it from the key).
     os: PathBuf,
@@ -27,6 +28,7 @@ struct Entry {
     hash: Hash,
 }
 
+#[derive(Default)]
 pub struct Index {
     files: BTreeMap<RelPath, Entry>,
     /// Directory (`""` = root) -> sorted child names.
@@ -119,6 +121,34 @@ fn stat(f: &File) -> io::Result<Stat> {
     })
 }
 
+/// (size, mtime) from directory metadata, in the same units as [`stat`].
+#[cfg(windows)]
+fn md_stat(md: &std::fs::Metadata) -> (u64, u128) {
+    use std::os::windows::fs::MetadataExt;
+    (md.len(), u128::from(md.last_write_time()))
+}
+#[cfg(unix)]
+fn md_stat(md: &std::fs::Metadata) -> (u64, u128) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        md.len(),
+        (md.mtime() as u128) * 1_000_000_000 + md.mtime_nsec() as u128,
+    )
+}
+
+/// `k` is `dir` or below it (ASCII case-insensitive where the file system is).
+fn at_or_below(k: &str, dir: &str) -> bool {
+    let ci = cfg!(any(windows, target_os = "macos"));
+    k.len() >= dir.len()
+        && k.is_char_boundary(dir.len())
+        && (if ci {
+            k[..dir.len()].eq_ignore_ascii_case(dir)
+        } else {
+            &k[..dir.len()] == dir
+        })
+        && (k.len() == dir.len() || k[dir.len()..].starts_with('/'))
+}
+
 fn excluded(name: &str, rel: &str, extra: &[RelPath]) -> bool {
     let ci = cfg!(any(windows, target_os = "macos"));
     let eq = |a: &str, b: &str| {
@@ -141,8 +171,37 @@ fn excluded(name: &str, rel: &str, extra: &[RelPath]) -> bool {
 struct Walk<'a> {
     extra: &'a [RelPath],
     prev: Option<&'a Index>,
+    /// Stat-only fast path: an entry whose (size, mtime) match `prev` is reused unopened.
+    fast: bool,
     index: Index,
     diags: Vec<Diagnostic>,
+}
+
+fn children_of(files: &BTreeMap<RelPath, Entry>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut c: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for key in files.keys() {
+        let mut dir = key.as_str();
+        while let Some((parent, name)) = dir.rsplit_once('/') {
+            c.entry(parent.to_owned())
+                .or_default()
+                .insert(name.to_owned());
+            dir = parent;
+        }
+        c.entry(String::new()).or_default().insert(dir.to_owned());
+    }
+    c
+}
+
+/// Normalized path segments of `p` below `root`; `None` if outside, `..` or not Unicode.
+fn names_below(root: &Path, p: &Path) -> Option<Vec<String>> {
+    p.strip_prefix(root)
+        .ok()?
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_str()?.nfc().collect()),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Walk<'_> {
@@ -199,12 +258,20 @@ impl Walk<'_> {
             } else if md.is_dir() {
                 self.dir(&path, &child);
             } else if md.is_file() {
-                self.file(key, path);
+                self.file(key, path, &md);
             }
         }
     }
 
-    fn file(&mut self, key: RelPath, os: PathBuf) {
+    fn file(&mut self, key: RelPath, os: PathBuf, md: &std::fs::Metadata) {
+        if self.fast
+            && let Some(p) = self.prev.and_then(|p| p.files.get(&key))
+            && (p.stat.size, p.stat.mtime) == md_stat(md)
+        {
+            let e = Entry { os, ..p.clone() };
+            self.index.files.insert(key, e);
+            return;
+        }
         let opened = open_nofollow(&os).and_then(|f| Ok((stat(&f)?, f)));
         let (s, mut f) = match opened {
             Ok(v) => v,
@@ -235,20 +302,6 @@ impl Walk<'_> {
                 *h.finalize().as_bytes()
             }
         };
-        let mut dir = key.as_str();
-        while let Some((parent, name)) = dir.rsplit_once('/') {
-            self.index
-                .children
-                .entry(parent.to_owned())
-                .or_default()
-                .insert(name.to_owned());
-            dir = parent;
-        }
-        self.index
-            .children
-            .entry(String::new())
-            .or_default()
-            .insert(dir.to_owned());
         self.index.files.insert(key, Entry { os, stat: s, hash });
     }
 }
@@ -264,17 +317,120 @@ impl Index {
         extra_excludes: &[RelPath],
         prev: Option<&Index>,
     ) -> (Index, Vec<Diagnostic>) {
+        Self::walk(root, extra_excludes, prev, false)
+    }
+
+    /// Like [`Index::build`] with `prev`, but unchanged entries (same size + mtime from
+    /// `symlink_metadata`) are reused without opening the file. File ids are still verified
+    /// at read time by `open`. Use for rescans (watch start, watcher overflow).
+    pub fn rescan(
+        root: &Path,
+        extra_excludes: &[RelPath],
+        prev: &Index,
+    ) -> (Index, Vec<Diagnostic>) {
+        Self::walk(root, extra_excludes, Some(prev), true)
+    }
+
+    fn walk(
+        root: &Path,
+        extra: &[RelPath],
+        prev: Option<&Index>,
+        fast: bool,
+    ) -> (Index, Vec<Diagnostic>) {
         let mut w = Walk {
-            extra: extra_excludes,
+            extra,
             prev,
-            index: Index {
-                files: BTreeMap::new(),
-                children: BTreeMap::new(),
-            },
+            fast,
+            index: Index::default(),
             diags: Vec::new(),
         };
         w.dir(root, "");
+        w.index.children = children_of(&w.index.files);
         (w.index, w.diags)
+    }
+
+    /// Re-indexes only `changed` (absolute paths, e.g. from the watcher): each is dropped
+    /// with everything below it, then re-read from disk if it still exists. An ancestor
+    /// that is a link or junction makes the path absent; excluded paths and paths outside
+    /// `root` are ignored. Equals a full [`Index::build`] when `changed` covers every
+    /// difference. Returns diagnostics for the touched paths only.
+    pub fn update(
+        &mut self,
+        root: &Path,
+        extra: &[RelPath],
+        changed: &[PathBuf],
+    ) -> Vec<Diagnostic> {
+        let mut diags = Vec::new();
+        for p in changed {
+            let Some(names) = names_below(root, p) else {
+                continue;
+            };
+            let mut pre = String::new();
+            if names.iter().any(|n| {
+                if !pre.is_empty() {
+                    pre.push('/');
+                }
+                pre.push_str(n);
+                excluded(n, &pre, extra)
+            }) {
+                continue;
+            }
+            let rel = names.join("/");
+            let gone: Vec<RelPath> = self
+                .files
+                .keys()
+                .filter(|k| names.is_empty() || at_or_below(k.as_str(), &rel))
+                .cloned()
+                .collect();
+            for k in gone {
+                self.files.remove(&k);
+            }
+            // every ancestor must be a real directory, the path itself may be anything
+            let mut abs = root.to_owned();
+            let mut md = std::fs::symlink_metadata(root).ok();
+            for (i, n) in p
+                .strip_prefix(root)
+                .into_iter()
+                .flat_map(Path::components)
+                .enumerate()
+            {
+                abs.push(n);
+                if i > 0 && !md.as_ref().is_some_and(|m| m.is_dir() && !is_reparse(m)) {
+                    md = None;
+                    break;
+                }
+                md = std::fs::symlink_metadata(&abs).ok();
+            }
+            let Some(md) = md else { continue };
+            let mut w = Walk {
+                extra,
+                // never reuse a hash here: a rewrite can keep size and mtime
+                prev: None,
+                fast: false,
+                index: std::mem::take(self),
+                diags: Vec::new(),
+            };
+            match RelPath::parse(&rel) {
+                _ if names.is_empty() => w.dir(&abs, ""),
+                Err(e) => w
+                    .diags
+                    .push(Diagnostic::new(Code::NonPortablePath, e.to_string())),
+                Ok(key) if is_reparse(&md) => w.diags.push(
+                    Diagnostic::new(
+                        Code::ReparsePointSkipped,
+                        format!("skipped link or junction {key}"),
+                    )
+                    .at(key, None, None),
+                ),
+                Ok(_) if md.is_dir() => w.dir(&abs, &rel),
+                Ok(key) if md.is_file() => w.file(key, abs, &md),
+                Ok(_) => {}
+            }
+            *self = w.index;
+            diags.extend(w.diags);
+        }
+        self.children = children_of(&self.files);
+        diags
     }
 
     /// All indexed files, sorted.

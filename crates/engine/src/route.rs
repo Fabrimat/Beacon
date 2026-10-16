@@ -150,6 +150,21 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
             );
         }
     }
+    // one ledger per folder: BP and RP must not share or contain each other
+    if let (Some(b), Some(r)) = (&c.packs.behavior_pack, &c.packs.resource_pack)
+        && let (Ok(Some(bp)), Ok(Some(rp))) = (norm_source(b), norm_source(r))
+    {
+        let (x, y) = (bp.fold_key(), rp.fold_key());
+        let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
+        if inside(&x, &y) || inside(&y, &x) {
+            bad(
+                format!(
+                    "packs.behaviorPack {b:?} and packs.resourcePack {r:?} must be separate folders"
+                ),
+                line_of(text, &["\"resourcePack\""]),
+            );
+        }
+    }
     for s in &c.beacon.sources {
         if let Err(e) = norm_source(s) {
             bad(

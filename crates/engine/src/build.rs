@@ -16,6 +16,7 @@
 use crate::cache::GenCache;
 use crate::config::{CONFIG_FILE, ProjectConfig, STATE_DIR};
 use crate::diag::{Code, Diagnostic, Severity};
+use crate::emit::Ledger;
 use crate::event::BuildReport;
 use crate::host::{BundleRequest, Bundler, GeneratorHost};
 use crate::lock::Lockfile;
@@ -25,10 +26,10 @@ use crate::path::{Hash, RelPath, Vfs};
 use crate::vfs::Index;
 use crate::{archive, emit, merge, route, sarif};
 use serde_json::Value;
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +71,18 @@ pub struct Session {
     cache: GenCache,
     bundles: HashMap<(OutputId, bool), BundleMemo>,
     generation: u64,
+    /// Index excludes of the current index (a change means a rescan).
+    excl: Vec<RelPath>,
+    /// Paths reported changed since the last build (see [`Session::changed`]).
+    dirty: BTreeSet<PathBuf>,
+    /// The caller reports changes: the next build applies `dirty` instead of walking the tree.
+    delta: bool,
+    /// Re-index opening every file (a file changed under a build).
+    strict: bool,
+    /// Diagnostics of the index walk(s), kept across delta updates.
+    idx_diags: Vec<Diagnostic>,
+    /// Last ledger written per pack dir; lets rebuilds skip unchanged outputs unstatted.
+    ledgers: HashMap<PathBuf, Ledger>,
 }
 
 #[derive(Clone)]
@@ -119,7 +132,7 @@ struct Attempt {
 /// indexing (the caller then re-indexes and retries).
 struct Live<'a> {
     idx: &'a Index,
-    changed: Cell<bool>,
+    changed: AtomicBool,
 }
 
 impl Live<'_> {
@@ -127,7 +140,7 @@ impl Live<'_> {
         if r.as_ref()
             .is_err_and(|e| e.kind() == ErrorKind::InvalidData)
         {
-            self.changed.set(true);
+            self.changed.store(true, Ordering::Relaxed);
         }
         r
     }
@@ -151,6 +164,23 @@ impl Vfs for Live<'_> {
     }
 }
 
+/// The real path of `p` as the OS reports it in watcher events (macOS FSEvents gives
+/// `/private/var/...` for `/var/...`): the longest existing ancestor canonicalized (without
+/// the verbatim `\\?\` prefix on Windows), plus the not-yet-existing rest. Absolute as given
+/// if nothing resolves.
+pub fn canon(p: &Path) -> PathBuf {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.into());
+    for a in abs.ancestors() {
+        if let Ok(c) = dunce::canonicalize(a) {
+            return match abs.strip_prefix(a) {
+                Ok(rest) if !rest.as_os_str().is_empty() => c.join(rest),
+                _ => c,
+            };
+        }
+    }
+    abs
+}
+
 /// Defence in depth (config validation already rejects path-like ids and `packs.*` escapes):
 /// `dir` must be strictly below `base`, lexically, with no `..`/root/prefix components.
 fn contained(base: &Path, dir: &Path) -> bool {
@@ -159,6 +189,32 @@ fn contained(base: &Path, dir: &Path) -> bool {
             && r.components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)))
     })
+}
+
+/// Links inside the project on the way to an output (`packs/BP -> ~/.config`, a linked
+/// `.beacon`, `dist` or in-project `--out`) would let a committed project redirect writes
+/// anywhere. Untrusted: refuse (error). Trusted: allowed with a warning naming the target
+/// (pack folders are often junctioned into com.mojang). Outputs outside the project
+/// (com.mojang, an outside `--out`) are paths the user chose; the project cannot plant links
+/// there, so they are not checked.
+fn link_ok(root: &Path, dir: &Path, trusted: bool, diags: &mut Vec<Diagnostic>) -> bool {
+    if !contained(root, dir) {
+        return true;
+    }
+    let Some(link) = emit::link_below(root, dir) else {
+        return true;
+    };
+    let target = std::fs::read_link(&link).map_or_else(|_| "?".into(), |t| t.display().to_string());
+    let mut d = Diagnostic::new(
+        Code::OutputIsLink,
+        format!("output dir {} is a link to {target}", link.display()),
+    );
+    if !trusted {
+        d.severity = Severity::Error;
+        d.message += "; refusing to write through it in an untrusted project";
+    }
+    diags.push(d);
+    trusted
 }
 
 fn escape(base: &Path, dir: &Path) -> Diagnostic {
@@ -360,11 +416,22 @@ fn languages(items: &mut Vec<ContentItem>) {
 impl Session {
     pub fn new(
         root: &Path,
-        opts: BuildOptions,
+        mut opts: BuildOptions,
         host: Box<dyn GeneratorHost>,
         bundler: Option<Box<dyn Bundler>>,
     ) -> Self {
-        let root = std::path::absolute(root).unwrap_or_else(|_| root.into());
+        let given = std::path::absolute(root).unwrap_or_else(|_| root.into());
+        let root = canon(root);
+        // `--out` inside the project, re-spelled under the canonical root without resolving
+        // anything below it (links there must stay visible to the link check); outside the
+        // project, canonical like the root (watch compares real paths).
+        opts.out = opts.out.map(|o| {
+            let abs = std::path::absolute(&o).unwrap_or(o);
+            match abs.strip_prefix(&given) {
+                Ok(rest) => root.join(rest),
+                Err(_) => canon(&abs),
+            }
+        });
         Session {
             cache: GenCache::new(&root),
             root,
@@ -374,7 +441,33 @@ impl Session {
             index: None,
             bundles: HashMap::new(),
             generation: 0,
+            excl: Vec::new(),
+            dirty: BTreeSet::new(),
+            delta: false,
+            strict: false,
+            idx_diags: Vec::new(),
+            ledgers: HashMap::new(),
         }
+    }
+
+    /// Watch: absolute paths that changed. The next `build` re-indexes only these (no walk)
+    /// and trusts the ledgers it wrote itself (no stat of unchanged outputs). Without this
+    /// (or after [`Session::rescan`]) a build walks the tree stat-only, verifies every output
+    /// on disk again and so restores hand-deleted files.
+    pub fn changed(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        // spelled like the canonical root (symlinked roots, 8.3 names, macOS /private)
+        let root = &self.root;
+        self.dirty.extend(
+            paths
+                .into_iter()
+                .map(|p| if p.starts_with(root) { p } else { canon(&p) }),
+        );
+        self.delta = true;
+    }
+
+    /// Watcher overflow or unknown changes: the next `build` is a full one.
+    pub fn rescan(&mut self) {
+        self.delta = false;
     }
 
     pub fn root(&self) -> &Path {
@@ -406,7 +499,7 @@ impl Session {
             }
         }
         if let Some(o) = &self.opts.out {
-            v.push(std::path::absolute(o).unwrap_or_else(|_| o.clone()));
+            v.push(o.clone());
         }
         v
     }
@@ -414,20 +507,26 @@ impl Session {
     fn run(&mut self, emit: bool) -> BuildOutcome {
         let t0 = Instant::now();
         self.generation += 1;
+        let delta = std::mem::take(&mut self.delta);
+        if !delta {
+            self.ledgers.clear();
+        }
         let (mut emitted, mut generators_run) = (0, 0);
         let mut a = Attempt::default();
         for _ in 0..ATTEMPTS {
-            a = self.attempt(emit);
+            self.strict = a.changed;
+            a = self.attempt(emit, delta && !self.strict);
             emitted += a.emitted;
             generators_run += a.generators_run;
             if !a.changed {
                 break;
             }
         }
+        self.strict = false;
         if a.changed {
             a.diags.push(Diagnostic::new(
                 Code::EmitFailed,
-                "files kept changing during the build; nothing was written (build again when edits settle)",
+                "files kept changing during the build; outputs may be partly written or stale (build again when edits settle)",
             ));
         }
         // one message per problem even when several targets hit it
@@ -464,7 +563,6 @@ impl Session {
             .opts
             .out
             .as_ref()
-            .and_then(|o| std::path::absolute(o).ok())
             .and_then(|o| o.strip_prefix(&self.root).ok().map(Path::to_path_buf))
         {
             let s: Vec<String> = rel
@@ -476,7 +574,13 @@ impl Session {
         v
     }
 
-    fn attempt(&mut self, emit: bool) -> Attempt {
+    /// Records the diagnostics of a full index walk.
+    fn walk(&mut self, (i, d): (Index, Vec<Diagnostic>)) -> Index {
+        self.idx_diags = d;
+        i
+    }
+
+    fn attempt(&mut self, emit: bool, delta: bool) -> Attempt {
         let mut a = Attempt::default();
         let cfg = match route::load(&self.root) {
             Ok(c) => c,
@@ -493,11 +597,32 @@ impl Session {
         let (plans, d) = plans(&cfg, &self.opts, &outputs);
         a.diags.extend(d);
 
-        let (index, d) = Index::build(&self.root, &self.excludes(&cfg), self.index.as_ref());
-        a.diags.extend(d);
+        let ex = self.excludes(&cfg);
+        let index = match self.index.take() {
+            Some(_) if self.strict => self.walk(Index::build(&self.root, &ex, None)),
+            Some(mut i) if delta && ex == self.excl => {
+                let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty).into_iter().collect();
+                let root = &self.root;
+                self.idx_diags.retain(|d| {
+                    d.span.as_ref().is_some_and(|s| {
+                        !dirty
+                            .iter()
+                            .any(|p| root.join(s.path.as_str()).starts_with(p))
+                    })
+                });
+                let d = i.update(root, &ex, &dirty);
+                self.idx_diags.extend(d);
+                i
+            }
+            Some(prev) => self.walk(Index::rescan(&self.root, &ex, &prev)),
+            None => self.walk(Index::build(&self.root, &ex, None)),
+        };
+        self.excl = ex;
+        self.dirty.clear();
+        a.diags.extend(self.idx_diags.iter().cloned());
         let vfs = Live {
             idx: &index,
-            changed: Cell::new(false),
+            changed: AtomicBool::new(false),
         };
         let routed = route::route(&cfg, &vfs);
         a.diags.extend(routed.diagnostics);
@@ -689,23 +814,23 @@ impl Session {
             built.push(merged);
         }
         // only an attempt that saw a consistent snapshot writes anything
-        if emit && lock.is_some() && !vfs.changed.get() {
+        if emit && lock.is_some() && !vfs.changed.load(Ordering::Relaxed) {
             for (plan, merged) in plans.iter().zip(&built) {
                 self.write(plan, &cfg, &outputs, merged, &vfs, &mut a);
             }
         }
-        a.changed = vfs.changed.get();
+        a.changed = vfs.changed.load(Ordering::Relaxed);
         self.index = Some(index);
         a
     }
 
     fn write(
-        &self,
+        &mut self,
         plan: &Plan,
         cfg: &ProjectConfig,
         outputs: &[OutputId],
         merged: &[ContentItem],
-        vfs: &dyn Vfs,
+        vfs: &(dyn Vfs + Sync),
         a: &mut Attempt,
     ) {
         let mut packs: BTreeMap<(&OutputId, Pack), Vec<(RelPath, &Body)>> = BTreeMap::new();
@@ -729,15 +854,26 @@ impl Session {
         let name = safe_name(&cfg.name);
         let multi = packs.keys().map(|k| k.0).collect::<BTreeSet<_>>().len() > 1;
         let fail = |what: String| Diagnostic::new(Code::EmitFailed, what);
-        let dir_emit = |base: &Path, dir: PathBuf, files: &[(RelPath, &Body)], a: &mut Attempt| {
-            if !contained(base, &dir) {
-                a.diags.push(escape(base, &dir));
-                return;
-            }
-            let (r, d) = emit::emit(&dir, files, vfs);
-            a.emitted += r.written;
-            a.diags.extend(d);
-        };
+        let ledgers = &mut self.ledgers;
+        let (root, trusted) = (&self.root, self.opts.trusted);
+        let mut dir_emit =
+            |base: &Path, dir: PathBuf, files: &[(RelPath, &Body)], a: &mut Attempt| {
+                if !contained(base, &dir) {
+                    a.diags.push(escape(base, &dir));
+                    return;
+                }
+                if !link_ok(root, &dir, trusted, &mut a.diags) {
+                    return;
+                }
+                let (r, d, ledger) = emit::emit_known(&dir, files, vfs, ledgers.get(&dir));
+                if d.iter().any(|d| d.code == Code::EmitFailed) {
+                    ledgers.remove(&dir); // verify the disk again next time
+                } else {
+                    ledgers.insert(dir, ledger);
+                }
+                a.emitted += r.written;
+                a.diags.extend(d);
+            };
         match plan.kind {
             Kind::Packs => {
                 for ((o, p), files) in &packs {
@@ -790,6 +926,9 @@ impl Session {
                     .out
                     .clone()
                     .unwrap_or_else(|| self.root.join("dist"));
+                if !link_ok(&self.root, &dir, trusted, &mut a.diags) {
+                    return;
+                }
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     a.diags.push(fail(format!("{}: {e}", dir.display())));
                     return;
@@ -831,6 +970,9 @@ impl Session {
                         a.diags.push(escape(&dir, &path));
                         continue;
                     }
+                    if !link_ok(&self.root, &path, trusted, &mut a.diags) {
+                        continue;
+                    }
                     match archive::write_zip(&path, &entries, vfs) {
                         Ok(()) => a.artifacts.push(path.display().to_string()),
                         Err(e) => a.diags.push(fail(format!("{}: {e}", path.display()))),
@@ -863,20 +1005,22 @@ fn bundle(
         sourcemap: key.1,
         minify: false,
     });
+    let external = r.external_inputs;
     let out = Bundled {
         code: r.code,
         map: r.map,
         diagnostics: r.diagnostics,
         inputs: r.inputs,
     };
-    // only successful bundles whose inputs are all indexed (not node_modules) are reused
+    // only successful bundles whose inputs are all indexed are reused: never with inputs in
+    // node_modules (not indexed) or outside the root (not even listed)
     let hashed: Option<Vec<(RelPath, Hash)>> = out
         .inputs
         .iter()
         .map(|p| index.hash(p).ok().map(|h| (p.clone(), h)))
         .collect();
     match hashed {
-        Some(inputs) if out.code.is_some() && out.diagnostics.is_empty() => {
+        Some(inputs) if !external && out.code.is_some() && out.diagnostics.is_empty() => {
             memo.insert(
                 key.clone(),
                 BundleMemo {
