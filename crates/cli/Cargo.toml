@@ -14,7 +14,7 @@ path = "src/main.rs"
 beacon-engine = { path = "../engine" }
 beacon-jshost = { path = "../jshost" }
 beacon-bundler = { path = "../bundler" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 notify = "8"
 serde_json = "1"
 ctrlc = "3"

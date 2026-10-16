@@ -1,7 +1,0 @@
-{
-  "resource_pack_name": "minimal",
-  "texture_name": "atlas.items",
-  "texture_data": {
-    "minimal_ruby": { "textures": "textures/items/ruby" }
-  }
-}

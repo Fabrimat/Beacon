@@ -260,6 +260,17 @@ echo 0.0.0
     let o = run(&["check", "--project", ps]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(!marker.exists(), "the bundler ran for an untrusted project");
+    // even with --yes and no BEACON_ESBUILD an untrusted build never downloads
+    let o = cmd(h.path(), &["build", "--yes", "--project", ps])
+        .env_remove("BEACON_ESBUILD")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
+        !h.path().join("tools").exists(),
+        "untrusted build touched the tools dir"
+    );
     // control: trusted, it is located (and run)
     run(&[
         "build",
@@ -562,4 +573,45 @@ fn corpus_medium_builds() {
     }
     assert!(corpus.join("packs/BP/manifest.json").is_file());
     assert!(corpus.join(".beacon/out/lib/RP/manifest.json").is_file());
+}
+
+/// Trusted, scripts present, no esbuild anywhere, no TTY and no `--yes`: the download is not
+/// allowed (BCN0065, exit USAGE) and nothing is written.
+#[test]
+fn download_needs_confirm_without_yes() {
+    let h = tempfile::tempdir().unwrap();
+    let p = project(false);
+    write(
+        p.path(),
+        "src/m/scripts/main.ts",
+        "export {};
+",
+    );
+    let ps = p.path().to_str().unwrap();
+    let o = cmd(h.path(), &["build", "--trust", "--project", ps])
+        .env_remove("BEACON_ESBUILD")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("BCN0065") && stderr(&o).contains("--yes"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!h.path().join("tools").exists());
+}
+
+/// `BEACON_DOWNLOAD=yes` consents to downloads only: it must never confirm `trust`.
+#[test]
+fn download_env_does_not_confirm_trust() {
+    let h = tempfile::tempdir().unwrap();
+    let p = project(true);
+    let ps = p.path().to_str().unwrap();
+    let o = cmd(h.path(), &["trust", "--project", ps])
+        .env("BEACON_DOWNLOAD", "yes")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(!h.path().join("trust.json").exists());
 }

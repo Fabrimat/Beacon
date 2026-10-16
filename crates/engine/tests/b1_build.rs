@@ -323,8 +323,8 @@ fn per_target_min_engine_and_stub_artifacts() {
     assert_eq!(min_engine("b"), serde_json::json!([1, 21, 50]));
 
     let r = session(opts(p.path(), Some("w")), p.path(), &runs).build();
-    assert!(r.diagnostics.iter().any(|d| d.code == Code::ConfigField
-        && d.message.contains("artifact 'mcworld' not supported yet")));
+    // mcworld is built now; this project has no world folder
+    assert!(r.diagnostics.iter().any(|d| d.code == Code::WorldNotFound));
 
     write(
         p.path(),

@@ -10,3 +10,5 @@ publish.workspace = true
 # rustls (ring + webpki roots): pure-Rust TLS, no system OpenSSL on any OS
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 blake3 = "1"
+dirs = "7.0.0"
+tempfile = "3"

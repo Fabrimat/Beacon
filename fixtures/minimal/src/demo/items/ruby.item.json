@@ -6,7 +6,7 @@
       "menu_category": { "category": "items" }
     },
     "components": {
-      "minecraft:icon": "minimal_ruby",
+      "minecraft:icon": "minimal:ruby",
       "minecraft:display_name": { "value": "item.minimal:ruby.name" }
     }
   }

@@ -42,7 +42,7 @@ fn rp(s: &str) -> RelPath {
 #[test]
 fn bundles_two_entries() {
     let Some(inst) = install() else { return };
-    let esbuild = Esbuild::find(inst).expect("find");
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
     println!("version: {:?}", esbuild.version());
     assert!(esbuild.version().unwrap().starts_with("esbuild 0.28"));
 
@@ -99,7 +99,7 @@ fn bundles_two_entries() {
 #[test]
 fn syntax_error_has_span() {
     let Some(inst) = install() else { return };
-    let esbuild = Esbuild::find(inst).expect("find");
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
     let t = tempfile::tempdir().unwrap();
     std::fs::write(t.path().join("bad.js"), "let ok = 1;\nlet x x;\n").unwrap();
     let entries = [rp("bad.js")];
@@ -120,7 +120,7 @@ fn syntax_error_has_span() {
 #[test]
 fn outside_root_imports_are_flagged() {
     let Some(inst) = install() else { return };
-    let esbuild = Esbuild::find(inst).expect("find");
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
     let t = tempfile::tempdir().unwrap();
     let root = t.path().join("proj");
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -155,7 +155,7 @@ console.log(x);
 #[test]
 fn define_becomes_constant() {
     let Some(inst) = install() else { return };
-    let esbuild = Esbuild::find(inst).expect("find");
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
     let t = tempfile::tempdir().unwrap();
     std::fs::write(
         t.path().join("a.js"),

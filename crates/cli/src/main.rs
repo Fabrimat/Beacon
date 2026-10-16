@@ -4,7 +4,7 @@
 
 mod watch;
 
-use beacon_bundler::Esbuild;
+use beacon_bundler::{Confirm, LazyEsbuild};
 use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
 use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, Severity, exit};
@@ -31,6 +31,10 @@ struct Cli {
     /// Project directory (default: current directory).
     #[arg(long, global = true, value_name = "dir")]
     project: Option<PathBuf>,
+    /// Allow downloads (esbuild) and skip confirmation prompts. `BEACON_DOWNLOAD=yes` allows
+    /// downloads only; it never confirms anything else (`trust`).
+    #[arg(long, global = true)]
+    yes: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -69,11 +73,7 @@ enum Cmd {
     /// Explain a diagnostic code, e.g. `BCN0011`.
     Explain { code: String },
     /// Remember that you trust this project's generators and plugins.
-    Trust {
-        /// Skip the confirmation prompt (required without a TTY).
-        #[arg(long)]
-        yes: bool,
-    },
+    Trust,
 }
 
 /// `beacon --help --json`: the clap command tree, versioned.
@@ -102,6 +102,10 @@ fn describe(c: &clap::Command) -> Value {
 struct Opts {
     project: PathBuf,
     json: bool,
+    /// Explicit `--yes` on the command line (confirms `trust`).
+    yes: bool,
+    /// `--yes` or `BEACON_DOWNLOAD=yes`: downloads are pre-confirmed.
+    download: bool,
 }
 
 /// `beacon.plugins` straight from `config.json` (the trust key; validation is the engine's job,
@@ -126,14 +130,17 @@ fn session(o: &Opts, a: &BuildArgs) -> Session {
         trusted: a.trust || trust::is_trusted(&o.project, &plugins(&o.project)),
         release: None,
     };
-    // Restricted mode never runs the sidecar (5.5), and `find` itself executes the binary
-    // (`--version`), which may be project-shipped (`node_modules`): only look when trusted.
-    // A missing esbuild is reported by the session, only if the project has scripts.
+    // Restricted mode never runs the sidecar (5.5), and locating it executes it (`--version`)
+    // and may download it: only when trusted. The lookup is lazy (first bundle), so a missing
+    // esbuild is only reported when the project has scripts.
+    let confirm = if o.download {
+        Confirm::Yes
+    } else {
+        Confirm::Tty
+    };
     let bundler = opts
         .trusted
-        .then(|| Esbuild::find(&o.project).ok())
-        .flatten()
-        .map(|e| Box::new(e) as Box<dyn Bundler>);
+        .then(|| Box::new(LazyEsbuild::new(&o.project, confirm)) as Box<dyn Bundler>);
     Session::new(
         &o.project,
         opts,
@@ -146,6 +153,12 @@ fn exit_code(diags: &[Diagnostic]) -> i32 {
     let err = |d: &&Diagnostic| d.severity == Severity::Error;
     if diags.iter().filter(err).any(|d| d.code == Code::Untrusted) {
         exit::UNTRUSTED
+    } else if diags
+        .iter()
+        .filter(err)
+        .any(|d| d.code == Code::DownloadNeedsConfirm)
+    {
+        exit::USAGE
     } else if diags.iter().filter(err).any(|d| d.code == Code::Internal) {
         exit::INTERNAL
     } else if diags.iter().any(|d| err(&d)) {
@@ -241,8 +254,8 @@ fn explain(code: &str, json: bool) -> i32 {
     exit::OK
 }
 
-fn trust_cmd(o: &Opts, yes: bool) -> i32 {
-    if !yes {
+fn trust_cmd(o: &Opts) -> i32 {
+    if !o.yes {
         if !io::stdin().is_terminal() {
             eprintln!("error: not a terminal; pass --yes to trust this project");
             return exit::USAGE;
@@ -285,13 +298,18 @@ fn main() {
     let o = Opts {
         project: cli.project.unwrap_or_else(|| ".".into()),
         json: cli.json,
+        yes: cli.yes,
+        download: cli.yes
+            || std::env::var("BEACON_DOWNLOAD").is_ok_and(|v| {
+                matches!(v.to_ascii_lowercase().as_str(), "yes" | "y" | "true" | "1")
+            }),
     };
     let code = match cli.cmd {
         Cmd::Build(a) => build(&o, &a),
         Cmd::Watch(a) => watch::run(&o, &a),
         Cmd::Check { trust } => check(&o, trust),
         Cmd::Explain { code } => explain(&code, cli.json),
-        Cmd::Trust { yes } => trust_cmd(&o, yes),
+        Cmd::Trust => trust_cmd(&o),
     };
     process::exit(code);
 }

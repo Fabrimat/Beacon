@@ -90,6 +90,13 @@ fn group(g: Vec<ContentItem>, vfs: &dyn Vfs, diags: &mut Vec<Diagnostic>) -> Con
         .filter(|i| i.merge != Merge::Skip)
         .cloned()
         .collect();
+    // The same source file reaching one dest twice (convention route + a generator's
+    // `asset()` reference) is one item, not a collision; different sources still collide.
+    let mut seen = BTreeSet::new();
+    live.retain(|i| match &i.body {
+        Body::Passthrough(src) => seen.insert(src.clone()),
+        _ => true,
+    });
     if live.is_empty() {
         return g.into_iter().next().expect("non-empty group");
     }

@@ -14,5 +14,9 @@ globset = "0.4"
 blake3 = "1"
 beacon-engine = { path = "../engine" }
 
+[dev-dependencies]
+beacon-bundler = { path = "../bundler" }
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation"] }

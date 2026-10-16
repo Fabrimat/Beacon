@@ -24,7 +24,7 @@ use std::time::Instant;
 
 /// Bump when the host's semantics change (runtime API, prelude, content conversion, input
 /// recording): it invalidates every cached generator result.
-pub const HOST_ABI: &str = "2";
+pub const HOST_ABI: &str = "4";
 
 pub struct Host {
     limits: Limits,
@@ -350,7 +350,12 @@ const PRELUDE: &str = r#"(() => {
     for (const i of [].concat(r ?? [])) out.push(i);
     return r;
   };
-  g.__result = () => ({ out, unc, defs });
+  // content files (`export default entity(...)`): collect the default export unless `generate`
+  // already did (same objects)
+  g.__result = () => {
+    for (const i of [].concat(g.__default ?? [])) if (i && i.__beacon && !out.includes(i)) out.push(i);
+    return { out, unc, defs };
+  };
 })()"#;
 
 // ---------------------------------------------------------------- assets()
@@ -518,7 +523,8 @@ impl Conv<'_> {
 
     /// Module asset (`./x`): emitted as Passthrough; returns (emitted path, source bytes).
     fn asset(&mut self, rel: &str, bytes: bool) -> Result<(String, Vec<u8>), String> {
-        let (pack, path, merge) = self.route(rel)?;
+        // `Skip`: the convention route already emits the same file; this copy must not collide
+        let (pack, path, _) = self.route(rel)?;
         let src = self
             .g
             .module
@@ -526,7 +532,7 @@ impl Conv<'_> {
             .map_err(|e| e.to_string())?;
         let b = observe(self.vfs, self.inputs, &src, bytes)
             .map_err(|e| format!("cannot read {src}: {e}"))?;
-        self.push(pack, &path, Body::Passthrough(src), merge)?;
+        self.push(pack, &path, Body::Passthrough(src), Merge::Error)?;
         Ok((path, b))
     }
 
@@ -655,8 +661,26 @@ impl Conv<'_> {
                 } else {
                     ("blocks", "minecraft:block")
                 };
-                let j = wrap(id, def, key, "1.21.0", true)?;
-                self.json(Pack::Behavior, format!("{dir}/{}.json", name_of(id)?), j)
+                let mut d = obj(def, "definition")?;
+                let tex = d.remove("texture");
+                let j = wrap(id, &d.into(), key, "1.21.0", true)?;
+                self.json(Pack::Behavior, format!("{dir}/{}.json", name_of(id)?), j)?;
+                let Some(t) = tex else { return Ok(()) };
+                let t = t.as_str().ok_or("texture must be a string")?;
+                let (atlas, reg) = if kind == "item" {
+                    ("atlas.items", "item_texture")
+                } else {
+                    ("atlas.terrain", "terrain_texture")
+                };
+                let path = self.asset(t, false)?.0;
+                let frag = json!({ "resource_pack_name": "vanilla", "texture_name": atlas,
+                    "texture_data": { id: { "textures": strip_ext(&path) } } });
+                self.push(
+                    Pack::Resource,
+                    &format!("textures/{reg}.json"),
+                    Body::Json(frag),
+                    Merge::JsonDeep,
+                )
             }
             "entity" => self.entity(id, def),
             "sound" => self.sound(id, def),
@@ -827,8 +851,12 @@ fn eval(
                 )?;
                 globals.set("__ctx", serde_json::to_string(ctx).unwrap_or_default())?;
                 c.eval::<(), _>(PRELUDE)?;
-                let (_, p) = Module::declare(c.clone(), g.path.as_str(), entry)?.eval()?;
+                let (m, p) = Module::declare(c.clone(), g.path.as_str(), entry)?.eval()?;
                 p.finish::<()>()?;
+                globals.set(
+                    "__default",
+                    m.namespace()?.get::<_, rquickjs::Value>("default")?,
+                )?;
                 // Drain microtasks under the deadline; whatever is left is a timeout.
                 // (job exceptions are swallowed by rquickjs; an unhandled rejection is not fatal)
                 while c.execute_pending_job() {
