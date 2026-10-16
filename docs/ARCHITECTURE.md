@@ -392,7 +392,8 @@ discover -> trust (5.5) -> index (VFS) -> route (5.3) -> generators (JS host)
   - `Date.now`, `Math.random`, `crypto.randomUUID` mark an evaluation uncacheable. External
     plugins always rerun.
 - **Shared content-addressed cache** (safe for parallel agents): atomic writes (temp +
-  rename), integrity check on read, size cap with LRU GC, cross-process locking.
+  rename), integrity check on read, size cap with LRU GC, cross-process locking. Phase 1
+  ships a per-project cache without locking or GC (14.1).
 - **Determinism**: file walks sorted by byte order of NFC-normalized UTF-8 paths; paths
   recorded as normalized relative paths; canonical JSON output (key order, number formatting,
   escaping; versioned as `canonicalVersion`); deterministic merge order for many-to-one
@@ -929,7 +930,8 @@ editor that installs the extension from Open VSX. The app covers what a fork wou
 - Phase 0 spike measures real per-context RSS and evaluation time of representative generators
   instead of quoted figures.
 - Bundling: esbuild sidecar, kept as one long-lived incremental service process in the daemon
-  (no per-change spawn); rolldown later. Narrow interface: entry points + externals +
+  (no per-change spawn) if spawn cost ever misses a budget; phase 1 spawns the CLI per bundle
+  and meets the watch budget (14.1); rolldown later. Narrow interface: entry points + externals +
   sourcemap -> files.
 - App shell: Tauri, for install size and idle RAM.
 
@@ -1014,6 +1016,38 @@ The phases are a process toward the **alpha**, which is the end of phase 5. User
 
 After the alpha: [BACKLOG.md](BACKLOG.md), prioritized with evidence from the team and
 collaborators.
+
+### 14.1 Phase 1 as built (2026-10-16)
+
+Decisions taken while building phase 1 that refine the sections above. Code is the source of
+truth (`crates/engine/src/{path,model,host,diag,event}.rs` are the contract modules).
+
+- **Sandbox = the VFS index (5.4).** User code reaches files only through `Vfs`, which serves
+  only indexed paths. The walker never follows reparse points; reads re-check
+  (size, mtime, file id) and the blake3 hash, returning "changed since indexing" otherwise.
+  `NotFound` means "not indexed" only. Generators cannot read `node_modules` (npm
+  pre-bundle of generators is deferred; measured maps have no npm imports, 2.2).
+- **`assets(glob)`** is relative to the generator file's folder; `../` may climb only to the
+  module root.
+- **Cache (5.2), phase-1 form:** per-project `.beacon/cache/<blake3>.json` plus in-memory;
+  key = generator + `GenCtx` + engine/canonical/suffix-table versions + `GeneratorHost::version()`
+  (`HOST_ABI`); an entry is reused only if every observed file hash, directory listing hash,
+  negative lookup, define and env value still matches. No cross-process lock or GC yet.
+- **Bundling:** esbuild CLI spawned per bundle (~50 ms), no service protocol; reused while
+  inputs are unchanged; bundles with inputs outside the project are never reused. esbuild is
+  located via `BEACON_ESBUILD`, project `node_modules/@esbuild/<platform>`, or PATH, and only
+  for trusted sessions (5.5). Hash-pinned download (9.2) is still to do.
+- **Untrusted builds** of projects without code (no generators, scripts, or plugins) still
+  build and write packs; any code makes `build` exit 3. Output directories reached through a
+  link are refused when untrusted (warning when trusted).
+- **Destinations:** no `--target` = packs projection (primary output to `packs.*`, others to
+  `.beacon/out/<id>/`); `dev` = `development_*_packs/<name>-<worktree8> BP|RP` in the edition's
+  com.mojang (`BEACON_COM_MOJANG` override); archives to `dist/`. `--out` overrides.
+- **Watch:** stat-only incremental index updates, 6 ms coalescing, in-memory ledger;
+  `watch --json` prints a `BuildEvent` after the build (ledger included) completes.
+- **Measured (large corpus, Windows):** watch JSON p95 ~50-80 ms, TS p95 ~130-160 ms, cold
+  ~2-3 s, warm ~0.8 s, idle RSS ~7 MB, binary 7.5 MB. CI enforces the phase-1 budgets on
+  Windows and macOS and checks byte-identical `.mcaddon` output across both.
 
 ---
 
