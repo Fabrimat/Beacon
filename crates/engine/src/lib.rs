@@ -21,6 +21,8 @@ pub mod suffix;
 
 // owned by workstreams
 pub mod archive;
+pub mod build;
+mod cache;
 pub mod canonical;
 pub mod emit;
 pub mod lock;

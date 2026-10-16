@@ -22,6 +22,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Bump when the host's semantics change (runtime API, prelude, content conversion, input
+/// recording): it invalidates every cached generator result.
+pub const HOST_ABI: &str = "1";
+
 pub struct Host {
     limits: Limits,
 }
@@ -868,5 +872,9 @@ impl GeneratorHost for Host {
         }
         r.items = conv.items;
         r
+    }
+
+    fn version(&self) -> String {
+        format!("beacon-jshost {} abi {HOST_ABI}", env!("CARGO_PKG_VERSION"))
     }
 }

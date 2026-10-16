@@ -1,0 +1,13 @@
+{
+  "format_version": "1.21.60",
+  "minecraft:item": {
+    "description": {
+      "identifier": "minimal:ruby",
+      "menu_category": { "category": "items" }
+    },
+    "components": {
+      "minecraft:icon": "minimal_ruby",
+      "minecraft:display_name": { "value": "item.minimal:ruby.name" }
+    }
+  }
+}

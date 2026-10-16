@@ -1,18 +1,22 @@
 //! `beacon` CLI (6.2). Non-interactive unless a command says otherwise (`trust` prompts on a TTY).
-//!
-//! The build pipeline is workstream B1; until then `run_build` / `run_watch` are phase-0
-//! copy placeholders behind `// B1:` seams.
+//! The pipeline is `beacon_engine::build::Session`; this crate wires in the QuickJS host and
+//! the esbuild bundler.
 
-use beacon_engine::config::{CONFIG_FILE, STATE_DIR};
+use beacon_bundler::Esbuild;
+use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
+use beacon_engine::config::{CONFIG_FILE, LOCK_FILE};
 use beacon_engine::diag::{Code, Diagnostic, Severity, exit};
-use beacon_engine::event::{BuildEvent, BuildReport};
+use beacon_engine::event::BuildEvent;
+use beacon_engine::host::Bundler;
 use beacon_engine::{sarif, trust};
+use beacon_jshost::{Host, Limits};
 use clap::{CommandFactory, Parser, Subcommand};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::{fs, process, sync::mpsc, time::Instant};
+use std::time::Duration;
+use std::{fs, process, sync::mpsc};
 
 #[derive(Parser)]
 #[command(
@@ -31,8 +35,6 @@ struct Cli {
     cmd: Cmd,
 }
 
-// B1: target/all/frozen are consumed by the real pipeline.
-#[allow(dead_code)]
 #[derive(clap::Args, Clone)]
 struct BuildArgs {
     /// Build one target from `beacon.targets`.
@@ -41,7 +43,7 @@ struct BuildArgs {
     /// Build every target.
     #[arg(long)]
     all: bool,
-    /// Output directory.
+    /// Output directory (replaces packs/.beacon/out, com.mojang for dev targets, dist/ for archives).
     #[arg(long, value_name = "dir")]
     out: Option<PathBuf>,
     /// Allow generators and plugins for this run only (does not persist; see `beacon trust`).
@@ -58,9 +60,9 @@ enum Cmd {
     Build(BuildArgs),
     /// Build, then rebuild on every change.
     Watch(BuildArgs),
-    /// Validate the project without running any JS (restricted mode).
+    /// Validate the project without writing anything; runs no JS unless trusted.
     Check {
-        /// Accepted for symmetry with `build`; check never runs JS.
+        /// Also run generators and the bundler for this run (does not persist).
         #[arg(long)]
         trust: bool,
     },
@@ -99,292 +101,179 @@ fn describe(c: &clap::Command) -> Value {
 
 struct Opts {
     project: PathBuf,
-    out: PathBuf,
     json: bool,
 }
 
-/// What the trust gate needs: raw plugin list and whether any code would run.
-struct Found {
-    plugins: Vec<Value>,
-    has_code: bool,
-}
-
-fn has_gen_ts(dir: &Path) -> bool {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return false;
-    };
-    // file_type() does not follow symlinks/junctions, so they are neither walked nor matched.
-    rd.flatten().any(|e| {
-        let Ok(ft) = e.file_type() else {
-            return false;
-        };
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if ft.is_dir() {
-            name != "node_modules" && has_gen_ts(&e.path())
-        } else {
-            ft.is_file() && name.ends_with(".gen.ts")
-        }
-    })
-}
-
-/// Reads `beacon.plugins` / `beacon.sources` straight from `config.json` (validation is the
-/// engine's job; a missing or broken config just means "no code" here).
-fn code_in(project: &Path) -> Found {
+/// `beacon.plugins` straight from `config.json` (the trust key; validation is the engine's job,
+/// a missing or broken config just means "no plugins" here).
+fn plugins(project: &Path) -> Vec<Value> {
     let cfg: Value = fs::read(project.join(CONFIG_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    let plugins = cfg["beacon"]["plugins"]
+    cfg["beacon"]["plugins"]
         .as_array()
         .cloned()
-        .unwrap_or_default();
-    let sources: Vec<String> = cfg["beacon"]["sources"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["./src".into()]);
-    let has_code = !plugins.is_empty() || sources.iter().any(|s| has_gen_ts(&project.join(s)));
-    Found { plugins, has_code }
+        .unwrap_or_default()
 }
 
-fn untrusted(project: &Path, allow: bool) -> Option<Diagnostic> {
-    let c = code_in(project);
-    (c.has_code && !allow && !trust::is_trusted(project, &c.plugins)).then(|| {
-        Diagnostic::new(
-            Code::Untrusted,
-            "project has generators or plugins and is not trusted; run `beacon trust` or pass --trust",
-        )
-    })
-}
-
-fn internal(e: impl std::fmt::Display) -> Diagnostic {
-    Diagnostic::new(Code::Internal, e.to_string())
+fn session(o: &Opts, a: &BuildArgs) -> Session {
+    let opts = BuildOptions {
+        target: a.target.clone(),
+        all: a.all,
+        out: a.out.clone(),
+        frozen: a.frozen,
+        trusted: a.trust || trust::is_trusted(&o.project, &plugins(&o.project)),
+    };
+    // a missing esbuild is reported by the session, only if the project has scripts
+    let bundler = Esbuild::find(&o.project)
+        .ok()
+        .map(|e| Box::new(e) as Box<dyn Bundler>);
+    Session::new(
+        &o.project,
+        opts,
+        Box::new(Host::new(Limits::default())),
+        bundler,
+    )
 }
 
 fn exit_code(diags: &[Diagnostic]) -> i32 {
-    let has = |c: Code| diags.iter().any(|d| d.code == c);
-    if has(Code::Untrusted) {
+    let err = |d: &&Diagnostic| d.severity == Severity::Error;
+    if diags.iter().filter(err).any(|d| d.code == Code::Untrusted) {
         exit::UNTRUSTED
-    } else if has(Code::Internal) {
+    } else if diags.iter().filter(err).any(|d| d.code == Code::Internal) {
         exit::INTERNAL
-    } else if diags.iter().any(|d| d.severity == Severity::Error) {
+    } else if diags.iter().any(|d| err(&d)) {
         exit::DIAGNOSTICS
     } else {
         exit::OK
     }
 }
 
-// ---- B1: placeholder pipeline (phase-0 copy of <project>/src to <out>) ----
-
-fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for e in entries {
-        let ft = e.file_type()?;
-        if ft.is_dir() {
-            walk(&e.path(), files)?;
-        } else if ft.is_file() {
-            files.push(e.path()); // symlinks and junctions are skipped
-        }
-    }
-    Ok(())
+fn count(diags: &[Diagnostic], s: Severity) -> usize {
+    diags.iter().filter(|d| d.severity == s).count()
 }
-
-/// Copy `src` to `dst` unless dst has the same size and is not older. True when written.
-fn copy_file(src: &Path, dst: &Path) -> io::Result<bool> {
-    let (s, d) = (fs::metadata(src)?, fs::metadata(dst));
-    if let Ok(d) = d
-        && d.len() == s.len()
-        && d.modified()? >= s.modified()?
-    {
-        return Ok(false);
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(src, dst)?;
-    Ok(true)
-}
-
-/// B1: replace with the real pipeline (config -> index -> route -> emit).
-fn run_build(o: &Opts) -> (BuildReport, Vec<Diagnostic>) {
-    let t = Instant::now();
-    let src = o.project.join("src");
-    let mut diags = Vec::new();
-    let mut emitted = 0;
-    let mut files = Vec::new();
-    match walk(&src, &mut files) {
-        Ok(()) => {
-            for f in files {
-                match copy_file(&f, &o.out.join(f.strip_prefix(&src).unwrap())) {
-                    Ok(w) => emitted += w as usize,
-                    Err(e) => diags.push(internal(format!("{}: {e}", f.display()))),
-                }
-            }
-        }
-        Err(e) => diags.push(internal(format!("{}: {e}", src.display()))),
-    }
-    let report = BuildReport {
-        ms: t.elapsed().as_secs_f64() * 1000.0,
-        emitted,
-        artifacts: vec![],
-        sarif: sarif::to_sarif(&diags),
-    };
-    (report, diags)
-}
-
-/// B1: replace with incremental rebuilds. Calls `on_build` for the initial build (`ready`) and
-/// after every rebuild that wrote something (`built`).
-fn run_watch(
-    o: &Opts,
-    mut on_build: impl FnMut(&str, &BuildReport, &[Diagnostic]),
-) -> notify::Result<()> {
-    let src = fs::canonicalize(o.project.join("src"))?;
-    let (report, diags) = run_build(o);
-    let (tx, rx) = mpsc::channel();
-    let mut w = notify::recommended_watcher(tx)?;
-    w.watch(&src, RecursiveMode::Recursive)?;
-    on_build("ready", &report, &diags);
-    for ev in rx {
-        let ev = ev?;
-        if !matches!(ev.kind, EventKind::Create(_) | EventKind::Modify(_)) {
-            continue;
-        }
-        let t = Instant::now();
-        let mut emitted = 0;
-        let mut diags = Vec::new();
-        for p in ev.paths.iter().filter(|p| p.is_file()) {
-            let dst = o.out.join(p.strip_prefix(&src).unwrap());
-            // Retry once: the writer may still hold the file.
-            let r = copy_file(p, &dst).or_else(|_| {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                copy_file(p, &dst)
-            });
-            match r {
-                Ok(w) => emitted += w as usize,
-                Err(e) => diags.push(internal(format!("{}: {e}", p.display()))),
-            }
-        }
-        if emitted > 0 || !diags.is_empty() {
-            let report = BuildReport {
-                ms: t.elapsed().as_secs_f64() * 1000.0,
-                emitted,
-                artifacts: vec![],
-                sarif: sarif::to_sarif(&diags),
-            };
-            on_build("built", &report, &diags);
-        }
-    }
-    Ok(())
-}
-
-// ---- commands ----
 
 fn print_diags(diags: &[Diagnostic]) {
     eprint!("{}", sarif::to_text(diags));
 }
 
-fn build(o: &Opts, allow: bool) -> i32 {
-    if let Some(d) = untrusted(&o.project, allow) {
-        return refuse(o, vec![d]);
-    }
-    let (report, diags) = run_build(o);
+fn build(o: &Opts, a: &BuildArgs) -> i32 {
+    let r = session(o, a).build();
     if o.json {
-        println!("{}", serde_json::to_string(&report).unwrap());
+        println!("{}", serde_json::to_string(&r.report).unwrap());
     } else {
-        print_diags(&diags);
-        println!("built in {:.0} ms ({} files)", report.ms, report.emitted);
+        print_diags(&r.diagnostics);
+        for a in &r.report.artifacts {
+            println!("wrote {a}");
+        }
+        println!(
+            "built in {:.0} ms ({} files written)",
+            r.report.ms, r.report.emitted
+        );
     }
-    exit_code(&diags)
+    exit_code(&r.diagnostics)
 }
 
-fn refuse(o: &Opts, diags: Vec<Diagnostic>) -> i32 {
+/// After every build (files flushed): a `BuildEvent` JSON line with `--json`, else the
+/// diagnostics and `ready` / `built in N ms`.
+fn report(o: &Opts, event: &'static str, r: &BuildOutcome) {
     if o.json {
-        let r = BuildReport {
-            ms: 0.0,
-            emitted: 0,
-            artifacts: vec![],
-            sarif: sarif::to_sarif(&diags),
+        let ev = BuildEvent {
+            event,
+            generation: r.generation,
+            ms: r.report.ms,
+            emitted: r.report.emitted,
+            errors: count(&r.diagnostics, Severity::Error),
+            warnings: count(&r.diagnostics, Severity::Warning),
         };
-        println!("{}", serde_json::to_string(&r).unwrap());
+        println!("{}", serde_json::to_string(&ev).unwrap());
     } else {
-        print_diags(&diags);
+        print_diags(&r.diagnostics);
+        if event == "ready" {
+            println!("ready");
+        } else {
+            println!(
+                "built in {:.0} ms ({} files written)",
+                r.report.ms, r.report.emitted
+            );
+        }
     }
-    exit_code(&diags)
+    let _ = io::stdout().flush();
 }
 
-fn watch(o: &Opts, allow: bool) -> i32 {
-    if let Some(d) = untrusted(&o.project, allow) {
-        return refuse(o, vec![d]);
+/// Minimal watch: every relevant change (debounced) is a full `Session::build`; the session's
+/// index fast path and caches keep it incremental.
+// ponytail: no overflow rescan / size-stability wait / polling fallback yet (9.3, B2).
+fn watch(o: &Opts, a: &BuildArgs) -> i32 {
+    let mut s = session(o, a);
+    let mut ignored = s.output_dirs();
+    ignored.push(s.root().join(".git"));
+    let (tx, rx) = mpsc::channel();
+    let watcher = notify::recommended_watcher(tx)
+        .and_then(|mut w| w.watch(s.root(), RecursiveMode::Recursive).map(|_| w));
+    let _watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: cannot watch {}: {e}", s.root().display());
+            return exit::INTERNAL;
+        }
+    };
+    // the build itself (re)writes the lockfile (+ its temp file)
+    let root = s.root().to_path_buf();
+    let own_lock = |p: &Path| {
+        p.parent() == Some(root.as_path())
+            && p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(LOCK_FILE))
+    };
+    let relevant = |ev: &notify::Result<notify::Event>| match ev {
+        // e.g. an event buffer overflow: rebuild (the build re-indexes everything)
+        Err(_) => true,
+        Ok(ev) => {
+            !matches!(ev.kind, EventKind::Access(_))
+                && ev
+                    .paths
+                    .iter()
+                    .any(|p| !ignored.iter().any(|i| p.starts_with(i)) && !own_lock(p))
+        }
+    };
+    let r = s.build();
+    report(o, "ready", &r);
+    if exit_code(&r.diagnostics) == exit::UNTRUSTED {
+        return exit::UNTRUSTED;
     }
-    let mut generation = 0;
-    let r = run_watch(o, |event, rep, diags| {
-        generation += 1;
-        if o.json {
-            let ev = BuildEvent {
-                event: if event == "ready" { "ready" } else { "built" },
-                generation,
-                ms: rep.ms,
-                emitted: rep.emitted,
-                errors: diags
-                    .iter()
-                    .filter(|d| d.severity == Severity::Error)
-                    .count(),
-                warnings: diags
-                    .iter()
-                    .filter(|d| d.severity == Severity::Warning)
-                    .count(),
-            };
-            println!("{}", serde_json::to_string(&ev).unwrap());
-        } else {
-            print_diags(diags);
-            if event == "ready" {
-                println!("ready");
-            } else {
-                println!("built in {:.0} ms", rep.ms);
+    while let Ok(ev) = rx.recv() {
+        if !relevant(&ev) {
+            continue;
+        }
+        // debounce: coalesce bursts (editor atomic saves) until 10 ms of quiet
+        loop {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return exit::OK,
             }
         }
-        let _ = io::stdout().flush();
-    });
-    match r {
-        Ok(()) => exit::OK,
-        Err(e) => {
-            eprintln!("error: {e}");
-            exit::INTERNAL
-        }
+        report(o, "built", &s.build());
     }
+    exit::OK
 }
 
-/// B1: restricted-mode validation (config, index, route, merge) without JS.
-fn check(o: &Opts) -> i32 {
-    let mut diags = Vec::new();
-    if code_in(&o.project).has_code && !trust::is_trusted(&o.project, &code_in(&o.project).plugins)
-    {
-        let mut d = Diagnostic::new(
-            Code::Untrusted,
-            "project has generators or plugins; checked in restricted mode (no JS was run)",
-        );
-        d.severity = Severity::Note;
-        diags.push(d);
-    }
+fn check(o: &Opts, trusted: bool) -> i32 {
+    let a = BuildArgs {
+        target: None,
+        all: false,
+        out: None,
+        trust: trusted,
+        frozen: false,
+    };
+    let r = session(o, &a).check();
     if o.json {
-        println!(
-            "{}",
-            serde_json::to_string(&sarif::to_sarif(&diags)).unwrap()
-        );
+        println!("{}", serde_json::to_string(&r.report.sarif).unwrap());
     } else {
-        print_diags(&diags);
+        print_diags(&r.diagnostics);
     }
-    // A note is not a failure.
-    if diags.iter().any(|d| d.severity == Severity::Error) {
-        exit::DIAGNOSTICS
-    } else {
-        exit::OK
-    }
+    exit_code(&r.diagnostics)
 }
 
 fn explain(code: &str, json: bool) -> i32 {
@@ -420,7 +309,7 @@ fn trust_cmd(o: &Opts, yes: bool) -> i32 {
             return exit::USAGE;
         }
     }
-    match trust::trust(&o.project, &code_in(&o.project).plugins) {
+    match trust::trust(&o.project, &plugins(&o.project)) {
         Ok(()) => {
             println!("trusted {}", o.project.display());
             exit::OK
@@ -445,18 +334,16 @@ fn main() {
         return;
     }
     let cli = Cli::parse();
-    let project = cli.project.unwrap_or_else(|| ".".into());
-    let mk = |out: Option<PathBuf>| Opts {
-        out: out.unwrap_or_else(|| project.join(STATE_DIR).join("out")),
-        project: project.clone(),
+    let o = Opts {
+        project: cli.project.unwrap_or_else(|| ".".into()),
         json: cli.json,
     };
     let code = match cli.cmd {
-        Cmd::Build(a) => build(&mk(a.out), a.trust),
-        Cmd::Watch(a) => watch(&mk(a.out), a.trust),
-        Cmd::Check { .. } => check(&mk(None)),
+        Cmd::Build(a) => build(&o, &a),
+        Cmd::Watch(a) => watch(&o, &a),
+        Cmd::Check { trust } => check(&o, trust),
         Cmd::Explain { code } => explain(&code, cli.json),
-        Cmd::Trust { yes } => trust_cmd(&mk(None), yes),
+        Cmd::Trust { yes } => trust_cmd(&o, yes),
     };
     process::exit(code);
 }

@@ -114,11 +114,14 @@ dependencies = [
 name = "beacon-cli"
 version = "0.0.0"
 dependencies = [
+ "beacon-bundler",
  "beacon-engine",
+ "beacon-jshost",
  "clap",
  "notify",
  "serde_json",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

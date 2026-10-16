@@ -17,6 +17,9 @@ pub struct GenResult {
 /// Runs one generator in a fresh JS context. Limits (5.4) become diagnostics, never panics.
 pub trait GeneratorHost: Send + Sync {
     fn run(&self, generator: &Generator, ctx: &GenCtx, vfs: &dyn Vfs) -> GenResult;
+    /// Identity of the host's observable behavior (runtime API, prelude, TS stripping). Part
+    /// of the generator cache key: change it whenever the same inputs could give other output.
+    fn version(&self) -> String;
 }
 
 pub struct BundleRequest<'a> {

@@ -1,0 +1,23 @@
+{
+  "format_version": "1.21.60",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "minimal:ghost",
+      "is_spawnable": true,
+      "is_summonable": true
+    },
+    "components": {
+      "minecraft:type_family": { "family": ["ghost", "mob"] },
+      "minecraft:health": { "value": 10, "max": 10 },
+      "minecraft:collision_box": { "width": 0.8, "height": 0.8 },
+      "minecraft:physics": {},
+      "minecraft:pushable": { "is_pushable": true, "is_pushable_by_piston": true },
+      "minecraft:movement": { "value": 0.2 },
+      "minecraft:movement.basic": {},
+      "minecraft:jump.static": {},
+      "minecraft:navigation.walk": { "can_walk": true },
+      "minecraft:behavior.random_stroll": { "priority": 6 },
+      "minecraft:behavior.look_at_player": { "priority": 7, "look_distance": 6 }
+    }
+  }
+}

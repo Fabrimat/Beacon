@@ -1,0 +1,13 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:client_entity": {
+    "description": {
+      "identifier": "minimal:ghost",
+      "materials": { "default": "entity_alphatest" },
+      "textures": { "default": "textures/entity/ghost" },
+      "geometry": { "default": "geometry.minimal.ghost" },
+      "render_controllers": ["controller.render.default"],
+      "spawn_egg": { "base_color": "#e1e8f0", "overlay_color": "#1e1e32" }
+    }
+  }
+}

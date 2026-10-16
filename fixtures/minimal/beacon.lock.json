@@ -1,0 +1,21 @@
+{
+  "bundler": "esbuild 0.28.2",
+  "canonicalVersion": 1,
+  "outputs": {
+    "main": {
+      "editions": {
+        "bedrock": {
+          "BP": {
+            "header": "dee77e66-e1e1-49ef-896d-c2829b179687",
+            "module": "d76d7624-3fe8-4042-8fcf-427b10f92b42"
+          },
+          "RP": {
+            "header": "98244285-abe1-4a4b-8f29-51df36e39dcb",
+            "module": "396f87f4-bc9a-4a00-aa2a-213c54f404ee"
+          }
+        }
+      },
+      "scriptModule": "3ee2b0c1-0ec0-4762-88dd-dd669c4d4f23"
+    }
+  }
+}

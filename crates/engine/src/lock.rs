@@ -149,7 +149,8 @@ impl Lockfile {
         Ok(lock)
     }
 
-    fn save(&self, root: &Path) -> std::io::Result<()> {
+    /// Writes the lockfile (canonical JSON, atomically).
+    pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let bytes = canonical::to_vec(&serde_json::to_value(self).expect("lockfile json"));
         let mut rnd = [0u8; 8];
         getrandom::fill(&mut rnd).map_err(std::io::Error::other)?;

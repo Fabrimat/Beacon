@@ -4,7 +4,9 @@
 
 use crate::path::RelPath;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
@@ -13,7 +15,7 @@ pub enum Severity {
 }
 
 /// 1-based line/column; `None` when only the file is known.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub path: RelPath,
     pub line: Option<u32>,
@@ -21,7 +23,7 @@ pub struct Span {
 }
 
 /// A text edit shaped like an LSP `TextEdit` (6.3 fix-its).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fix {
     pub description: String,
     pub path: RelPath,
@@ -32,7 +34,7 @@ pub struct Fix {
     pub safe: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub code: Code,
     pub severity: Severity,
@@ -92,6 +94,13 @@ macro_rules! codes {
 impl serde::Serialize for Code {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.id())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Code {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(d)?;
+        Code::from_id(&id).ok_or_else(|| serde::de::Error::custom(format!("unknown code {id}")))
     }
 }
 

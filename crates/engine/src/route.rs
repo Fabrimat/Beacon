@@ -26,6 +26,13 @@ fn norm_source(s: &str) -> Result<Option<RelPath>, String> {
     RelPath::parse(s).map(Some).map_err(|e| e.to_string())
 }
 
+/// Output ids and target names: `[A-Za-z0-9_-]+`.
+fn id_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 fn ns_ok(s: &str) -> bool {
     s != "minecraft"
         && !s.is_empty()
@@ -87,9 +94,12 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
     let mut seen = std::collections::BTreeSet::new();
     for o in &c.beacon.outputs {
         let line = |k: &str, v: &str| line_of(text, &[k, &format!("\"{v}\"")]);
-        if o.id.is_empty() || !seen.insert(&o.id) {
+        if !id_ok(&o.id) || !seen.insert(&o.id) {
             bad(
-                format!("output id {:?} is empty or duplicated", o.id),
+                format!(
+                    "output id {:?} must be unique and match [A-Za-z0-9_-]+",
+                    o.id
+                ),
                 line("\"id\"", &o.id),
             );
         }
@@ -103,6 +113,41 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
                     line_of(text, &[&format!("\"{g}\"")]),
                 );
             }
+        }
+    }
+    // ids and names end up in file and folder names: never let them steer a path
+    for t in c.beacon.targets.keys().filter(|t| !id_ok(t)) {
+        bad(
+            format!("target name {t:?} must match [A-Za-z0-9_-]+"),
+            line_of(text, &[&format!("\"{t}\"")]),
+        );
+    }
+    if let Some(p) = &c.beacon.primary_output {
+        let known = if c.beacon.outputs.is_empty() {
+            p == "main"
+        } else {
+            seen.contains(p)
+        };
+        if !known {
+            bad(
+                format!("primaryOutput {p:?} is not an output id"),
+                line_of(text, &["\"primaryOutput\""]),
+            );
+        }
+    }
+    for (k, v) in [
+        ("behaviorPack", &c.packs.behavior_pack),
+        ("resourcePack", &c.packs.resource_pack),
+    ] {
+        if let Some(v) = v
+            && !matches!(norm_source(v), Ok(Some(_)))
+        {
+            bad(
+                format!(
+                    "packs.{k} {v:?} must be a folder inside the project (no `..`, not absolute)"
+                ),
+                line_of(text, &[&format!("\"{k}\"")]),
+            );
         }
     }
     for s in &c.beacon.sources {

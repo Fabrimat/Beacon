@@ -1,0 +1,3 @@
+item.minimal:ruby.name=Ruby
+entity.minimal:ghost.name=Ghost
+item.spawn_egg.entity.minimal:ghost.name=Spawn Ghost

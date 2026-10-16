@@ -1,0 +1,24 @@
+{
+  "type": "minecraftBedrock",
+  "name": "beacon-minimal",
+  "authors": ["Beacon"],
+  "targetVersion": "1.26.60",
+  "namespace": "minimal",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP"
+  },
+  "beacon": {
+    "sources": ["./src"],
+    "packMeta": {
+      "name": "Beacon Minimal",
+      "description": "Hand-made Beacon example project",
+      "icon": "./pack_icon.png"
+    },
+    "targets": {
+      "dev": { "edition": "bedrock", "artifact": "dev" },
+      "addon": { "edition": "bedrock", "artifact": "mcaddon" }
+    },
+    "scriptModules": { "@minecraft/server": "2.10.0" }
+  }
+}
