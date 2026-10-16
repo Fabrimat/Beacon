@@ -119,8 +119,92 @@ pub fn rule_for(file_name: &str) -> Option<&'static Rule> {
         .max_by_key(|r| r.suffix.len())
 }
 
+/// Never routed, never `UnknownSuffix` (code, data modules, config).
+pub fn is_unrouted(file_name: &str) -> bool {
+    file_name == crate::config::MODULE_FILE
+        || file_name.ends_with(".ts")
+        || file_name.ends_with(".js")
+        || file_name.ends_with(".data.json")
+}
+
+/// Convention destination of a file: `module` = module name, `rel` = module-relative path
+/// (`/`-separated). Returns pack, pack-relative path and merge policy, or `None` when no rule
+/// applies (`UnknownSuffix`, unless [`is_unrouted`]). Shared by routing and by generators
+/// that reference assets (e.g. `sound()` needs the emitted path of an `.ogg`).
+pub fn route_file(module: &str, namespace: &str, rel: &str) -> Option<(Pack, String, Merge)> {
+    let segs: Vec<&str> = rel.split('/').collect();
+    let name = *segs.last()?;
+    if TEXTURE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        let (i, dir) = segs[..segs.len() - 1]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| {
+                TEXTURE_FOLDERS
+                    .iter()
+                    .find(|(f, _)| f == s)
+                    .map(|(_, d)| (i, *d))
+            })?;
+        return Some((
+            Pack::Resource,
+            format!("textures/{dir}/{}", segs[i + 1..].join("/")),
+            Merge::Error,
+        ));
+    }
+    let rule = rule_for(name)?;
+    let rest = if segs.len() > 1 {
+        segs[1..].join("/")
+    } else {
+        name.to_owned()
+    };
+    let rename = |s: &str| {
+        if rule.rename_to_json {
+            format!("{}.json", &s[..s.len() - rule.suffix.len()])
+        } else {
+            s.to_owned()
+        }
+    };
+    let path = match rule.layout {
+        Layout::Flat => format!("{}/{}", rule.dir, rename(name)),
+        Layout::Module => format!("{}/{module}/{}", rule.dir, rename(&rest)),
+        Layout::Namespace => format!("{}/{namespace}/{}", rule.dir, rename(&rest)),
+    };
+    Some((rule.pack, path, rule.merge))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::route_file;
+    use crate::model::Pack;
+
+    #[test]
+    fn routes_by_layout() {
+        let p = |rel| route_file("vehicles", "demo", rel).map(|(_, p, _)| p);
+        assert_eq!(p("items/sword.item.json").unwrap(), "items/sword.json");
+        assert_eq!(p("sword.item.json").unwrap(), "items/sword.json");
+        assert_eq!(
+            p("functions/game/start.mcfunction").unwrap(),
+            "functions/vehicles/game/start.mcfunction"
+        );
+        assert_eq!(p("sounds/beep.ogg").unwrap(), "sounds/vehicles/beep.ogg");
+        assert_eq!(
+            p("structures/house.mcstructure").unwrap(),
+            "structures/demo/house.mcstructure"
+        );
+        assert_eq!(
+            p("entities/car/body.png").unwrap(),
+            "textures/entity/car/body.png"
+        );
+        assert_eq!(p("items/sword.png").unwrap(), "textures/items/sword.png");
+        assert_eq!(p("texts/en_US.lang").unwrap(), "texts/en_US.lang");
+        assert_eq!(
+            route_file("m", "d", "car.geo.json").unwrap().0,
+            Pack::Resource
+        );
+        assert!(p("loose.png").is_none());
+        assert!(p("notes.txt").is_none());
+    }
+
     #[test]
     fn longest_suffix_wins() {
         assert_eq!(
