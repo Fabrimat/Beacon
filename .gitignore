@@ -5,3 +5,4 @@
 *.log
 !fixtures/**/db/*.log
 /.beacon-home
+/.ci-corpus-large
