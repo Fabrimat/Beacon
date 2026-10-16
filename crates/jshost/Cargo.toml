@@ -11,6 +11,8 @@ rquickjs = { version = "0.14", features = ["loader"] }
 oxc = { version = "=0.146.0", features = ["transformer", "codegen", "semantic"] }
 serde_json = "1"
 globset = "0.4"
+blake3 = "1"
+beacon-engine = { path = "../engine" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation"] }

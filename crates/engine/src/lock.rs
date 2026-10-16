@@ -1,37 +1,212 @@
 //! Workstream A2: `beacon.lock.json` (4.2).
 
-use crate::config::ProjectConfig;
-use crate::diag::Diagnostic;
+use crate::canonical;
+use crate::config::{LOCK_FILE, ProjectConfig};
+use crate::diag::{Code, Diagnostic};
 use crate::model::{Edition, OutputId, Pack};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A2 defines the fields: pack + module UUIDs keyed by (output x edition) (one shared UUID
-/// when `sharedEditionUuids`), script module UUID per output, `canonicalVersion`, bundler
-/// name + version.
+/// `beacon.lock.json`. Pack + module UUIDs per (output x edition), or one `shared` set when
+/// `sharedEditionUuids`; script module UUID per output. Entries of outputs that disappeared
+/// are kept (identities survive; `rename-output` is phase 3).
+// ponytail: last released version/hash and plugin sources are phase 2/3 fields.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lockfile {
+    pub canonical_version: u32,
+    /// e.g. `esbuild 0.25.4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundler: Option<String>,
+    #[serde(default)]
+    pub outputs: BTreeMap<OutputId, OutputLock>,
+}
+
+impl Default for Lockfile {
+    fn default() -> Self {
+        Lockfile {
+            canonical_version: canonical::CANONICAL_VERSION,
+            bundler: None,
+            outputs: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Lockfile {}
+#[serde(rename_all = "camelCase")]
+pub struct OutputLock {
+    pub script_module: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<EditionLock>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub editions: BTreeMap<Edition, EditionLock>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditionLock {
+    #[serde(rename = "BP")]
+    pub bp: PackLock,
+    #[serde(rename = "RP")]
+    pub rp: PackLock,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PackLock {
+    pub header: String,
+    pub module: String,
+}
+
+fn uuid4() -> String {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("os randomness");
+    fmt_uuid(b)
+}
+
+fn fmt_uuid(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+fn new_pack() -> PackLock {
+    PackLock {
+        header: uuid4(),
+        module: uuid4(),
+    }
+}
+
+fn new_edition() -> EditionLock {
+    EditionLock {
+        bp: new_pack(),
+        rp: new_pack(),
+    }
+}
 
 impl Lockfile {
-    /// Loads the lockfile, adds missing entries for `outputs` (new random UUIDs), and saves
-    /// it (canonical JSON) if it changed. With `frozen`, a needed change is
+    /// Loads the lockfile (or starts empty), adds missing entries for `outputs` (new random
+    /// UUIDs) for every edition of `cfg.beacon.targets` (Bedrock if none), and saves it
+    /// (canonical JSON, atomically) if it changed. With `frozen`, a needed change is
     /// `Code::LockfileFrozen` instead.
     pub fn ensure(
-        _root: &Path,
-        _cfg: &ProjectConfig,
-        _outputs: &[OutputId],
-        _frozen: bool,
+        root: &Path,
+        cfg: &ProjectConfig,
+        outputs: &[OutputId],
+        frozen: bool,
     ) -> Result<Lockfile, Diagnostic> {
-        todo!("A2")
+        let path = root.join(LOCK_FILE);
+        let invalid = |e: &dyn std::fmt::Display| {
+            Diagnostic::new(Code::LockfileInvalid, format!("{LOCK_FILE}: {e}"))
+        };
+        let loaded = match std::fs::read(&path) {
+            Ok(b) => Some(serde_json::from_slice::<Lockfile>(&b).map_err(|e| invalid(&e))?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(invalid(&e)),
+        };
+        let mut lock = loaded.clone().unwrap_or_default();
+        let mut editions: Vec<Edition> = cfg.beacon.targets.values().map(|t| t.edition).collect();
+        editions.sort();
+        editions.dedup();
+        if editions.is_empty() {
+            editions.push(Edition::Bedrock);
+        }
+        for id in outputs {
+            let o = lock
+                .outputs
+                .entry(id.clone())
+                .or_insert_with(|| OutputLock {
+                    script_module: uuid4(),
+                    ..Default::default()
+                });
+            if cfg.beacon.shared_edition_uuids {
+                if o.shared.is_none() {
+                    o.shared = Some(new_edition());
+                }
+            } else {
+                for e in &editions {
+                    o.editions.entry(*e).or_insert_with(new_edition);
+                }
+            }
+        }
+        if loaded.as_ref() != Some(&lock) {
+            if frozen {
+                return Err(Diagnostic::new(
+                    Code::LockfileFrozen,
+                    format!("{LOCK_FILE} would change but --frozen was given"),
+                ));
+            }
+            lock.save(root).map_err(|e| {
+                Diagnostic::new(Code::EmitFailed, format!("cannot write {LOCK_FILE}: {e}"))
+            })?;
+        }
+        Ok(lock)
     }
 
-    /// Release UUID of a pack header.
-    pub fn pack_uuid(&self, _output: &str, _pack: Pack, _edition: Edition) -> String {
-        todo!("A2")
+    fn save(&self, root: &Path) -> std::io::Result<()> {
+        let bytes = canonical::to_vec(&serde_json::to_value(self).expect("lockfile json"));
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(std::io::Error::other)?;
+        let tmp = root.join(format!("{LOCK_FILE}.{:x}.tmp", u64::from_le_bytes(rnd)));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, root.join(LOCK_FILE)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+
+    fn pack_lock(&self, output: &str, pack: Pack, edition: Edition) -> Option<&PackLock> {
+        let o = self.outputs.get(output)?;
+        let e = o.shared.as_ref().or_else(|| o.editions.get(&edition))?;
+        match pack {
+            Pack::Behavior => Some(&e.bp),
+            Pack::Resource => Some(&e.rp),
+        }
+    }
+
+    /// Release UUID of a pack header; `None` if `ensure` did not cover the output/edition.
+    pub fn pack_uuid(&self, output: &str, pack: Pack, edition: Edition) -> Option<String> {
+        self.pack_lock(output, pack, edition)
+            .map(|p| p.header.clone())
+    }
+
+    /// Release UUID of a pack's data/resources module.
+    pub fn module_uuid(&self, output: &str, pack: Pack, edition: Edition) -> Option<String> {
+        self.pack_lock(output, pack, edition)
+            .map(|p| p.module.clone())
+    }
+
+    /// Release UUID of the output's script module (edition independent).
+    pub fn script_module_uuid(&self, output: &str) -> Option<String> {
+        self.outputs.get(output).map(|o| o.script_module.clone())
+    }
+
+    pub fn set_bundler(&mut self, version: Option<String>) {
+        self.bundler = version;
     }
 }
 
 /// Dev UUID (4.2): deterministic from the release UUID and the worktree root path, never
 /// committed (blake3-derived, formatted as a v4-shaped UUID).
-pub fn dev_uuid(_release: &str, _worktree_root: &Path) -> String {
-    todo!("A2")
+pub fn dev_uuid(release: &str, worktree_root: &Path) -> String {
+    let root = std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.into());
+    let mut h = blake3::Hasher::new();
+    h.update(release.as_bytes());
+    h.update(&[0]);
+    let root = root.to_string_lossy();
+    // Windows paths are case-insensitive
+    let root = if cfg!(windows) {
+        root.to_lowercase()
+    } else {
+        root.into_owned()
+    };
+    h.update(root.as_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    fmt_uuid(b)
 }

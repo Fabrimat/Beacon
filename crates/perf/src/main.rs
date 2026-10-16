@@ -131,7 +131,7 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn cmd(&self, sub: &str) -> Command {
         let mut c = Command::new(self.beacon);
-        c.args([sub, "--project"])
+        c.args([sub, "--trust", "--project"])
             .arg(self.project)
             .arg("--out")
             .arg(self.out);
@@ -180,9 +180,8 @@ impl Ctx<'_> {
         // Keeps draining stdout for the child's lifetime so it can never block on a full pipe.
         thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
+                // Receiver is gone after `ready`; keep draining so later lines never block.
+                let _ = tx.send(line);
             }
         });
         let deadline = Instant::now() + Duration::from_secs(60);

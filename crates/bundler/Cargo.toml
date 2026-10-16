@@ -1,0 +1,12 @@
+[package]
+name = "beacon-bundler"
+description = "Beacon game-script bundler: esbuild CLI behind the engine's Bundler trait"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+beacon-engine = { path = "../engine" }
+serde_json = "1"
+tempfile = "3"

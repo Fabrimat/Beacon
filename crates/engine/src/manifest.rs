@@ -1,8 +1,10 @@
 //! Workstream A2: generated `manifest.json` and base lang (4.1, 5.9).
 
 use crate::config::ProjectConfig;
-use crate::lock::Lockfile;
-use crate::model::{ContentItem, Edition, OutputId};
+use crate::lock::{Lockfile, dev_uuid};
+use crate::model::{Body, ContentItem, Dest, Edition, Merge, OutputId, Pack};
+use crate::path::RelPath;
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub struct ManifestInput<'a> {
@@ -19,10 +21,130 @@ pub struct ManifestInput<'a> {
     pub has_rp: bool,
 }
 
+// versionPolicy (auto bump from content hashes) is phase 2: every pack is 1.0.0 for now.
+const VERSION: [u32; 3] = [1, 0, 0];
+
+fn min_engine(m: &ManifestInput) -> Vec<u32> {
+    let edition_version = m
+        .cfg
+        .beacon
+        .targets
+        .values()
+        .find(|t| t.edition == m.edition && t.target_version.is_some())
+        .and_then(|t| t.target_version.as_deref());
+    let mut v: Vec<u32> = edition_version
+        .unwrap_or(&m.cfg.target_version)
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .take(3)
+        .collect();
+    v.resize(3, 0);
+    v
+}
+
 /// `manifest.json` for each pack of the output, base `texts/en_US.lang` (`pack.name`,
 /// `pack.description`, `Merge::LangLines` so module lang files merge into it) and
 /// `pack_icon.png` (passthrough) when `packMeta.icon` is set. `texts/languages.json` is NOT
 /// generated here: the orchestrator derives it after merge from the `texts/*.lang` dests.
-pub fn generate(_m: &ManifestInput) -> Vec<ContentItem> {
-    todo!("A2")
+/// `origin` and `module` of the items are `config.json`.
+pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
+    let (out, ed) = (m.output.as_str(), m.edition);
+    // A missing lock entry (generate called for an output/edition `ensure` did not cover)
+    // skips that pack: the signature has no diagnostics channel and `ensure` guarantees entries.
+    let id = |release: Option<String>| -> Option<String> {
+        let r = release?;
+        Some(
+            m.dev_worktree
+                .map_or_else(|| r.clone(), |w| dev_uuid(&r, w)),
+        )
+    };
+    let meta = m.cfg.beacon.pack_meta.as_ref();
+    let clean = |s: &str| s.replace(['\r', '\n'], " ");
+    let name = clean(meta.and_then(|p| p.name.as_deref()).unwrap_or(&m.cfg.name));
+    let desc = clean(meta.and_then(|p| p.description.as_deref()).unwrap_or(""));
+    let icon = meta
+        .and_then(|p| p.icon.as_deref())
+        .and_then(|i| RelPath::parse(i.trim_start_matches("./")).ok());
+    let origin = RelPath::parse("config.json").expect("static path");
+    let min = min_engine(m);
+
+    let mut items = Vec::new();
+    for (pack, present) in [(Pack::Behavior, m.has_bp), (Pack::Resource, m.has_rp)] {
+        if !present {
+            continue;
+        }
+        let bp = pack == Pack::Behavior;
+        let Some(manifest) = (|| -> Option<Value> {
+            let mut modules = vec![json!({
+                "type": if bp { "data" } else { "resources" },
+                "uuid": id(m.lock.module_uuid(out, pack, ed))?,
+                "version": VERSION,
+            })];
+            let mut deps = Vec::new();
+            if bp {
+                if m.has_rp {
+                    deps.push(json!({
+                        "uuid": id(m.lock.pack_uuid(out, Pack::Resource, ed))?,
+                        "version": VERSION,
+                    }));
+                }
+                if let Some(entry) = m.script_entry {
+                    modules.push(json!({
+                        "type": "script",
+                        "language": "javascript",
+                        "entry": entry,
+                        "uuid": id(m.lock.script_module_uuid(out))?,
+                        "version": VERSION,
+                    }));
+                    deps.extend(
+                        m.cfg
+                            .beacon
+                            .script_modules
+                            .iter()
+                            .map(|(n, v)| json!({"module_name": n, "version": v})),
+                    );
+                }
+            }
+            let mut manifest = json!({
+                "format_version": 2,
+                "header": {
+                    "name": "pack.name",
+                    "description": "pack.description",
+                    "uuid": id(m.lock.pack_uuid(out, pack, ed))?,
+                    "version": VERSION,
+                    "min_engine_version": min,
+                },
+                "modules": modules,
+            });
+            if !deps.is_empty() {
+                manifest["dependencies"] = Value::Array(deps);
+            }
+            Some(manifest)
+        })() else {
+            continue;
+        };
+        let mut item = |path: &str, body: Body, merge: Merge| {
+            items.push(ContentItem {
+                dest: Dest {
+                    output: m.output.clone(),
+                    pack,
+                    path: RelPath::parse(path).expect("static path"),
+                },
+                body,
+                merge,
+                origin: origin.clone(),
+                module: origin.clone(),
+            });
+        };
+        item("manifest.json", Body::Json(manifest), Merge::Error);
+        item(
+            "texts/en_US.lang",
+            Body::Text(format!("pack.name={name}\npack.description={desc}\n")),
+            Merge::LangLines,
+        );
+        if let Some(i) = &icon {
+            item("pack_icon.png", Body::Passthrough(i.clone()), Merge::Error);
+        }
+    }
+    items
 }

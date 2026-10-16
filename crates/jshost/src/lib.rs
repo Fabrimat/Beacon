@@ -9,7 +9,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod host;
 pub mod mem;
+
+pub use host::Host;
 
 pub use serde_json::Value;
 
@@ -30,6 +33,7 @@ pub trait Evaluator {
     fn eval(&self, entry: &str, files: &Files, assets: &[String]) -> Result<Output, String>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub memory: usize,
     pub stack: usize,
@@ -75,31 +79,7 @@ impl QuickJs {
 
 /// Strip TypeScript syntax (no type checking) with oxc.
 pub fn strip_ts(path: &str, src: &str) -> Result<String, String> {
-    use oxc::allocator::Allocator;
-    use oxc::codegen::Codegen;
-    use oxc::parser::Parser;
-    use oxc::semantic::SemanticBuilder;
-    use oxc::span::SourceType;
-    use oxc::transformer::{TransformOptions, Transformer};
-
-    let alloc = Allocator::default();
-    let st = SourceType::from_path(path).map_err(|e| e.to_string())?;
-    let parsed = Parser::new(&alloc, src, st).parse();
-    if !parsed.diagnostics.is_empty() {
-        return Err(format!("{path}: {}", parsed.diagnostics[0]));
-    }
-    let mut program = parsed.program;
-    let scoping = SemanticBuilder::new()
-        .build(&program)
-        .semantic
-        .into_scoping();
-    let opts = TransformOptions::default();
-    let t = Transformer::new(&alloc, std::path::Path::new(path), &opts)
-        .build_with_scoping(scoping, &mut program);
-    if !t.diagnostics.is_empty() {
-        return Err(format!("{path}: {}", t.diagnostics[0]));
-    }
-    Ok(Codegen::new().build(&program).code)
+    host::compile(path, src).map(|c| c.js)
 }
 
 const RUNTIME_MODULE: &str = r#"
@@ -181,7 +161,7 @@ impl Loader for Fs {
             .get(name)
             .ok_or_else(|| rquickjs::Error::new_loading(name))?;
         let js = if name.ends_with(".json") {
-            format!("export default {src};")
+            host::json_module(src)
         } else if name.ends_with(".ts") {
             strip_ts(name, src).map_err(|m| rquickjs::Error::new_loading_message(name, m))?
         } else {

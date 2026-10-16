@@ -102,10 +102,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "beacon-bundler"
+version = "0.0.0"
+dependencies = [
+ "beacon-engine",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "beacon-cli"
 version = "0.0.0"
 dependencies = [
+ "beacon-engine",
+ "clap",
  "notify",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -125,6 +138,7 @@ dependencies = [
  "dirs",
  "getrandom",
  "globset",
+ "libc",
  "proptest",
  "serde",
  "serde_json",
@@ -138,6 +152,8 @@ dependencies = [
 name = "beacon-jshost"
 version = "0.0.0"
 dependencies = [
+ "beacon-engine",
+ "blake3",
  "globset",
  "oxc",
  "rquickjs",

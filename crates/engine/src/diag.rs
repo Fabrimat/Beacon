@@ -119,6 +119,8 @@ codes! {
     LangDuplicateKey = "BCN0020", Error;
     /// JSON deep merge found two different scalar values for the same key.
     MergeConflict = "BCN0021", Error;
+    /// A file taking part in a merge could not be read, or is not valid JSON.
+    MergeInputInvalid = "BCN0022", Error;
     /// A symlink, junction, or other reparse point inside the project was skipped. User code
     /// never sees files outside the project root.
     ReparsePointSkipped = "BCN0030", Note;
