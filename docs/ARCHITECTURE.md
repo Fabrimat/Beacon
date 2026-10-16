@@ -85,8 +85,21 @@ migration path from those tools.
 Conclusion: routing can be convention + declarations, with code only for one-to-many
 generation. Most conflict policies disappear if registries are **derived** (5.3).
 
-To measure before phase 1 (they size the migrator, 5.6): how many map/scope modules import
-npm packages, and how many write to the source tree during evaluation.
+Measured on Dimension-Clash (259 ModularMC `_map.ts`, 2026-10-15):
+
+- **0** external imports in map modules (no `npm:`, bare, `jsr:`, `https:`, `node:*`); one
+  type-only `@minecraft/server` import. 47 relative imports, 8 of them to gitignored
+  `generated/*.ts` files produced by a pre-build Node script.
+- **0** filesystem writes and **0** `Deno.*` calls during map evaluation; one
+  `process.env.BETA_MODE` read; no `Date` / `Math.random`.
+- Source-tree writes happen **before** the build, in ~20 Node scripts (sound map generation,
+  emissive MER texture sets via `pngjs`/`sharp`, manifest/lang rewrite-and-restore in
+  `build.js`). These are exactly what generators (5.3) and plugins (5.10) replace.
+- Game scripts import only `@minecraft/server`, `@minecraft/server-ui`,
+  `@minecraft/live-events-creator-api`.
+
+Conclusion: map code is pure data building. Importing npm packages from build-time code is
+possible but bad practice; Beacon supports it (5.4) without optimizing for it.
 
 ### 2.3 User research (hypothesis, n=1 so far)
 
@@ -220,9 +233,10 @@ Rules:
 
 Generated, committed, not hand-edited. Holds:
 
-- Pack UUIDs and module UUIDs keyed by **(output id x edition)**, and additionally by target
-  when a target overrides `targetVersion` (script module versions differ). Bedrock and
-  Education builds of the same output never share a UUID.
+- Pack, module, and world template UUIDs keyed by **(output id x edition)**: Bedrock and
+  Education builds get different UUIDs by default. `beacon.sharedEditionUuids: true` opts
+  pack and module UUIDs into sharing one UUID across editions (some existing projects ship
+  that way); world template header UUIDs stay per edition (separate store products).
 - Script module UUID per output (used as the debugger's `targetModuleUuid`).
 - Last released version and content hash per pack (each BP, RP, world template, skin pack).
 - Resolved plugin sources (git URL + full commit SHA + content hash, 5.10) and schema set version.
@@ -321,12 +335,22 @@ scripts, and functions, plus new content depending on all of them).
   "edu":      { "edition": "education", "artifact": "mcworld",    "world": "worlds/main",
                 "targetVersion": "1.21.50" },
   "edu-dev":  { "edition": "education", "artifact": "dev" },
-  "skins":    { "edition": "bedrock",   "artifact": "skinpack" }
+  "skins":    { "edition": "bedrock",   "artifact": "skinpack" },
+  "store":    { "edition": "bedrock",   "artifact": "marketplace", "world": "worlds/main",
+                "art": "./pack/art" },
+  "beta":     { "edition": "bedrock",   "artifact": "dev", "define": { "BETA_MODE": true } }
 }
 ```
 
 - `targets.<t>.targetVersion` overrides the project one; schemas, symbols, API index, and
   edition transforms are version-aware per target.
+- `define`: per-target build flags, read in generators as `ctx.define.X` (recorded as cache
+  inputs). Replaces env-var flags such as `BETA_MODE`.
+- `marketplace` artifact: the store submission zip
+  (`Content/world_template/{behavior_packs,resource_packs,texts}`, `Store Art`,
+  `Marketing Art`), as produced today by per-project CI scripts.
+- Dev deploy per edition writes into that edition's `com.mojang` (Education:
+  `%APPDATA%/Minecraft Education Edition/games/com.mojang`), detected by the setup wizard.
 - `embedPacks: false` warns when the world references packs that will be missing.
 - `beacon build --all` evaluates the shared graph once, then the per-target tail only.
 
@@ -488,10 +512,17 @@ Workspace Trust).
   - conflict policies on registry files -> dropped (derived registries);
   - one-to-many loops -> generator skeletons, with the evaluated output kept as the
     equivalence oracle;
-  - env-flag branches (e.g. "education enabled") -> `ctx.edition`.
-- **Runtimes for evaluation, downloaded on demand for that run only** (hash-pinned, 9.2):
-  Deno for ModularMC `_map.ts`, Python via uv for system_template `_map.py`. Never needed at
-  build time.
+  - env-flag branches -> `ctx.edition` or target `define` (4.4);
+  - pre-build scripts that write generated sources (e.g. sound maps, texture sets) ->
+    listed in the migration report as generators/plugins to port; their current output is
+    imported as plain files meanwhile.
+- **Evaluation runtimes, used by `migrate` only:**
+  - ModularMC `_map.ts`: Beacon's own JS host (TS strip + relative imports + a
+    `process.env` shim fed from the migration options). Measured maps need nothing more
+    (2.2). Deno is downloaded on demand only as a fallback for maps using `Deno.*` or
+    external imports.
+  - system_template `_map.py`: Python via uv, on demand for that run only.
+  - Both hash-pinned (9.2), never needed at build time.
 - **Equivalence check**: the migrated project must build packs equal to the old tool's output
   after normalization (parsed JSON equal, text files exact, script bundles compared after
   sourcemap/path normalization). Differences are listed, not hidden.
@@ -508,9 +539,16 @@ identifiers, MCP queries.
 
 ### 5.8 Schemas and types
 
-Vendor an existing community-maintained Bedrock JSON schema set (license to confirm, 13),
-diff and update it per game release, generate TS types for content files from those schemas.
-`@minecraft/*` typings from npm. Versioned per `targetVersion`.
+- **Schemas: [Mojang/bedrock-schemas](https://github.com/Mojang/bedrock-schemas)** (MIT,
+  (c) Microsoft; also on npm as `@minecraft/bedrock-schemas`). Official, generated by Mojang,
+  JSON Schema draft-07, ships TS `.d.ts` types, editor form definitions, and a `catalog.json`
+  (file glob -> schema). Tagged per game version, stable and preview separately
+  (e.g. `v1.26.50.26`, `v1.26.60.29-preview`). Vendored by tag; the catalog seeds the
+  convention suffix table (5.3) and the form definitions can drive the app's forms (6.1).
+- Community sets (e.g. Blockception, BSD-3-Clause, with embedded third-party material) are
+  used only for comparison or gap-filling after a provenance review.
+- Coverage per file type is checked against the synthetic corpus in phase 0.
+- `@minecraft/*` typings from npm (license checked per package). Versioned per `targetVersion`.
 
 ### 5.9 Built-ins
 
@@ -523,11 +561,21 @@ diff and update it per game release, generate TS types for content files from th
     `lock_template_options`) configurable per target.
   - `level.dat`: little-endian NBT with an 8-byte header; edited by validated round trip.
   - `.mcstructure` passthrough.
-- **Education Edition transforms** (per `edition: "education"` target): separate UUIDs (4.2);
-  `min_engine_version` and `base_game_version` from the target's `targetVersion`; Education
-  flags in `level.dat`; experimental toggles validated against what the Education version
-  supports; Education lang overlay; schemas/API index for that version. Exact flag names are
-  verified against a real Education world before implementation.
+- **Edition transforms** (from The-Great-Adventure, which ships both editions from one
+  Education-first source; differences are small):
+  - `level.dat`, Bedrock target: `educationFeaturesEnabled=0`, `eduOffer=0`,
+    `experiments.cameras=0`, `experiments.experiments_ever_used=0`,
+    `experiments.saved_with_toggled_experiments=0`. Education target: `educationFeaturesEnabled=1`
+    and the experiments its content needs (e.g. `cameras` for the camera item).
+    `MinimumCompatibleClientVersion` from the target's `targetVersion`.
+  - Manifests: `header.min_engine_version` per target (4.2.1); pack content otherwise identical.
+  - World template: separate folder/name per edition, own header UUID (4.2) and product name;
+    `world_*_packs.json` kept in sync with pack UUIDs and versions; `base_game_version`,
+    `lock_template_options`, `allow_random_seed` per target.
+  - Content usually needs **no** build-time branching: projects detect the edition at runtime
+    (e.g. a command only Education accepts) and UI uses the vanilla `$education_edition`
+    variable. `ctx.edition` is there for the rest.
+  - Schemas/API index for the target's version; experimental toggles validated against it.
 - Archive writers, pack validation.
 - **Emit ledger** for dev dirs (`.beacon-emit.json`): delete stale files without touching the
   user's other packs. Writes go to a temp file in the same directory, then atomic replace;
@@ -692,9 +740,16 @@ Two distinct problems, two homes.
 
 **(a) Content and code correctness: inside the engine** (`beacon check`, LSP, MCP).
 
-- **Versioned API index**, built in CI from official sources and shipped compact, selected per
-  target `targetVersion`: script module metadata and vanilla data from Mojang's
-  `bedrock-samples`, `@minecraft/*` typings from npm, the vendored JSON schema set.
+- **Versioned API index**, selected per target `targetVersion`, built from:
+  - [Mojang/bedrock-samples](https://github.com/Mojang/bedrock-samples) `metadata/`:
+    `script_modules/@minecraft/<module>_<version>.json`, `command_modules`, `molang_modules`,
+    `vanilladata_modules` (blocks, items, entities, biomes, effects, ...), tagged per game
+    version (stable and `-preview`). **License: "(c) Mojang AB. All rights reserved", use under
+    the Minecraft EULA.** Beacon does not vendor or redistribute these files: the index is
+    built locally from a pinned tag, downloaded on demand (like BDS), until a legal review
+    says a derived index may ship.
+  - `@minecraft/*` typings from npm and the vendored schema set (5.8).
+  - Every index records its source tags/commits for provenance.
 - JSON: unknown or misspelled components, outdated/deprecated `format_version`, experimental
   components without the matching toggle in the standard's `experimentalGameplay`.
 - Scripts: members that do not exist (invented APIs), `@deprecated` or removed APIs across
@@ -728,6 +783,12 @@ public tool by the same author, run alongside Beacon, not inside it).
     `blame` never attribute false drift.
   - The plugin declares `ignoreRegions` for `<!-- beacon:begin ... -->` / `<!-- beacon:end ... -->`,
     so users need no extra config.
+  - `suggestion` replaces the whole claim value: for commands it is the full corrected command
+    line, not just the wrong flag.
+  - ctxtruth puts no timeout on `verify`: the plugin bounds every Beacon CLI call itself and
+    returns unknown on timeout.
+  - The package exports a `default` (or `main`) condition, since ctxtruth resolves plugins with
+    `require.resolve`. Report shapes follow ctxtruth's published JSON Schemas (v1).
   - Requires on the Beacon side: stable `--help --json`, `symbols --json`, `api --json` outputs
     (versioned JSON output policy, 6.2).
 - Division of labor: Beacon **generates** the generated sections of agent docs (8.3, between
@@ -920,7 +981,14 @@ spike has real numbers.
 - [ ] Code ported from Mojang/minecraft-debugger (MIT, (c) Microsoft): keep headers, add to
       `NOTICE`; check `webview-ui` dependency licenses before reusing UI.
 - [ ] Check whether upstream minecraft-debugger contributions require a Microsoft CLA.
-- [ ] Vendored schema set: confirm license and attribution.
+- [x] Schemas: Mojang/bedrock-schemas, MIT (c) Microsoft. Keep copyright + license text in
+      `NOTICE` / `THIRD_PARTY`.
+- [ ] Mojang/bedrock-samples: "All rights reserved" + Minecraft EULA. Legal review before
+      redistributing any file or derived index; until then fetch on demand, never commit.
+- [ ] Community schema sets (Blockception, BSD-3-Clause + embedded material): audit before
+      reusing anything.
+- [ ] `@minecraft/*` npm packages: verify each license.
+- [ ] "Not affiliated with Mojang or Microsoft" disclaimer.
 - [ ] Runtime libraries bundled into generated add-ons: permissive, or optional with
       obligations documented.
 - [ ] Fonts/assets: OFL / CC0 / permissive only.
@@ -938,7 +1006,7 @@ The phases are a process toward the **alpha**, which is the end of phase 5. User
 |---|---|---|
 | 0 | Repo, CI (Windows + macOS), synthetic corpus generator, perf harness, local fixture script; QuickJS spike on representative generators; corpus measurements from 2.2; name/org/domain | Perf harness reports every phase-1 metric; spike numbers recorded; go/no-go on QuickJS |
 | 1 | Rust CLI `build/watch/check --json` (SARIF); VFS + cache; convention routing; `module.json`; generators in the JS host (sandbox policy, limits, esbuild pre-bundle); project trust; lockfile UUIDs + manifests + base lang; emit ledger; `.mcpack`/`.mcaddon`, one output | A new project made by hand builds and runs in-game; synthetic corpus builds; phase-1 budgets met |
-| 2 | Derived registries, content files, hooks, data modules; targets with **Education Edition** transforms; **multi-pack** (outputs, static outputs, order, dev world); all archive types (`mcworld`, `mctemplate`, skin pack); `beacon init` / `add` / `pack` with `versionPolicy`; `AGENTS.md` generation; read-only stdio MCP | One `beacon build --all` produces Bedrock + Education artifacts for a multi-pack project; the team builds a real release of a new project with Beacon |
+| 2 | Derived registries, content files, hooks, data modules; targets with **Education Edition** transforms; **multi-pack** (outputs, static outputs, order, dev world); all archive types (`mcworld`, `mctemplate`, skin pack, `marketplace` submission zip); target `define`; `beacon init` / `add` / `pack` with `versionPolicy`; `AGENTS.md` generation; read-only stdio MCP | One `beacon build --all` produces Bedrock + Education artifacts for a multi-pack project; the team builds a real release of a new project with Beacon |
 | 3 | `beacon migrate` (ModularMC + system_template, Deno/uv on demand, equivalence check); `legacy_filter`; `rename-output`, `plugin update`; Claude Code guardrail plugin (8.2) | Both production projects migrate locally and build equivalent packs, both editions, with no other tool at build time |
 | 4 | `beacon serve` (daemon, stdio shim, LSP) + VS Code extension + debugger interop + versioned API index + full MCP + `ctxtruth-bedrock` | Rename of an entity id updates all references; breakpoints hit in TS source via the official debugger; `serve` idle budget met |
 | 5 (**alpha**) | Desktop app (Play, visual settings and `module.json` forms, trust prompt) + setup wizard + `beacon test` on BDS + signing/distribution + updater | Clean Windows machine: install -> Play in under 5 minutes, no other installs; a non-coder completes it unaided |
@@ -957,8 +1025,11 @@ collaborators.
   untranslated parts emitted as generator skeletons with diagnostics, never silently dropped.
 - **Format churn**: schemas and the API index must be updated every game release; automate
   diffing.
-- **Education Edition specifics**: exact `level.dat` flags and manifest differences to be
-  verified on real Education worlds before phase 2 implementation.
+- **Education Edition specifics**: transforms in 5.9 come from one project
+  (The-Great-Adventure); verify the Education-target direction (flags set to 1, experiments)
+  on a second Education project before phase 2.
+- **bedrock-samples license**: if a derived API index cannot ship, every user downloads the
+  metadata on first `check`; acceptable, but it must be fast and cached per tag.
 - **Windows realities**: files held open by the game, UWP vs GDK paths, long paths,
   case-insensitivity, junctions, AV scanning. Covered by the emit ledger, watch rules (9.3),
   and Windows CI.
