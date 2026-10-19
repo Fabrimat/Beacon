@@ -18,6 +18,7 @@
 
 // contract
 pub mod api_index;
+pub(crate) mod apicheck;
 pub mod config;
 pub mod debug;
 pub mod diag;

@@ -85,8 +85,9 @@ pub fn set_overlay(st: &mut crate::daemon::EngineState, trusted: bool, rel: &Rel
     }
 }
 
+/// Never creates a session: none means nothing is open.
 pub fn close_overlays(st: &mut crate::daemon::EngineState, trusted: bool, rels: &[RelPath]) {
-    if let Some(t) = st.session(trusted).symbols_mut() {
+    if let Some(t) = st.session_if_exists(trusted).and_then(|s| s.symbols_mut()) {
         for r in rels {
             t.close_overlay(r);
         }

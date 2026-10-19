@@ -1196,6 +1196,7 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   through the daemon (3) and the TCP endpoint wait for phase 5 (the app). `beacon mcp`
   becomes `beacon serve --stdio --mcp`.
 - **MCP grants and guardrail (8.1, 8.2).** Write tools (`rename_symbol`, `fix`, `add_content`, `build`, `deploy`, `pack`) take `dryRun` (default true, a read: no grant); `dryRun: false` needs the shim's `--allow edit|build|release|deploy` and otherwise fails with `GrantRequired` naming the flag. Trust and grants are per connection, never from tool arguments. Because `--trust` and `--allow` live in the agent's own MCP config, `beacon hook pre-tool-use` also denies edits to `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json` and `.vscode/mcp.json` (project-local, so an agent cannot grant itself access). This protects the config path only: an agent with arbitrary shell access, or a user-level config, is out of scope. `build` / `deploy` / `pack` with `dryRun` validate (as `check`) and write nothing; the emitted-file diff waits for engine support.
+- **What `--trust` on an agent connection permits.** It trusts the project as it was at connect: generators and `beacon.plugins` entries (external processes such as `legacy_filter`) run in that connection's `check`, `build` and LSP features with no further grant. It is pinned to the `beacon.plugins` at connect: the engine thread revalidates before every job, and a connection whose `beacon.plugins` no longer match (an agent editing `config.json`), like one trusted by the stored decision whose key no longer matches, is demoted to restricted until it reconnects. `--trust` does not grant writes (`--allow`) and does not cover generator *sources* edited later: those run with the trust the connection holds, as in `beacon watch`.
 - **LSP crate: `lsp-server` + `lsp-types`**, not `tower-lsp` (supersedes 9.1): a minimal
   stdio server measured 1.0 MB vs 2.8 MB with `tower-lsp-server` + tokio (Windows,
   release, stripped), no async runtime in a resident process, and the codebase is
@@ -1212,7 +1213,7 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   (`ApiIndexMissing`), never an error. Component checks use names from the schemas, not
   full JSON Schema validation. Script checks are named imports and manifest module versions;
   member-level checks stay with `check --full` (tsgo).
-- **Debugger (6.6), verified** against Mojang/minecraft-debugger `c69bc37` (2026-10-13) and
+- **Debugger (6.6), verified** against Mojang/minecraft-debugger `c54af36` (2026-10-13) and
   BDS 1.26.52.3: launch fields `type: minecraft-js`, `request: attach`,
   `mode: connect|listen`, `localRoot`, `sourceMapRoot`, `generatedSourceRoot`, `host`,
   `port` (19144), `targetModuleUuid`, `passcode`. BDS `server.properties` has
@@ -1221,7 +1222,10 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   `script-debugger-listen-address`, `script-debugger-passcode`. Today's bundle maps cannot
   bind breakpoints (esbuild writes `sources` relative to its temp outdir, or `file:///D:/`
   across drives); dev-like builds add a **debug mirror** `.beacon/debug/<target>/<output>/`
-  with project-relative `sources`. Dev `targetModuleUuid`s are per worktree, so committed
+  with project-relative `sources`, `file` relative to the map's own folder, and a copy of the
+  bundle beside the map. The game names a script relative to the pack's `scripts/` folder
+  (`main.js`), so `generatedSourceRoot` is the mirror's `scripts` folder, while `localRoot` and
+  `sourceMapRoot` stay at the mirror root (proven by the e2e below). Dev `targetModuleUuid`s are per worktree, so committed
   `launch.json` entries carry only `beaconOutput` / `beaconTarget`, and the VS Code extension
   resolves them at launch (a debug configuration provider for `minecraft-js`);
   `beacon debug-config --json` prints the resolved config for other editors. Beacon never

@@ -461,6 +461,7 @@ impl Session {
 
     fn run(&mut self, emit: bool) -> BuildOutcome {
         let t0 = Instant::now();
+        sweep_tmp(&self.root);
         self.generation += 1;
         let delta = std::mem::take(&mut self.delta);
         if !delta {
@@ -764,6 +765,8 @@ impl Session {
         let mut blocked = Vec::with_capacity(plans.len());
         // generator output of the first plan: the symbol table's generated definitions
         let mut generated = Vec::new();
+        // (plan, target, output, entry path, bundle, map) of dev builds: the debug mirror
+        let mut mirrors = Vec::new();
         for (n, plan) in plans.iter().enumerate() {
             let mut items: Vec<ContentItem> = routed
                 .items
@@ -831,11 +834,13 @@ impl Session {
                 if let Some(m) = &b.map {
                     add(format!("{entry_path}.map"), m);
                     if emit && plan.artifact == Some(Artifact::Dev) {
-                        a.diags.extend(write_debug_mirror(
-                            &self.root,
-                            &plan.target,
-                            o,
+                        // written after the snapshot gate, with the plan's other outputs
+                        mirrors.push((
+                            n,
+                            plan.target.clone(),
+                            o.clone(),
                             entry_path,
+                            code.clone(),
                             m,
                         ));
                     }
@@ -937,15 +942,18 @@ impl Session {
             // a failed release writes nothing and records nothing
             let skip = a.rel.is_some() && artifact::has_errors(&a.diags);
             let releasing = a.rel.is_some(); // dev targets are not part of a release
-            for ((plan, merged), _) in
-                plans
-                    .iter()
-                    .zip(&built)
-                    .zip(&blocked)
-                    .filter(|((plan, _), blocked)| {
+            for (n, ((plan, merged), _)) in
+                plans.iter().zip(&built).zip(&blocked).enumerate().filter(
+                    |(_, ((plan, _), blocked))| {
                         !(**blocked || skip || releasing && plan.artifact == Some(Artifact::Dev))
-                    })
+                    },
+                )
             {
+                for (_, target, output, entry, code, map) in mirrors.iter().filter(|m| m.0 == n) {
+                    a.diags.extend(write_debug_mirror(
+                        &self.root, target, output, entry, code, map,
+                    ));
+                }
                 let work = a.rel.as_ref().map(|s| s.work.clone());
                 let cx = ArtifactCx::new(
                     &self.root,
@@ -982,6 +990,19 @@ impl Session {
         let symbols = self.symbols.get_or_insert_default();
         symbols.update(&cfg, &routed, &generated, &vfs);
         a.diags.extend(symbols.diagnostics(&cfg, !trusted));
+        if !persist {
+            // check only: builds never carry API notes; a missing index is one note
+            let versions = plans.iter().map(|p| p.target_version.as_str()).collect();
+            let files = index.files();
+            a.diags.extend(crate::apicheck::check(
+                &self.root,
+                &cfg,
+                &vfs,
+                &files,
+                &routed.items,
+                &versions,
+            ));
+        }
         a.changed = vfs.changed.load(Ordering::Relaxed);
         self.index = Some(index);
         a
@@ -1050,30 +1071,58 @@ fn bundle(
     out
 }
 
-/// Writes the debug mirror of a dev build (`.beacon/debug/<target>/<output>/<entry>.map`, see
-/// `debug.rs`), only when its content changed. A failure is a warning: the build is unaffected.
+/// Writes the debug mirror of a dev build (`.beacon/debug/<target>/<output>/<entry>` and its
+/// `.map`, see `debug.rs`), atomically and only when the content changed. The bundle is
+/// byte-identical to the emitted one (`generatedSourceRoot` points here). A failure is a
+/// warning: the build is unaffected.
 fn write_debug_mirror(
     root: &Path,
     target: &str,
     output: &str,
     entry_path: &str,
+    code: &str,
     map: &str,
 ) -> Option<Diagnostic> {
     let run = || -> Result<(), Diagnostic> {
-        let rel = crate::debug::mirror_dir(target, output)?.join(&format!("{entry_path}.map"));
-        let rel = rel.map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{e:?}")))?;
-        let dir = rel.parent().expect("has a folder");
-        let text = crate::debug::rewrite_map(map, root, &dir, entry_path)?;
-        let path = root.join(rel.as_str());
-        if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
-            return Ok(());
+        let dir = crate::debug::mirror_dir(target, output)?;
+        let rel = dir
+            .join(entry_path)
+            .map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{e:?}")))?;
+        let rel_map = dir
+            .join(&format!("{entry_path}.map"))
+            .map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{e:?}")))?;
+        let map_dir = rel_map.parent().expect("has a folder");
+        let map = crate::debug::rewrite_map(map, root, &map_dir, entry_path)?;
+        for (rel, text) in [(rel, code), (rel_map, map.as_str())] {
+            let path = root.join(rel.as_str());
+            if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+                continue;
+            }
+            crate::cache::write_atomic(&path, text.as_bytes()).map_err(|e| {
+                Diagnostic::new(Code::EmitFailed, format!("{}: {e}", path.display()))
+            })?;
         }
-        std::fs::create_dir_all(path.parent().expect("has a folder"))
-            .and_then(|()| std::fs::write(&path, text))
-            .map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{}: {e}", path.display())))
+        Ok(())
     };
     run().err().map(|mut d| {
         d.severity = Severity::Warning;
         d
     })
+}
+
+/// Deletes `.beacon/tmp/.tmp*` scratch dirs of crashed bundler runs older than an hour.
+fn sweep_tmp(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root.join(STATE_DIR).join("tmp")) else {
+        return;
+    };
+    let hour = std::time::Duration::from_secs(3600);
+    for e in rd.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with(".tmp")
+            && e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > hour));
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }

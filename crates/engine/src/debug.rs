@@ -2,14 +2,16 @@
 //! the source maps and the debug configuration; the official VS Code extension owns the
 //! debugger (DAP, wire protocol, breakpoints). Nothing here speaks the wire protocol.
 //!
-//! Verified against upstream Mojang/minecraft-debugger `c69bc37` (2026-10-13) and BDS
+//! Verified against upstream Mojang/minecraft-debugger `c54af36` (2026-10-13) and BDS
 //! 1.26.52.3 `server.properties`:
 //! - launch fields: `type: "minecraft-js"`, `request: "attach"`, `mode: "connect" | "listen"`,
 //!   `localRoot`, `sourceMapRoot`, `generatedSourceRoot`, `host`, `port` (default 19144),
 //!   `targetModuleUuid`, `passcode`;
-//! - the extension finds `*.map` under `sourceMapRoot`, resolves each map's `sources`
-//!   relative to the map file, and matches the game's script path against the map's `file`
-//!   relative to `generatedSourceRoot`;
+//! - the extension finds `*.map` under `sourceMapRoot`, resolves each map's `sources` and its
+//!   `file` relative to the map's own folder, and names the script to the game by that
+//!   generated file's path relative to `generatedSourceRoot`. The game names a script relative
+//!   to the pack's `scripts/` folder (`main.js`, not `scripts/main.js`; proven end to end by
+//!   the vscode e2e), so `generatedSourceRoot` is the mirror's `scripts` folder;
 //! - BDS: `allow-inbound-script-debugging=true`, `force-inbound-debug-port`,
 //!   `script-debugger-auto-attach=listen`, `script-debugger-auto-attach-timeout` (seconds to
 //!   wait at world load), `script-debugger-listen-address` (default loopback),
@@ -20,9 +22,9 @@
 //! its outdir, or as `file:///D:/...` across drives). The bundler now runs esbuild inside
 //! `<project>/.beacon/tmp` and reports `sources` relative to the project root; dev-like builds
 //! also write a **debug mirror** inside the project, `.beacon/debug/<target>/<output>/<entry>.map`
-//! (`<entry>` is the BP-relative script path, `scripts/main.js`, which is how the game names
-//! the script), with `sources` relative to the map's folder (+ `sourcesContent`), so the roots
-//! resolve with the editor's own path spelling, on any drive.
+//! (`<entry>` is the BP-relative script path, `scripts/main.js`), next to a copy of the bundle,
+//! with `sources` relative to the map's folder (+ `sourcesContent`) and `file` the bundle's name
+//! in that folder, so the roots resolve with the editor's own path spelling, on any drive.
 //! `targetModuleUuid` is the dev script module UUID (per worktree, 4.2), so committed
 //! `launch.json` entries carry only `beaconOutput` / `beaconTarget`; the VS Code extension
 //! fills in the rest at launch (a debug configuration provider for `minecraft-js`), and
@@ -76,7 +78,9 @@ pub fn mirror_dir(target: &str, output: &str) -> Result<RelPath, Diagnostic> {
 }
 
 /// Rewrites a bundle map for the mirror: every source relative to `mirror` (the project-relative
-/// folder the map is written in), `file` set to `entry_file`, `sourcesContent` kept. Accepts the
+/// folder the map is written in), `file` set to the file name of `entry_file` (the bundle sits
+/// beside its map, and the debugger resolves `file` against the map's folder), `sourcesContent`
+/// kept. Accepts the
 /// bundler's project-relative form and absolute / `file://` forms under the project; any other
 /// source is left as is. A map that is not a JSON object is an error.
 pub fn rewrite_map(
@@ -116,7 +120,8 @@ pub fn rewrite_map(
             *s = Value::String(format!("{up}{}", r.trim_start_matches("./")));
         }
     }
-    obj.insert("file".into(), Value::String(entry_file.into()));
+    let name = entry_file.rsplit('/').next().unwrap_or(entry_file);
+    obj.insert("file".into(), Value::String(name.into()));
     serde_json::to_string(&v).map_err(|e| bad(e.to_string()))
 }
 
@@ -164,6 +169,8 @@ pub fn launch_config(
         "${{workspaceFolder}}/{}",
         mirror_dir(target, output)?.as_str()
     );
+    // the game names scripts relative to the pack's `scripts/` folder
+    let generated = format!("{mirror}/scripts");
     Ok(LaunchConfig {
         kind: "minecraft-js",
         request: "attach",
@@ -172,8 +179,8 @@ pub fn launch_config(
         host: (mode == Mode::Connect).then(|| "127.0.0.1".to_owned()),
         port: DEFAULT_PORT,
         local_root: mirror.clone(),
-        source_map_root: mirror.clone(),
-        generated_source_root: mirror,
+        source_map_root: mirror,
+        generated_source_root: generated,
         target_module_uuid: dev_uuid(&release, root),
     })
 }

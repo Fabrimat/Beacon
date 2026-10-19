@@ -35,7 +35,6 @@ use beacon_engine::diag::{Code, Diagnostic, exit};
 use beacon_engine::path::RelPath;
 use beacon_engine::{sarif, trust};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,9 +79,11 @@ impl DaemonOptions {
 struct Conn {
     /// Shared with the connection's [`EngineHandle`]: demotion is visible to its channel.
     trusted: Arc<AtomicBool>,
-    /// The shim's own `--trust`: never re-evaluated. Otherwise trust came from the stored
-    /// decision and is re-checked when `config.json` changes.
+    /// The shim's own `--trust`. Otherwise trust came from the stored decision.
     explicit: bool,
+    /// `beacon.plugins` as it was at connect. An explicit grant is pinned to it (the project
+    /// is trusted as it was then); a stored one is re-checked against the decision.
+    plugins: Vec<serde_json::Value>,
 }
 
 /// Everything the engine thread owns. Reached only through [`EngineHandle::call`].
@@ -95,8 +96,6 @@ pub struct EngineState {
     conns: Vec<Conn>,
     /// The watcher's latest check (of [`EngineState::watch_trusted`]'s session).
     pub last_check: Option<BuildOutcome>,
-    /// API indexes by game version, loaded on first use (a missing one is never cached).
-    api: BTreeMap<String, ApiIndex>,
 }
 
 impl EngineState {
@@ -120,18 +119,21 @@ impl EngineState {
         })
     }
 
+    /// The session if it exists; never creates one (closing an overlay must not spin up a
+    /// QuickJS runtime).
+    pub fn session_if_exists(&mut self, trusted: bool) -> Option<&mut Session> {
+        self.sessions[trusted as usize].as_mut()
+    }
+
     /// A throwaway session with explicit options (MCP `build` / `deploy` / `pack`).
     pub fn fresh_session(&self, opts: BuildOptions) -> Session {
         (self.factory)(&self.root, opts)
     }
 
-    /// The API index of `game_version`, loaded from the cache on first use.
-    pub fn api_index(&mut self, game_version: &str) -> Result<&ApiIndex, Diagnostic> {
-        if !self.api.contains_key(game_version) {
-            let ix = ApiIndex::load(game_version)?;
-            self.api.insert(game_version.to_owned(), ix);
-        }
-        Ok(&self.api[game_version])
+    /// The API index of `game_version`: the process-wide cache, loaded on first use (a missing
+    /// one is never cached).
+    pub fn api_index(&self, game_version: &str) -> Result<Arc<ApiIndex>, Diagnostic> {
+        beacon_engine::api_index::shared(game_version)
     }
 
     /// The watcher re-checks the trusted session iff a trusted client is attached.
@@ -172,13 +174,20 @@ impl EngineState {
         }
     }
 
-    /// `config.json` changed: a connection trusted only by the stored decision loses trust
-    /// when the decision no longer matches (`beacon.plugins` changed, 5.5). Explicit
-    /// (`--trust`) connections keep theirs.
+    /// Runs before every job (and on a `config.json` change): a connection loses trust when
+    /// `beacon.plugins` changed. A stored-decision one when the decision no longer matches
+    /// (5.5); an explicit (`--trust`) one when the plugins differ from those at connect (it
+    /// must reconnect: plugins spawn external processes). Cheap when nobody is trusted.
     fn revalidate_trust(&mut self) {
-        let ok = trust::is_trusted(&self.root, &plugins(&self.root));
-        for c in self.conns.iter().filter(|c| !c.explicit && !ok) {
-            c.trusted.store(false, Ordering::SeqCst);
+        if !self.watch_trusted() {
+            return;
+        }
+        let now = plugins(&self.root);
+        let ok = trust::is_trusted(&self.root, &now);
+        for c in &self.conns {
+            if !(if c.explicit { c.plugins == now } else { ok }) {
+                c.trusted.store(false, Ordering::SeqCst);
+            }
         }
         self.drop_trusted_if_alone();
     }
@@ -254,9 +263,10 @@ fn engine(root: PathBuf, factory: SessionFactory) -> Sender<Job> {
             sessions: [None, None],
             conns: vec![],
             last_check: None,
-            api: BTreeMap::new(),
         };
         for job in rx {
+            // a config write may have outrun the watcher: never run a job on stale trust
+            st.revalidate_trust();
             // the caller sees the panic (its reply channel drops); state stays usable
             let _ = catch_unwind(AssertUnwindSafe(|| job(&mut st)));
         }
@@ -507,7 +517,8 @@ fn connection(mut s: Stream, shared: &Shared, tx: Sender<Job>) {
     // Trust per connection: the shim's own `--trust` (the operator's command line; the pipe
     // only admits this user) or the stored decision. Never from channel messages. The source
     // is kept: only the stored decision is re-evaluated later.
-    let trusted = hello.trust || trust::is_trusted(&shared.root, &plugins(&shared.root));
+    let pl = plugins(&shared.root);
+    let trusted = hello.trust || trust::is_trusted(&shared.root, &pl);
     {
         let mut r = shared.reg();
         if r.closing {
@@ -553,15 +564,13 @@ fn connection(mut s: Stream, shared: &Shared, tx: Sender<Job>) {
     let c = Conn {
         trusted: handle.trusted.clone(),
         explicit: handle.explicit,
+        plugins: pl,
     };
     // A revalidation that ran between the trust decision above and this attach missed the
     // connection: re-evaluate once it is registered.
     handle.call(move |st| {
-        let stored = !c.explicit;
         st.attach(c);
-        if stored {
-            st.revalidate_trust();
-        }
+        st.revalidate_trust();
     });
     match hello.channel {
         Channel::Lsp => crate::lsp::serve(s, handle),
@@ -638,7 +647,7 @@ fn control(mut s: Stream, shared: &Shared) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use beacon_engine::host::{GenResult, GeneratorHost};
 
@@ -661,6 +670,11 @@ mod tests {
         }
     }
 
+    /// A restricted connection with the `edit` grant on a fresh engine (for the MCP tool tests).
+    pub(crate) fn test_handle(root: PathBuf) -> EngineHandle {
+        handle(&test_engine(root), false, false)
+    }
+
     fn test_engine(root: PathBuf) -> Sender<Job> {
         engine(
             root,
@@ -681,8 +695,13 @@ mod tests {
         let c = Conn {
             trusted: h.trusted.clone(),
             explicit: h.explicit,
+            plugins: Vec::new(),
         };
-        h.call(move |st| st.attach(c));
+        h.call(move |st| {
+            let mut c = c;
+            c.plugins = plugins(&st.root);
+            st.attach(c)
+        });
     }
 
     fn detach(h: &EngineHandle) {
@@ -720,10 +739,12 @@ mod tests {
         );
     }
 
-    /// Trust that came from the stored decision is dropped when it no longer matches; the
-    /// shim's `--trust` stays. The decision is checked against a real store (`BEACON_HOME`).
+    /// Trust is dropped when `beacon.plugins` changes: a stored decision no longer matches, and
+    /// an explicit `--trust` is pinned to the plugins at connect (reconnect to re-grant). The
+    /// decision is checked against a real store (`BEACON_HOME`). No explicit revalidate call:
+    /// the next job does it (a job enqueued before the watcher batch sees fresh trust).
     #[test]
-    fn stored_trust_is_demoted_explicit_is_not() {
+    fn plugin_change_demotes_stored_and_explicit_before_the_next_job() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: only this test touches BEACON_HOME in this crate's unit tests.
         unsafe { std::env::set_var("BEACON_HOME", dir.path().join("home")) };
@@ -742,19 +763,32 @@ mod tests {
         attach(&stored);
         attach(&flag);
         stored.call(|st| st.session(true).root().to_path_buf()); // the trusted session exists
-        // unchanged config: the decision still matches
-        stored.call(|st| st.revalidate_trust());
+        // unchanged config: both keep trust
+        stored.call(|_| ());
         assert!(stored.trusted() && flag.trusted());
-        // `beacon.plugins` changed: the decision key no longer matches
+        // `beacon.plugins` changed: any following job revalidates first
         cfg(r#"[{"id":"x"}]"#);
-        stored.call(|st| st.revalidate_trust());
+        stored.call(|_| ());
         assert!(!stored.trusted(), "stored trust demoted");
-        assert!(flag.trusted(), "explicit trust kept");
-        assert_eq!(stored.call(|st| st.trusted_clients()), 1);
-        assert!(stored.call(|st| st.sessions[1].is_some()));
-        // the last trusted client is gone: the trusted session goes with it
-        detach(&flag);
+        assert!(
+            !flag.trusted(),
+            "explicit trust is pinned to the connect-time plugins"
+        );
+        assert_eq!(stored.call(|st| st.trusted_clients()), 0);
         assert!(stored.call(|st| st.sessions[1].is_none() && !st.watch_trusted()));
+    }
+
+    /// Closing an overlay never creates a session.
+    #[test]
+    fn close_overlays_never_creates_a_session() {
+        let tx = test_engine(PathBuf::from("/nowhere"));
+        let h = handle(&tx, true, true);
+        h.call(|st| {
+            let r = RelPath::parse("a.json").unwrap();
+            crate::lsp::features::close_overlays(st, true, std::slice::from_ref(&r));
+            crate::lsp::features::close_overlays(st, false, std::slice::from_ref(&r));
+            assert!(st.sessions.iter().all(Option::is_none));
+        });
     }
 
     /// The handshake reply must not wait for the engine thread.

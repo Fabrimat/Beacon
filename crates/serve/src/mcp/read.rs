@@ -195,17 +195,14 @@ pub(super) fn symbols_definition(h: &EngineHandle, a: &Value) -> Value {
     })
 }
 
-/// 1-based line and byte column of `offset`.
-fn line_col(text: &str, offset: usize) -> (usize, usize) {
-    let before = &text.as_bytes()[..offset.min(text.len())];
-    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
-    let col = before.len()
-        - before
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |p| p + 1)
-        + 1;
-    (line, col)
+/// 1-based line and byte column of `offset`, from the table's line starts (the overlay text
+/// when the file is open in an editor, so never from the disk).
+fn line_col(starts: &[u32], offset: usize) -> (usize, usize) {
+    let line = starts.partition_point(|&s| s as usize <= offset).max(1);
+    (
+        line,
+        offset - starts.get(line - 1).map_or(0, |&s| s as usize) + 1,
+    )
 }
 
 pub(super) fn symbols_references(h: &EngineHandle, a: &Value) -> Value {
@@ -218,7 +215,7 @@ pub(super) fn symbols_references(h: &EngineHandle, a: &Value) -> Value {
         Err(e) => return e,
     };
     let a = a.clone();
-    with_table(h, move |t, root| {
+    with_table(h, move |t, _| {
         let kinds: Vec<SymbolKind> = match kind {
             Some(k) => vec![k],
             None => {
@@ -247,15 +244,10 @@ pub(super) fn symbols_references(h: &EngineHandle, a: &Value) -> Value {
             }
         }
         by_file.sort();
-        let mut texts: Option<(RelPath, String)> = None;
         let items = by_file
             .into_iter()
             .map(|(p, off)| {
-                if texts.as_ref().is_none_or(|(tp, _)| *tp != p) {
-                    let body = std::fs::read_to_string(root.join(p.as_str())).unwrap_or_default();
-                    texts = Some((p.clone(), body));
-                }
-                let (line, column) = line_col(&texts.as_ref().expect("read").1, off);
+                let (line, column) = line_col(t.line_starts(&p).unwrap_or_default(), off);
                 json!({ "path": p, "line": line, "column": column })
             })
             .collect();
@@ -284,7 +276,7 @@ fn with_index(
             Err(d) => return failure(&d),
         };
         match st.api_index(&v) {
-            Ok(ix) => f(ix),
+            Ok(ix) => f(&ix),
             Err(d) => note(d), // never a download, never an error
         }
     })

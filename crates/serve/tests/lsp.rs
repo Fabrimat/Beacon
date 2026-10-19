@@ -647,3 +647,35 @@ fn many_changes_then_close_leave_no_overlay() {
     }
     c.shutdown();
 }
+
+/// `symbols_references` of a file open with unsaved edits: line/column come from the buffer the
+/// table was scanned from, not from the disk text.
+#[test]
+fn mcp_references_positions_follow_the_open_buffer() {
+    let mut c = Client::start(false);
+    let client = "src/vehicles/entities/car.client_entity.json";
+    let disk = c.read(client);
+    // three lines on top: every position in the buffer is 3 lines below the disk's
+    let buffer = format!("\n\n\n{disk}");
+    c.open(client, 1, &buffer);
+    c.wait("textDocument/publishDiagnostics", |_| true);
+    let r = mcp_tool(&c, "symbols_references", json!({ "name": "demo:car" }));
+    let t = r["result"]["content"][0]["text"].as_str().unwrap();
+    let v: Value = serde_json::from_str(t).unwrap();
+    let hit = v["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["path"] == client)
+        .unwrap_or_else(|| panic!("no hit in {client}: {t}"))
+        .clone();
+    let off = buffer.find("demo:car").unwrap();
+    let line = buffer[..off].matches('\n').count() + 1;
+    let col = off - buffer[..off].rfind('\n').map_or(0, |p| p + 1) + 1;
+    assert_eq!(
+        (hit["line"].as_u64(), hit["column"].as_u64()),
+        (Some(line as u64), Some(col as u64)),
+        "{t}"
+    );
+    c.shutdown();
+}

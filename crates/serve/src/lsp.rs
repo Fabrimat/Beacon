@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod convert;
-mod features;
+pub(crate) mod features;
 
 pub use convert::{offset, offset_at, path_to_uri, position, position_at, uri_to_path};
 

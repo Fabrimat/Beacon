@@ -1,0 +1,72 @@
+# Script debugger e2e spike (phase 4 exit criterion 2): the official Mojang minecraft-debugger
+# adapter (built from its MIT source, never the Marketplace VSIX) attaches to BDS and must bind
+# and hit a breakpoint on a TS line of integrations/vscode/test/fixture through Beacon's debug
+# mirror map. The repo owner accepted the Minecraft EULA for automated BDS use (see ci.yml
+# bds-smoke); the BDS zip is minecraft.net-only, blake3-pinned in crates/bds, cached here by hash.
+# continue-on-error until the job is green N times in a row.
+name: vscode-e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "integrations/vscode/**"
+      - "crates/engine/src/debug.rs"
+      - ".github/workflows/vscode-e2e.yml"
+
+jobs:
+  debugger-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    env:
+      BEACON_HOME: ${{ github.workspace }}/.beacon-home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/cache@v4
+        with:
+          path: .beacon-home/tools/03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+          key: bds-win-03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+
+      - name: Build beacon
+        run: cargo build --release -p beacon-cli
+
+      # caches the pinned BDS zip (the e2e extracts it itself); the smoke world is only a carrier
+      - name: Fetch BDS
+        shell: bash
+        run: |
+          cp -r fixtures/multipack "$RUNNER_TEMP/multipack"
+          npm i --prefix .ci-esbuild esbuild@0.28.2
+          BEACON_ESBUILD="$(pwd -W)/.ci-esbuild/node_modules/@esbuild/win32-x64/esbuild.exe" \
+            target/release/beacon.exe build --project "$RUNNER_TEMP/multipack" --target world --trust --out smoke-out
+          cargo bds smoke --world smoke-out/beacon-multipack-world.mcworld --expect BEACON_SMOKE_OK:2 --accept-eula --yes --log bds-fetch.log
+
+      - name: Extension build and unit tests
+        working-directory: integrations/vscode
+        run: |
+          npm install
+          npm test
+
+      - name: Build the official debug adapter (MIT source)
+        working-directory: integrations/vscode
+        run: node test/e2e/build-adapter.mjs
+
+      - name: Debugger e2e
+        working-directory: integrations/vscode
+        shell: bash
+        env:
+          E2E_TIMEOUT: "240"
+        run: |
+          (cd test/fixture && npm install)
+          BEACON="$GITHUB_WORKSPACE/target/release/beacon.exe" node test/e2e/run.mjs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vscode-e2e-logs
+          path: bds-fetch.log

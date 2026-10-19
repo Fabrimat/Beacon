@@ -8,12 +8,14 @@ use super::{arg, bad_args, failure, grant_name, ok, text};
 use crate::Grant;
 use crate::daemon::{EngineHandle, EngineState};
 use beacon_engine::build::{BuildOptions, Bump, ReleaseOptions};
-use beacon_engine::config::Artifact;
+use beacon_engine::config::{Artifact, ProjectConfig};
 use beacon_engine::diag::{Code, Diagnostic, Fix, Severity};
+use beacon_engine::lock::Lockfile;
 use beacon_engine::path::RelPath;
 use beacon_engine::scaffold::{self, Edit, Kind, generated_file};
 use beacon_engine::{agents, route, symbols};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,33 @@ fn refresh(st: &mut EngineState, trusted: bool, files: impl IntoIterator<Item = 
     s.check();
 }
 
+/// The edits of a rename and the files they touch, verified against the disk; the failure is
+/// the tool result.
+fn plan_rename(
+    st: &mut EngineState,
+    t: bool,
+    root: &Path,
+    kind: Option<symbols::SymbolKind>,
+    from: &str,
+    to: &str,
+    diags: &[Diagnostic],
+) -> Result<(Vec<Fix>, Vec<symbols::FileEdit>), Value> {
+    let Some(table) = st.session(t).symbols() else {
+        return Err(failure(diags));
+    };
+    let fixes = symbols::rename(table, kind, from, to).map_err(|d| failure(&[d]))?;
+    for f in &fixes {
+        if let Some(d) = refuse(&|p| st.has_overlay(p), root, &f.path) {
+            return Err(failure(&[d]));
+        }
+    }
+    let files = match st.session(t).symbols() {
+        Some(table) => symbols::plan(root, table, &fixes).map_err(|d| failure(&[d]))?,
+        None => return Err(failure(diags)),
+    };
+    Ok((fixes, files))
+}
+
 pub(super) fn rename_symbol(h: &EngineHandle, a: &Value) -> Value {
     let (from, to) = match (arg(a, "from"), arg(a, "to")) {
         (Ok(f), Ok(t)) => (f.to_owned(), t.to_owned()),
@@ -93,27 +122,24 @@ pub(super) fn rename_symbol(h: &EngineHandle, a: &Value) -> Value {
     h.call(move |st| {
         let t = h2.trusted();
         let root = st.root().to_path_buf();
-        let diags = st.session(t).check().diagnostics; // fresh table: the watcher may lag a save
-        let fixes = {
-            let Some(table) = st.session(t).symbols() else {
-                return failure(&diags);
-            };
-            match symbols::rename(table, kind, &from, &to) {
-                Ok(f) => f,
-                Err(d) => return failure(&[d]),
-            }
+        // A real rename always checks first: `plan` re-verifies only the ranges the table knows,
+        // so a reference added since the last scan would be missed. A dry run checks only when
+        // the table is missing, or stale (the watcher lagged a save, so a range no longer holds
+        // its text).
+        let mut checked = !dry || st.session(t).symbols().is_none();
+        let mut diags = if checked {
+            st.session(t).check().diagnostics
+        } else {
+            vec![]
         };
-        for f in &fixes {
-            if let Some(d) = refuse(&|p| st.has_overlay(p), &root, &f.path) {
-                return failure(&[d]);
-            }
-        }
-        // all-or-nothing; also the dry run's check that every range still holds its text
-        let files = {
-            let table = st.session(t).symbols().expect("checked above");
-            match symbols::plan(&root, table, &fixes) {
-                Ok(f) => f,
-                Err(d) => return failure(&[d]),
+        let (fixes, files) = loop {
+            match plan_rename(st, t, &root, kind, &from, &to, &diags) {
+                Ok(r) => break r,
+                Err(_) if !checked => {
+                    checked = true;
+                    diags = st.session(t).check().diagnostics;
+                }
+                Err(e) => return e,
             }
         };
         let paths: Vec<RelPath> = files.iter().map(|f| f.path.clone()).collect();
@@ -221,6 +247,107 @@ pub(super) fn add_content(h: &EngineHandle, a: &Value) -> Value {
     })
 }
 
+/// What a real `pack` checks before writing and `check` skips, for a dry run, without writing
+/// anything: the lockfile under `frozen` (the `debug_config` pattern), `--pack` ids against the
+/// packs of the release, and `--set-version` against the released versions.
+/// ponytail: world/skin lock identities and content-dependent staleness (needs hashes of the
+/// built packs) are left to the real run.
+fn validate_release(
+    root: &Path,
+    cfg: &ProjectConfig,
+    target: Option<&str>,
+    all: bool,
+    only: &[String],
+    set_version: Option<[u32; 3]>,
+) -> Vec<Diagnostic> {
+    let is_static = |id: &str| {
+        cfg.beacon
+            .outputs
+            .iter()
+            .any(|o| o.id == id && o.static_packs.is_some())
+    };
+    let all_outputs: Vec<String> = cfg.beacon.outputs.iter().map(|o| o.id.clone()).collect();
+    let minted: Vec<String> = all_outputs
+        .iter()
+        .filter(|o| !is_static(o))
+        .cloned()
+        .collect();
+    let (lock, mut out) = match Lockfile::ensure(root, cfg, &minted, &[], &[], true) {
+        Ok(l) => (Some(l), vec![]),
+        Err(d) => (None, vec![d]),
+    };
+    // (outputs, world folder, skins folder) of each release plan; none for a dev target
+    let mut plans: Vec<(Vec<String>, Option<String>, Option<String>)> = vec![];
+    match (target, all) {
+        (None, false) => plans.push((all_outputs.clone(), None, None)),
+        (t, _) => {
+            for (name, d) in &cfg.beacon.targets {
+                if t.is_some_and(|t| t != name) || d.artifact == Artifact::Dev {
+                    continue;
+                }
+                let outs = match &d.outputs {
+                    Some(l) if !l.iter().any(|o| o == "*") => all_outputs
+                        .iter()
+                        .filter(|o| l.contains(o))
+                        .cloned()
+                        .collect(),
+                    _ => all_outputs.clone(),
+                };
+                let trim = |s: &Option<String>| {
+                    s.as_deref()
+                        .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_owned())
+                };
+                let (world, skins) = match d.artifact {
+                    Artifact::McTemplate => (trim(&d.world), None),
+                    Artifact::Marketplace => (trim(&d.world), trim(&d.skins)),
+                    Artifact::SkinPack => (None, trim(&d.skins)),
+                    _ => (None, None),
+                };
+                plans.push((outs, world, skins));
+            }
+        }
+    }
+    let mut ids = BTreeSet::new();
+    for (outs, world, skins) in &plans {
+        for o in outs.iter().filter(|o| !is_static(o)) {
+            ids.extend([o.clone(), format!("{o}/BP"), format!("{o}/RP")]);
+        }
+        ids.extend(world.iter().map(|w| format!("world:{w}")));
+        ids.extend(skins.iter().map(|s| format!("skins:{s}")));
+    }
+    if let Some(bad) = only.iter().find(|o| !ids.contains(*o)) {
+        let valid: Vec<&str> = ids.iter().map(String::as_str).collect();
+        out.push(Diagnostic::new(
+            Code::ConfigField,
+            format!(
+                "--pack {bad:?} matches no pack of this release; valid ids: {}",
+                valid.join(", ")
+            ),
+        ));
+    }
+    if let (Some(set), Some(lock)) = (set_version, &lock) {
+        for (o, ol) in lock.outputs.iter().filter(|(o, _)| ids.contains(*o)) {
+            for e in ol.shared.iter().chain(ol.editions.values()) {
+                for (suffix, pack) in [("BP", &e.bp), ("RP", &e.rp)] {
+                    let key = format!("{o}/{suffix}");
+                    let mine = only.is_empty() || only.iter().any(|x| *x == key || x == o);
+                    let mut released = pack.release.iter().chain(pack.releases.values());
+                    if let Some(r) = released.find(|r| mine && set < r.version) {
+                        out.push(Diagnostic::new(
+                            Code::PackVersionNotMonotonic,
+                            format!(
+                                "{key}: {}.{}.{} is lower than the released {}.{}.{}",
+                                set[0], set[1], set[2], r.version[0], r.version[1], r.version[2]
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `build`, `deploy` and `pack`: a throwaway session with the connection's trust; the output
 /// is the build report. `dryRun` runs the same pipeline as `check` for the chosen target and
 /// release options: diagnostics and nothing written (the engine has no emit plan yet).
@@ -259,6 +386,7 @@ pub(super) fn build(h: &EngineHandle, a: &Value, flavor: Flavor) -> Value {
         })
         .unwrap_or_default();
     let all = flavor == Flavor::Pack && a["all"].as_bool().unwrap_or(false);
+    let only_ids = only.clone();
     let mut target = a["target"].as_str().map(str::to_owned);
     let h2 = h.clone(); // trust is read on the engine thread, after any demotion
     h.call(move |st| {
@@ -293,7 +421,12 @@ pub(super) fn build(h: &EngineHandle, a: &Value, flavor: Flavor) -> Value {
             release: (flavor == Flavor::Pack).then_some(ReleaseOptions { bump, set_version, only }),
         };
         let mut s = st.fresh_session(opts);
-        let r = if dry { s.check() } else { s.build() };
+        let mut r = if dry { s.check() } else { s.build() };
+        if dry && flavor == Flavor::Pack {
+            let root = st.root().to_path_buf();
+            let tgt = target.as_deref();
+            r.diagnostics.extend(validate_release(&root, &cfg, tgt, all, &only_ids, set_version));
+        }
         let errors = r.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
         let mut out = json!({
             "dryRun": dry, "target": target, "emitted": r.report.emitted,
@@ -310,6 +443,64 @@ pub(super) fn build(h: &EngineHandle, a: &Value, flavor: Flavor) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::tests::test_handle;
+
+    /// A copy of `fixtures/rename` (a restricted session indexes it without generators).
+    fn project() -> (tempfile::TempDir, PathBuf) {
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                let dest = to.join(e.file_name());
+                if e.path().is_dir() {
+                    copy(&e.path(), &dest);
+                } else {
+                    std::fs::copy(e.path(), dest).unwrap();
+                }
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        copy(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rename"),
+            &root,
+        );
+        (d, root)
+    }
+
+    #[test]
+    fn dry_rename_checks_only_a_missing_or_stale_table() {
+        let (_d, root) = project();
+        let h = test_handle(root);
+        let gen_after = |h: &EngineHandle| h.call(|st| st.session(false).check().generation);
+        let a = json!({ "from": "demo:car", "to": "demo:truck" });
+        let g0 = gen_after(&h); // the table exists now
+        let r = rename_symbol(&h, &a);
+        assert_eq!(r["isError"], false, "{r}");
+        // exactly our own check ran in between: the dry runs did not check
+        rename_symbol(&h, &a);
+        assert_eq!(gen_after(&h), g0 + 1);
+        // no table yet: the first call checks (a different, fresh engine)
+        let (_d2, root2) = project();
+        let h2 = test_handle(root2);
+        let r = rename_symbol(&h2, &a);
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(gen_after(&h2), 2);
+    }
+
+    #[test]
+    fn dry_pack_rejects_an_unknown_pack_id() {
+        let (_d, root) = project();
+        let h = test_handle(root);
+        let r = build(&h, &json!({ "pack": ["nope"] }), Flavor::Pack);
+        assert_eq!(r["isError"], true, "{r}");
+        let t = r["content"][0]["text"].as_str().unwrap();
+        assert!(t.contains("matches no pack of this release"), "{t}");
+        // a real id passes that check
+        let r = build(&h, &json!({ "pack": ["main/BP"] }), Flavor::Pack);
+        let t = r["content"][0]["text"].as_str().unwrap();
+        assert!(!t.contains("matches no pack"), "{t}");
+    }
 
     #[test]
     fn protected_and_dirty_files_are_refused() {

@@ -144,7 +144,7 @@ impl GenCache {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().expect("cache dir"))?;
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(std::io::Error::other)?;

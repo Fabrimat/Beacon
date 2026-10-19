@@ -265,11 +265,7 @@ fn launch_json(p: &Plan) -> Option<String> {
         })
         .collect();
     let v = json!({ "version": "0.2.0", "configurations": configs });
-    Some(
-        serde_json::to_string_pretty(&v).expect("json")
-            + "
-",
-    )
+    Some(serde_json::to_string_pretty(&v).expect("json") + "\n")
 }
 
 /// Writes the project into `dir` (created if needed). Refuses a non-empty directory before
@@ -301,9 +297,8 @@ pub fn scaffold(dir: &Path, p: &Plan) -> Result<Created, Vec<Diagnostic>> {
             &json!({ "recommendations": ["mojang-studios.minecraft-debugger"] }),
         )
         .expect("json")
-            + "
-")
-        .into_bytes(),
+            + "\n")
+            .into_bytes(),
     ));
     if let Some(l) = launch_json(p) {
         files.push((".vscode/launch.json".into(), l.into_bytes()));

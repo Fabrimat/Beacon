@@ -124,6 +124,22 @@ pub fn cache_path(game_version: &str) -> Option<PathBuf> {
     Some(base.join("api").join(game_version).join("index.json"))
 }
 
+static SHARED: std::sync::Mutex<BTreeMap<String, std::sync::Arc<ApiIndex>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Process-wide cached index for `game_version` (shared by `check` and the daemon). Only hits
+/// are cached: a miss (`ApiIndexMissing`) is retried next call, so a later `beacon api`
+/// install is picked up. Never downloads.
+pub fn shared(game_version: &str) -> Result<std::sync::Arc<ApiIndex>, Diagnostic> {
+    let mut m = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ix) = m.get(game_version) {
+        return Ok(ix.clone());
+    }
+    let ix = std::sync::Arc::new(ApiIndex::load(game_version)?);
+    m.insert(game_version.to_owned(), ix.clone());
+    Ok(ix)
+}
+
 /// (path, signature, doc, deprecated) -> keep going?
 type Visitor<'a> = dyn FnMut(&str, Option<&str>, Option<&str>, bool) -> bool + 'a;
 

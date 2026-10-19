@@ -56,7 +56,7 @@ fn build(root: &Path, target: &str) -> beacon_engine::build::BuildOutcome {
 fn check_mirror(root: &Path) {
     let map_path = root.join(".beacon/debug/dev/main/scripts/main.js.map");
     let map: Value = serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
-    assert_eq!(map["file"], "scripts/main.js");
+    assert_eq!(map["file"], "main.js");
     assert_eq!(map["sourcesContent"].as_array().unwrap().len(), 2);
     let sources = map["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
@@ -138,7 +138,7 @@ fn rewrite_map_forms() {
             "https://x/y.ts"
         ])
     );
-    assert_eq!(v["file"], "scripts/main.js");
+    assert_eq!(v["file"], "main.js"); // relative to the map's own folder
     assert!(debug::rewrite_map("nope", root, &mirror, "x").is_err());
 }
 
@@ -155,6 +155,8 @@ fn launch_config_resolves_dev_uuid() {
     assert_eq!(c.port, DEFAULT_PORT);
     let mirror = "${workspaceFolder}/.beacon/debug/dev/main";
     assert_eq!(c.local_root, mirror);
+    assert_eq!(c.source_map_root, mirror);
+    assert_eq!(c.generated_source_root, format!("{mirror}/scripts"));
     let v = serde_json::to_value(&c).unwrap();
     for k in [
         "type",
@@ -177,6 +179,10 @@ fn launch_config_resolves_dev_uuid() {
     c.absolutize(p.path());
     assert!(!c.source_map_root.contains("${"), "{}", c.source_map_root);
     assert!(c.source_map_root.ends_with("/.beacon/debug/dev/main"));
+    assert!(
+        c.generated_source_root
+            .ends_with("/.beacon/debug/dev/main/scripts")
+    );
     let l = debug::launch_config(p.path(), &cfg, &lock, "dev", "main", Mode::Listen).unwrap();
     assert!(serde_json::to_value(&l).unwrap().get("host").is_none());
 }

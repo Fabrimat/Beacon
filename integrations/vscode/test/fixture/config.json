@@ -1,0 +1,34 @@
+{
+  "authors": [],
+  "beacon": {
+    "packMeta": {
+      "description": "dbgfixture (made with Beacon)",
+      "icon": "./pack_icon.png",
+      "name": "dbgfixture"
+    },
+    "scriptModules": {
+      "@minecraft/server": "2.10.0"
+    },
+    "sources": [
+      "./src"
+    ],
+    "targets": {
+      "addon": {
+        "artifact": "mcaddon",
+        "edition": "bedrock"
+      },
+      "dev": {
+        "artifact": "dev",
+        "edition": "bedrock"
+      }
+    }
+  },
+  "name": "dbgfixture",
+  "namespace": "dbgfx",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP"
+  },
+  "targetVersion": "1.26.50",
+  "type": "minecraftBedrock"
+}

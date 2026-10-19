@@ -1,0 +1,82 @@
+{
+  "name": "beacon-vscode",
+  "displayName": "Beacon",
+  "description": "Beacon for Minecraft Bedrock add-ons: language server, build commands, and debugger configuration.",
+  "version": "0.1.0",
+  "publisher": "beacon",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "workspaceContains:config.json",
+    "onDebugResolve:minecraft-js"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "beacon.build",
+        "title": "Beacon: Build"
+      },
+      {
+        "command": "beacon.watch",
+        "title": "Beacon: Watch"
+      },
+      {
+        "command": "beacon.deploy",
+        "title": "Beacon: Deploy (build the dev target into com.mojang)"
+      },
+      {
+        "command": "beacon.trust",
+        "title": "Beacon: Trust this workspace"
+      }
+    ],
+    "configuration": {
+      "title": "Beacon",
+      "properties": {
+        "beacon.path": {
+          "type": "string",
+          "default": "beacon",
+          "description": "The beacon executable (default: found on PATH). Machine scope: a repository cannot set it.",
+          "scope": "machine"
+        },
+        "beacon.devTarget": {
+          "type": "string",
+          "default": "dev",
+          "description": "The dev target used by Beacon: Deploy.",
+          "scope": "resource",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test \"out/test/*.test.js\"",
+    "package": "npm run build && vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.6.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Beacon runs the beacon executable (language server, build tasks, debug configuration); all of that is disabled in Restricted Mode.",
+      "restrictedConfigurations": [
+        "beacon.path",
+        "beacon.devTarget"
+      ]
+    }
+  }
+}

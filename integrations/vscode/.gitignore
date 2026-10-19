@@ -1,0 +1,6 @@
+node_modules/
+out/
+*.vsix
+test/fixture/.beacon/
+test/fixture/node_modules/
+.e2e/

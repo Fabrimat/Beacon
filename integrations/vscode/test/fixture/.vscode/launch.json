@@ -1,0 +1,12 @@
+{
+  "configurations": [
+    {
+      "beaconOutput": "main",
+      "beaconTarget": "dev",
+      "name": "Beacon: dev",
+      "request": "attach",
+      "type": "minecraft-js"
+    }
+  ],
+  "version": "0.2.0"
+}

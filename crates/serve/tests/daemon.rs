@@ -88,8 +88,8 @@ fn main() {
             two_shims_meet_the_same_daemon,
         ),
         (
-            "stored_trust_is_demoted_when_plugins_change",
-            stored_trust_is_demoted_when_plugins_change,
+            "trust_is_demoted_when_plugins_change",
+            trust_is_demoted_when_plugins_change,
         ),
         #[cfg(windows)]
         ("pipe_dacl_is_owner_only", pipe_dacl_is_owner_only),
@@ -487,9 +487,9 @@ fn two_shims_meet_the_same_daemon() {
     fx.wait_daemon_gone();
 }
 
-/// A connection trusted by the stored decision loses trust when `beacon.plugins` changes (the
-/// watcher sees `config.json`); one trusted by the shim's `--trust` keeps it.
-fn stored_trust_is_demoted_when_plugins_change() {
+/// A connection trusted by the stored decision, and one trusted by the shim's `--trust` (pinned
+/// to the plugins at connect), both lose trust when `beacon.plugins` changes.
+fn trust_is_demoted_when_plugins_change() {
     let fx = Fx::new();
     let cfg = |plugins: &str| {
         std::fs::write(
@@ -519,9 +519,8 @@ fn stored_trust_is_demoted_when_plugins_change() {
     assert!(r.ok);
     trusted(2);
     cfg(r#"[{"id":"changed"}]"#);
-    trusted(1);
-    drop(_explicit);
     trusted(0);
+    drop(_explicit);
     drop(_stored);
     stop(&fx);
     assert_eq!(wait_exit(&mut d), 0);
