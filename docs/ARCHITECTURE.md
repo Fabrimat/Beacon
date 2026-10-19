@@ -1195,6 +1195,7 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   thread owns sessions, symbols, document overlays and the API index. The CLI's warm path
   through the daemon (3) and the TCP endpoint wait for phase 5 (the app). `beacon mcp`
   becomes `beacon serve --stdio --mcp`.
+- **MCP grants and guardrail (8.1, 8.2).** Write tools (`rename_symbol`, `fix`, `add_content`, `build`, `deploy`, `pack`) take `dryRun` (default true, a read: no grant); `dryRun: false` needs the shim's `--allow edit|build|release|deploy` and otherwise fails with `GrantRequired` naming the flag. Trust and grants are per connection, never from tool arguments. Because `--trust` and `--allow` live in the agent's own MCP config, `beacon hook pre-tool-use` also denies edits to `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json` and `.vscode/mcp.json` (project-local, so an agent cannot grant itself access). This protects the config path only: an agent with arbitrary shell access, or a user-level config, is out of scope. `build` / `deploy` / `pack` with `dryRun` validate (as `check`) and write nothing; the emitted-file diff waits for engine support.
 - **LSP crate: `lsp-server` + `lsp-types`**, not `tower-lsp` (supersedes 9.1): a minimal
   stdio server measured 1.0 MB vs 2.8 MB with `tower-lsp-server` + tokio (Windows,
   release, stripped), no async runtime in a resident process, and the codebase is

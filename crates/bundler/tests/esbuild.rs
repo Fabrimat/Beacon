@@ -228,3 +228,48 @@ console.log(VANILLA, world, x);
     assert!(code.contains("\"@minecraft/server\""), "{code}");
     assert!(code.contains("\"@minecraft/server/deep\""), "{code}");
 }
+
+/// Debugger interop: map `sources` are project-relative and resolve to real files, also when the
+/// project is on another drive than the system TEMP (the repo's `target/` vs `%TEMP%`).
+#[test]
+fn map_sources_are_project_relative() {
+    let Some(inst) = install() else { return };
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    let t = tempfile::tempdir_in(base).unwrap();
+    // no verbatim prefix: the engine hands esbuild a plain path
+    let canon = t.path().canonicalize().unwrap();
+    let r = PathBuf::from(canon.to_string_lossy().trim_start_matches(r"\\?\"));
+    std::fs::create_dir_all(r.join("src/lib")).unwrap();
+    std::fs::write(
+        r.join("src/main.ts"),
+        "import {h} from './lib/h';\nconsole.log(h());\n",
+    )
+    .unwrap();
+    std::fs::write(
+        r.join("src/lib/h.ts"),
+        "export const h = (): string => 'H';\n",
+    )
+    .unwrap();
+    let entries = [rp("src/main.ts")];
+    let req = BundleRequest {
+        root: &r,
+        entries: &entries,
+        sourcemap: true,
+        minify: false,
+        define: &Default::default(),
+        externals: &[],
+    };
+    let res = esbuild.bundle(&req);
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    let map: serde_json::Value = serde_json::from_str(&res.map.expect("map")).unwrap();
+    let mut got: Vec<_> = map["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_owned())
+        .collect();
+    got.sort();
+    assert_eq!(got, ["src/lib/h.ts", "src/main.ts"]);
+    assert!(got.iter().all(|s| r.join(s).is_file()));
+}

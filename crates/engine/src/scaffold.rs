@@ -210,6 +210,28 @@ pub fn add(
     module: Option<&str>,
     force_convention: bool,
 ) -> Res<Added> {
+    add_impl(root, kind, name, module, force_convention, false)
+}
+
+/// [`add`] without writing: the files it would create (MCP `add_content` with `dryRun`).
+pub fn plan_add(
+    root: &Path,
+    kind: Kind,
+    name: &str,
+    module: Option<&str>,
+    force_convention: bool,
+) -> Res<Added> {
+    add_impl(root, kind, name, module, force_convention, true)
+}
+
+fn add_impl(
+    root: &Path,
+    kind: Kind,
+    name: &str,
+    module: Option<&str>,
+    force_convention: bool,
+    dry: bool,
+) -> Res<Added> {
     if !name_ok(name) {
         return usage(format!("name {name:?} must match [a-z0-9_]+"));
     }
@@ -228,7 +250,9 @@ pub fn add(
         if dir.exists() {
             return usage(format!("{rel} already exists"));
         }
-        std::fs::create_dir_all(&dir).or_else(|e| io(&rel, e))?;
+        if !dry {
+            std::fs::create_dir_all(&dir).or_else(|e| io(&rel, e))?;
+        }
         return Ok(Added {
             module: rel.clone(),
             files: vec![format!("{rel}/")],
@@ -286,6 +310,10 @@ pub fn add(
     }
     let mut made = Vec::new();
     for (rel, text) in &files {
+        if dry {
+            made.push(format!("{module}/{rel}"));
+            continue;
+        }
         let p = base.join(rel);
         let w = std::fs::create_dir_all(p.parent().expect("parent")).and_then(|()| {
             std::fs::OpenOptions::new()
@@ -307,14 +335,16 @@ pub fn add(
         } else {
             "\n"
         };
-        let w = std::fs::create_dir_all(lp.parent().expect("parent")).and_then(|()| {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&lp)
-                .and_then(|mut f| f.write_all(format!("{sep}{lang}\n").as_bytes()))
-        });
-        w.or_else(|e| io(lang_rel, e))?;
+        if !dry {
+            let w = std::fs::create_dir_all(lp.parent().expect("parent")).and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&lp)
+                    .and_then(|mut f| f.write_all(format!("{sep}{lang}\n").as_bytes()))
+            });
+            w.or_else(|e| io(lang_rel, e))?;
+        }
         made.push(format!("{module}/{lang_rel}"));
     }
     Ok(Added {
@@ -536,6 +566,16 @@ const DEV_FOLDERS: &[&str] = &[
     "development_skin_packs",
 ];
 
+/// Project-local MCP and Claude Code configuration (case-folded, root-relative): the files
+/// where `beacon mcp` / `beacon serve --mcp` is configured with `--trust` and `--allow`, so
+/// an agent that could edit them could grant itself both (8.2).
+const AGENT_CONFIG: &[&[&str]] = &[
+    &[".mcp.json"],
+    &[".claude", "settings.json"],
+    &[".claude", "settings.local.json"],
+    &[".vscode", "mcp.json"],
+];
+
 /// The one source of truth for generated files: why a tool must not edit `file` (a normalized
 /// absolute path), or `None`. Case-folded. `root` is the project root (without it only dev
 /// pack folders are known). `AGENTS.md` is protected only inside its generated region.
@@ -554,6 +594,12 @@ pub fn generated_file(root: Option<&Path>, file: &Path, edit: &Edit) -> Option<S
         return None;
     }
     let rel = all[r.len()..].to_vec();
+    if AGENT_CONFIG.iter().any(|p| rel == *p) {
+        return Some(format!(
+            "{} configures which agents and MCP servers run here and what `beacon serve --mcp` is granted (`--trust`, `--allow`); the operator edits it by hand, an agent must not grant itself access",
+            rel.join("/")
+        ));
+    }
     if rel == [LOCK_FILE] {
         return Some(format!(
             "{LOCK_FILE} is owned by beacon (UUIDs, releases); it is updated by `beacon build`, `beacon pack` and `beacon rename-output`"

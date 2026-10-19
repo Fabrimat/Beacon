@@ -28,13 +28,17 @@ use crate::{
     Channel, ControlRequest, ENGINE_VERSION, Grant, Hello, HelloError, HelloReply,
     PROTOCOL_VERSION, read_line, write_line,
 };
-use beacon_engine::build::{BuildOutcome, Session};
+use beacon_engine::api_index::ApiIndex;
+use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
 use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, exit};
+use beacon_engine::path::RelPath;
 use beacon_engine::{sarif, trust};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -42,9 +46,11 @@ use std::time::{Duration, Instant};
 /// Exit after this long with no client attached.
 pub const IDLE_SHUTDOWN: Duration = Duration::from_secs(60);
 
-/// Builds a session for the project; `true` = trusted. The CLI wires the QuickJS host and
-/// the esbuild bundler in (this crate depends on neither).
-pub type SessionFactory = Box<dyn Fn(&Path, bool) -> Session + Send + Sync>;
+/// Builds a session for the project with these options (`opts.trusted` decides restricted vs
+/// trusted). The CLI wires the QuickJS host and the esbuild bundler in (this crate depends on
+/// neither). Cached sessions use default options; MCP `build` / `deploy` / `pack` pass a
+/// target and release options.
+pub type SessionFactory = Box<dyn Fn(&Path, BuildOptions) -> Session + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -70,16 +76,27 @@ impl DaemonOptions {
     }
 }
 
+/// One attached LSP/MCP connection as the engine thread sees it.
+struct Conn {
+    /// Shared with the connection's [`EngineHandle`]: demotion is visible to its channel.
+    trusted: Arc<AtomicBool>,
+    /// The shim's own `--trust`: never re-evaluated. Otherwise trust came from the stored
+    /// decision and is re-checked when `config.json` changes.
+    explicit: bool,
+}
+
 /// Everything the engine thread owns. Reached only through [`EngineHandle::call`].
 pub struct EngineState {
     root: PathBuf,
     factory: SessionFactory,
     /// [restricted, trusted], created on first use.
     sessions: [Option<Session>; 2],
-    /// Attached LSP/MCP clients whose connection is trusted.
-    trusted_clients: usize,
+    /// Attached LSP/MCP clients.
+    conns: Vec<Conn>,
     /// The watcher's latest check (of [`EngineState::watch_trusted`]'s session).
     pub last_check: Option<BuildOutcome>,
+    /// API indexes by game version, loaded on first use (a missing one is never cached).
+    api: BTreeMap<String, ApiIndex>,
 }
 
 impl EngineState {
@@ -92,26 +109,78 @@ impl EngineState {
     /// connection's [`EngineHandle::trusted`], never a client-supplied value.
     pub fn session(&mut self, trusted: bool) -> &mut Session {
         let (root, f) = (&self.root, &self.factory);
-        self.sessions[trusted as usize].get_or_insert_with(|| f(root, trusted))
+        self.sessions[trusted as usize].get_or_insert_with(|| {
+            f(
+                root,
+                BuildOptions {
+                    trusted,
+                    ..Default::default()
+                },
+            )
+        })
+    }
+
+    /// A throwaway session with explicit options (MCP `build` / `deploy` / `pack`).
+    pub fn fresh_session(&self, opts: BuildOptions) -> Session {
+        (self.factory)(&self.root, opts)
+    }
+
+    /// The API index of `game_version`, loaded from the cache on first use.
+    pub fn api_index(&mut self, game_version: &str) -> Result<&ApiIndex, Diagnostic> {
+        if !self.api.contains_key(game_version) {
+            let ix = ApiIndex::load(game_version)?;
+            self.api.insert(game_version.to_owned(), ix);
+        }
+        Ok(&self.api[game_version])
     }
 
     /// The watcher re-checks the trusted session iff a trusted client is attached.
     pub fn watch_trusted(&self) -> bool {
-        self.trusted_clients > 0
+        self.conns.iter().any(|c| c.trusted.load(Ordering::SeqCst))
     }
 
-    fn attach(&mut self, trusted: bool, on: bool) {
-        if !trusted {
-            return;
+    /// `path` is open with unsaved changes in an LSP client (an overlay in either session's
+    /// symbol table; MCP write tools refuse such files with `DocumentDirty`).
+    pub fn has_overlay(&self, path: &RelPath) -> bool {
+        self.sessions
+            .iter()
+            .flatten()
+            .any(|s| s.symbols().is_some_and(|t| t.has_overlay(path)))
+    }
+
+    /// Attached clients whose connection is trusted (`beacon serve --status`).
+    pub fn trusted_clients(&self) -> usize {
+        self.conns
+            .iter()
+            .filter(|c| c.trusted.load(Ordering::SeqCst))
+            .count()
+    }
+
+    fn attach(&mut self, c: Conn) {
+        self.conns.push(c);
+    }
+
+    fn detach(&mut self, trusted: &Arc<AtomicBool>) {
+        self.conns.retain(|c| !Arc::ptr_eq(&c.trusted, trusted));
+        self.drop_trusted_if_alone();
+    }
+
+    /// No trusted client left: back to restricted; frees the JS runtime.
+    fn drop_trusted_if_alone(&mut self) {
+        if !self.watch_trusted() {
+            self.sessions[1] = None;
         }
-        if on {
-            self.trusted_clients += 1;
-        } else {
-            self.trusted_clients -= 1;
-            if self.trusted_clients == 0 {
-                self.sessions[1] = None; // back to restricted; frees the JS runtime
-            }
+    }
+
+    /// `config.json` changed: a connection trusted only by the stored decision loses trust
+    /// when the decision no longer matches (`beacon.plugins` changed, 5.5). Explicit
+    /// (`--trust`) connections keep theirs.
+    fn revalidate_trust(&mut self) {
+        let ok = trust::is_trusted(&self.root, &plugins(&self.root));
+        for c in self.conns.iter().filter(|c| !c.explicit && !ok) {
+            c.trusted.store(false, Ordering::SeqCst);
         }
+        self.drop_trusted_if_alone();
     }
 
     fn on_changes(&mut self, b: &crate::watch::Batch) {
@@ -129,7 +198,9 @@ type Job = Box<dyn FnOnce(&mut EngineState) + Send>;
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: Sender<Job>,
-    trusted: bool,
+    trusted: Arc<AtomicBool>,
+    /// The shim's `--trust` (see [`Conn::explicit`]).
+    explicit: bool,
     grants: Vec<Grant>,
 }
 
@@ -148,9 +219,20 @@ impl EngineHandle {
         rrx.recv().expect("engine call panicked")
     }
 
-    /// Trusted connection: the stored per-user decision or the shim's own `--trust` (5.5).
+    /// Trusted connection: the shim's own `--trust` or the stored per-user decision, which
+    /// is re-evaluated when `config.json` changes (5.5).
     pub fn trusted(&self) -> bool {
-        self.trusted
+        self.trusted.load(Ordering::SeqCst)
+    }
+
+    /// Where this connection's trust came from: `flag` (the shim's `--trust`), `stored` (the
+    /// per-user decision) or `none`.
+    pub fn trust_source(&self) -> &'static str {
+        match (self.trusted(), self.explicit) {
+            (false, _) => "none",
+            (true, true) => "flag",
+            (true, false) => "stored",
+        }
     }
 
     /// The operator's `--allow` grants for this connection (8.1).
@@ -170,8 +252,9 @@ fn engine(root: PathBuf, factory: SessionFactory) -> Sender<Job> {
             root,
             factory,
             sessions: [None, None],
-            trusted_clients: 0,
+            conns: vec![],
             last_check: None,
+            api: BTreeMap::new(),
         };
         for job in rx {
             // the caller sees the panic (its reply channel drops); state stays usable
@@ -188,6 +271,8 @@ struct Reg {
     closing: bool,
     /// Leave the main loop now.
     stop: bool,
+    /// Trust flags of the attached connections (`--status` reads them without the engine).
+    trust_flags: Vec<Arc<AtomicBool>>,
     /// Last time `clients` dropped to 0 (`None`: never had one).
     idle_since: Option<Instant>,
 }
@@ -263,6 +348,7 @@ pub fn run(opts: &DaemonOptions, factory: SessionFactory) -> i32 {
             closing: false,
             stop: false,
             idle_since: None,
+            trust_flags: vec![],
         }),
         cv: Condvar::new(),
         root: root.clone(),
@@ -331,7 +417,8 @@ fn watcher(root: &Path, tx: Sender<Job>) {
     };
     let h = EngineHandle {
         tx,
-        trusted: false,
+        trusted: Arc::new(AtomicBool::new(false)),
+        explicit: false,
         grants: vec![],
     };
     std::thread::spawn(move || {
@@ -344,7 +431,12 @@ fn watcher(root: &Path, tx: Sender<Job>) {
         let mut ign = ignored(&h);
         while let Some(b) = w.next(&ign) {
             let cfg = b.touches_config(&h.call(|st| st.root().to_path_buf()));
-            h.call(move |st| st.on_changes(&b));
+            h.call(move |st| {
+                if cfg {
+                    st.revalidate_trust(); // before the re-check picks its session
+                }
+                st.on_changes(&b);
+            });
             if cfg {
                 ign = ignored(&h); // pack folders may have moved
             }
@@ -413,7 +505,8 @@ fn connection(mut s: Stream, shared: &Shared, tx: Sender<Job>) {
         return;
     }
     // Trust per connection: the shim's own `--trust` (the operator's command line; the pipe
-    // only admits this user) or the stored decision. Never from channel messages.
+    // only admits this user) or the stored decision. Never from channel messages. The source
+    // is kept: only the stored decision is re-evaluated later.
     let trusted = hello.trust || trust::is_trusted(&shared.root, &plugins(&shared.root));
     {
         let mut r = shared.reg();
@@ -430,17 +523,19 @@ fn connection(mut s: Stream, shared: &Shared, tx: Sender<Job>) {
     }
     let handle = EngineHandle {
         tx,
-        trusted,
+        trusted: Arc::new(AtomicBool::new(trusted)),
+        explicit: hello.trust,
         grants: hello.allow,
     };
-    handle.call(move |st| st.attach(trusted, true));
-    // detach even if the channel panics
+    // detach even if the channel panics (a no-op for a connection never attached)
     struct Detach<'a>(&'a Shared, EngineHandle);
     impl Drop for Detach<'_> {
         fn drop(&mut self) {
-            let t = self.1.trusted;
-            self.1.call(move |st| st.attach(t, false));
+            let t = self.1.trusted.clone();
+            let t2 = t.clone();
+            self.1.call(move |st| st.detach(&t));
             let mut r = self.0.reg();
+            r.trust_flags.retain(|f| !Arc::ptr_eq(f, &t2));
             r.clients -= 1;
             if r.clients == 0 {
                 r.idle_since = Some(Instant::now());
@@ -448,10 +543,26 @@ fn connection(mut s: Stream, shared: &Shared, tx: Sender<Job>) {
             self.0.cv.notify_all();
         }
     }
+    shared.reg().trust_flags.push(handle.trusted.clone());
     let _d = Detach(shared, handle.clone());
+    // Reply first: attaching queues behind whatever the engine thread is doing (a long
+    // trusted `check`), and the shim gives up on the handshake after a few seconds.
     if write_line(&mut s, &reply(true, None)).is_err() {
         return;
     }
+    let c = Conn {
+        trusted: handle.trusted.clone(),
+        explicit: handle.explicit,
+    };
+    // A revalidation that ran between the trust decision above and this attach missed the
+    // connection: re-evaluate once it is registered.
+    handle.call(move |st| {
+        let stored = !c.explicit;
+        st.attach(c);
+        if stored {
+            st.revalidate_trust();
+        }
+    });
     match hello.channel {
         Channel::Lsp => crate::lsp::serve(s, handle),
         Channel::Mcp => crate::mcp::serve(s, handle),
@@ -499,6 +610,7 @@ fn control(mut s: Stream, shared: &Shared) {
                 "engine": ENGINE_VERSION,
                 "protocol": PROTOCOL_VERSION,
                 "clients": shared.reg().clients,
+                "trustedClients": shared.reg().trust_flags.iter().filter(|f| f.load(Ordering::SeqCst)).count(),
                 "uptimeMs": shared.started.elapsed().as_millis() as u64,
                 "rssBytes": rss(),
             }),
@@ -528,7 +640,6 @@ fn control(mut s: Stream, shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beacon_engine::build::BuildOptions;
     use beacon_engine::host::{GenResult, GeneratorHost};
 
     struct NoHost;
@@ -550,36 +661,55 @@ mod tests {
         }
     }
 
+    fn test_engine(root: PathBuf) -> Sender<Job> {
+        engine(
+            root,
+            Box::new(|root, o: BuildOptions| Session::new(root, o, Box::new(NoHost), None)),
+        )
+    }
+
+    fn handle(tx: &Sender<Job>, trusted: bool, explicit: bool) -> EngineHandle {
+        EngineHandle {
+            tx: tx.clone(),
+            trusted: Arc::new(AtomicBool::new(trusted)),
+            explicit,
+            grants: vec![Grant::Edit],
+        }
+    }
+
+    fn attach(h: &EngineHandle) {
+        let c = Conn {
+            trusted: h.trusted.clone(),
+            explicit: h.explicit,
+        };
+        h.call(move |st| st.attach(c));
+    }
+
+    fn detach(h: &EngineHandle) {
+        let t = h.trusted.clone();
+        h.call(move |st| st.detach(&t));
+    }
+
     #[test]
     fn watcher_trust_follows_trusted_clients() {
-        let tx = engine(
-            PathBuf::from("/nowhere"),
-            Box::new(|root, trusted| {
-                let o = BuildOptions {
-                    trusted,
-                    ..Default::default()
-                };
-                Session::new(root, o, Box::new(NoHost), None)
-            }),
+        let tx = test_engine(PathBuf::from("/nowhere"));
+        let (a, b, r) = (
+            handle(&tx, true, true),
+            handle(&tx, true, true),
+            handle(&tx, false, false),
         );
-        let h = |trusted| EngineHandle {
-            tx: tx.clone(),
-            trusted,
-            grants: vec![Grant::Edit],
-        };
-        let (a, b, r) = (h(true), h(true), h(false));
         assert!(a.allows(Grant::Edit) && !a.allows(Grant::Deploy));
-        r.call(|st| st.attach(false, true));
+        attach(&r);
         assert!(!r.call(|st| st.watch_trusted()));
-        a.call(|st| st.attach(true, true));
-        b.call(|st| st.attach(true, true));
+        attach(&a);
+        attach(&b);
         a.call(|st| {
             st.session(true);
         });
-        a.call(|st| st.attach(true, false));
+        detach(&a);
         assert!(a.call(|st| st.watch_trusted() && st.sessions[1].is_some()));
         // the last trusted client leaves: restricted again, trusted session dropped
-        b.call(|st| st.attach(true, false));
+        detach(&b);
         assert!(b.call(|st| !st.watch_trusted() && st.sessions[1].is_none()));
         // a panic in a job reaches the caller; the engine thread lives on
         let p = std::panic::catch_unwind(AssertUnwindSafe(|| r.call(|_| panic!("boom"))));
@@ -588,5 +718,104 @@ mod tests {
             r.call(|st| st.root().to_path_buf()),
             PathBuf::from("/nowhere")
         );
+    }
+
+    /// Trust that came from the stored decision is dropped when it no longer matches; the
+    /// shim's `--trust` stays. The decision is checked against a real store (`BEACON_HOME`).
+    #[test]
+    fn stored_trust_is_demoted_explicit_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: only this test touches BEACON_HOME in this crate's unit tests.
+        unsafe { std::env::set_var("BEACON_HOME", dir.path().join("home")) };
+        let cfg = |plugins: &str| {
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!(r#"{{"beacon":{{"plugins":{plugins}}}}}"#),
+            )
+            .unwrap();
+        };
+        cfg("[]");
+        let root = dir.path().canonicalize().unwrap();
+        trust::trust(&root, &plugins(&root)).unwrap();
+        let tx = test_engine(root);
+        let (stored, flag) = (handle(&tx, true, false), handle(&tx, true, true));
+        attach(&stored);
+        attach(&flag);
+        stored.call(|st| st.session(true).root().to_path_buf()); // the trusted session exists
+        // unchanged config: the decision still matches
+        stored.call(|st| st.revalidate_trust());
+        assert!(stored.trusted() && flag.trusted());
+        // `beacon.plugins` changed: the decision key no longer matches
+        cfg(r#"[{"id":"x"}]"#);
+        stored.call(|st| st.revalidate_trust());
+        assert!(!stored.trusted(), "stored trust demoted");
+        assert!(flag.trusted(), "explicit trust kept");
+        assert_eq!(stored.call(|st| st.trusted_clients()), 1);
+        assert!(stored.call(|st| st.sessions[1].is_some()));
+        // the last trusted client is gone: the trusted session goes with it
+        detach(&flag);
+        assert!(stored.call(|st| st.sessions[1].is_none() && !st.watch_trusted()));
+    }
+
+    /// The handshake reply must not wait for the engine thread.
+    #[test]
+    fn hello_reply_precedes_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let run = dir.path().join("run");
+        transport::secure_dir(&run).unwrap();
+        let (mut l, pipe) = Listener::bind(&run, "k").unwrap();
+        let tx = test_engine(root.clone());
+        // block the engine thread (a long trusted check, in real life)
+        let (release, wait) = mpsc::channel::<()>();
+        let (started_tx, started) = mpsc::channel::<()>();
+        let blocker: Job = Box::new(move |_| {
+            let _ = started_tx.send(());
+            let _ = wait.recv();
+        });
+        tx.send(blocker).unwrap();
+        started.recv().unwrap();
+        let shared = Arc::new(Shared {
+            reg: Mutex::new(Reg {
+                clients: 0,
+                closing: false,
+                stop: false,
+                idle_since: None,
+                trust_flags: vec![],
+            }),
+            cv: Condvar::new(),
+            root,
+            started: Instant::now(),
+        });
+        let sh = shared.clone();
+        let t2 = tx.clone();
+        std::thread::spawn(move || {
+            let s = l.accept().unwrap();
+            connection(s, &sh, t2);
+        });
+        let mut c = transport::connect(&pipe).unwrap();
+        let hello = Hello {
+            beacon: PROTOCOL_VERSION,
+            engine: ENGINE_VERSION.into(),
+            channel: Channel::Mcp,
+            trust: true,
+            allow: vec![],
+        };
+        write_line(&mut c, &hello).unwrap();
+        let mut r = c.try_clone().unwrap();
+        let (ltx, lrx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ltx.send(read_line(&mut r));
+        });
+        let line = lrx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reply while the engine thread is busy")
+            .unwrap()
+            .unwrap();
+        assert!(serde_json::from_str::<HelloReply>(&line).unwrap().ok);
+        assert_eq!(shared.reg().clients, 1);
+        drop(release); // engine free again: the attach goes through
+        drop(c);
     }
 }

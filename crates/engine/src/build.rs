@@ -830,6 +830,15 @@ impl Session {
                 add(entry_path.into(), code);
                 if let Some(m) = &b.map {
                     add(format!("{entry_path}.map"), m);
+                    if emit && plan.artifact == Some(Artifact::Dev) {
+                        a.diags.extend(write_debug_mirror(
+                            &self.root,
+                            &plan.target,
+                            o,
+                            entry_path,
+                            m,
+                        ));
+                    }
                 }
                 scripted.insert(o.clone());
             }
@@ -1039,4 +1048,32 @@ fn bundle(
         }
     }
     out
+}
+
+/// Writes the debug mirror of a dev build (`.beacon/debug/<target>/<output>/<entry>.map`, see
+/// `debug.rs`), only when its content changed. A failure is a warning: the build is unaffected.
+fn write_debug_mirror(
+    root: &Path,
+    target: &str,
+    output: &str,
+    entry_path: &str,
+    map: &str,
+) -> Option<Diagnostic> {
+    let run = || -> Result<(), Diagnostic> {
+        let rel = crate::debug::mirror_dir(target, output)?.join(&format!("{entry_path}.map"));
+        let rel = rel.map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{e:?}")))?;
+        let dir = rel.parent().expect("has a folder");
+        let text = crate::debug::rewrite_map(map, root, &dir, entry_path)?;
+        let path = root.join(rel.as_str());
+        if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(path.parent().expect("has a folder"))
+            .and_then(|()| std::fs::write(&path, text))
+            .map_err(|e| Diagnostic::new(Code::EmitFailed, format!("{}: {e}", path.display())))
+    };
+    run().err().map(|mut d| {
+        d.severity = Severity::Warning;
+        d
+    })
 }

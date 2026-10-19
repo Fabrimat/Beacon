@@ -50,6 +50,7 @@ use crate::route::Routed;
 use crate::suffix::is_generator;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Kinds of identifiers. Serialized in `symbols --json` (versioned output, 6.2): new kinds
 /// may be added, existing names never change.
@@ -170,6 +171,8 @@ struct FileSyms {
     editable: bool,
     /// Byte offset of every line start.
     lines: Vec<u32>,
+    /// Holds an editor buffer ([`SymbolTable::overlay`]), not the disk text.
+    overlay: bool,
     /// Sorted by range (`None` first).
     occs: Vec<Occurrence>,
 }
@@ -813,6 +816,11 @@ impl SymbolTable {
 
         let mut old = std::mem::take(&mut self.files);
         for (path, (dest, output)) in want {
+            // an open buffer wins over the disk until `close_overlay`
+            if old.get(&path).is_some_and(|f| f.overlay) {
+                self.files.extend(old.remove_entry(&path));
+                continue;
+            }
             let Ok(hash) = vfs.hash(&path) else { continue };
             let ns = ns_of(output.as_deref());
             let editable = !output.as_deref().is_some_and(is_static);
@@ -842,6 +850,7 @@ impl SymbolTable {
                     ns,
                     editable,
                     lines: line_starts(&text),
+                    overlay: false,
                     occs,
                 },
             );
@@ -1001,14 +1010,56 @@ impl SymbolTable {
     }
 
     /// Re-scans one file from unsaved editor text (LSP overlay); does not touch disk state.
-    /// The next [`SymbolTable::update`] rescans it from disk. Files the table does not know
-    /// are ignored.
+    /// Files the table does not know are ignored.
+    ///
+    /// Lifecycle: the overlay persists across [`SymbolTable::update`] (watcher re-checks,
+    /// builds) until [`SymbolTable::close_overlay`]; calling `overlay` again replaces the
+    /// buffer text. An overlaid file that leaves the routing (deleted, moved out of a
+    /// module) drops out like any other file.
     pub fn overlay(&mut self, path: &RelPath, text: &str) {
         if let Some(f) = self.files.get_mut(path) {
             f.occs = resolve(scan(path, f.dest.as_ref(), text), &f.ns);
             f.lines = line_starts(text);
             f.hash = [0; 32];
+            f.overlay = true;
         }
+    }
+
+    /// Ends the overlay of `path` (the editor closed the buffer): the next
+    /// [`SymbolTable::update`] rescans the file from disk.
+    pub fn close_overlay(&mut self, path: &RelPath) {
+        if let Some(f) = self.files.get_mut(path) {
+            f.overlay = false;
+            f.hash = [0; 32];
+        }
+    }
+
+    /// Whether `path` currently holds an editor buffer.
+    pub fn has_overlay(&self, path: &RelPath) -> bool {
+        self.files.get(path).is_some_and(|f| f.overlay)
+    }
+
+    /// Byte offset of every line start of `path` as the table sees it (the buffer when
+    /// overlaid), for byte <-> LSP position conversion.
+    pub fn line_starts(&self, path: &RelPath) -> Option<&[u32]> {
+        self.files.get(path).map(|f| f.lines.as_slice())
+    }
+
+    /// Text a fix range must still cover: the occurrence at exactly `[start, end)` (its name,
+    /// or the part after the namespace for template heads).
+    fn expected(&self, path: &RelPath, start: usize, end: usize) -> Option<&str> {
+        let f = self.files.get(path)?;
+        let generated = self.generated.get(path).into_iter().flatten();
+        let o = f
+            .occs
+            .iter()
+            .chain(generated)
+            .find(|o| o.range == Some(ByteRange { start, end }))?;
+        Some(if o.local {
+            o.name.split_once(':').map_or("", |(_, n)| n)
+        } else {
+            &o.name
+        })
     }
 
     fn loc<'a>(&'a self, p: &'a RelPath, o: &'a Occurrence) -> Loc<'a> {
@@ -1272,6 +1323,112 @@ pub fn rename(
         ));
     }
     Ok(fixes)
+}
+
+/// One file's verified edit: the text it had when planned, the text after, and its fixes
+/// (sorted by start).
+#[derive(Debug, Clone)]
+pub struct FileEdit {
+    pub path: RelPath,
+    pub old: Vec<u8>,
+    pub new: String,
+    pub fixes: Vec<Fix>,
+}
+
+/// Dry run of [`apply`]: reads every touched file under `root` and checks that each fix range
+/// still holds the text `table` saw there (a stale table is `RenameBlocked`); nothing is
+/// written. Returns the edits grouped per file, ordered by path.
+pub fn plan(root: &Path, table: &SymbolTable, fixes: &[Fix]) -> Result<Vec<FileEdit>, Diagnostic> {
+    let blocked = |m: String| Diagnostic::new(Code::RenameBlocked, m);
+    let mut sorted = fixes.to_vec();
+    sorted.sort_by(|a, b| (&a.path, a.start, a.end).cmp(&(&b.path, b.start, b.end)));
+    let mut out = Vec::new();
+    for group in sorted.chunk_by(|a, b| a.path == b.path) {
+        let rel = &group[0].path;
+        let old = std::fs::read(root.join(rel.as_str()))
+            .map_err(|e| blocked(format!("cannot read {rel}: {e}")))?;
+        let mut new = String::from_utf8(old.clone())
+            .map_err(|_| blocked(format!("{rel} is not UTF-8 text")))?;
+        for f in group.iter().rev() {
+            let want = table.expected(rel, f.start, f.end);
+            if want.is_none() || new.get(f.start..f.end) != want {
+                return Err(blocked(format!(
+                    "{rel} changed since it was scanned (expected {:?} at byte {}); run again",
+                    want.unwrap_or("a known symbol"),
+                    f.start
+                )));
+            }
+            new.replace_range(f.start..f.end, &f.replacement);
+        }
+        out.push(FileEdit {
+            path: rel.clone(),
+            old,
+            new,
+            fixes: group.to_vec(),
+        });
+    }
+    Ok(out)
+}
+
+/// Writes every planned file or none: all temp files first (keeping each file's permissions),
+/// then renames; a failed rename restores the files already replaced. A restore that fails is
+/// reported in the message (those files hold the new text), never ignored.
+pub fn write_plan(root: &Path, files: &[FileEdit]) -> Result<(), Diagnostic> {
+    let fail = |m: String| Diagnostic::new(Code::Internal, m);
+    let abs = |f: &FileEdit| root.join(f.path.as_str());
+    let tmp = |f: &FileEdit| {
+        let mut t = abs(f).into_os_string();
+        t.push(format!(".{}.rename.tmp", std::process::id()));
+        PathBuf::from(t)
+    };
+    for (i, f) in files.iter().enumerate() {
+        let t = tmp(f);
+        let w = std::fs::write(&t, &f.new)
+            .and_then(|()| std::fs::set_permissions(&t, std::fs::metadata(abs(f))?.permissions()));
+        if let Err(e) = w {
+            for g in &files[..=i] {
+                let _ = std::fs::remove_file(tmp(g));
+            }
+            return Err(fail(format!(
+                "cannot write {}: {e}; nothing was renamed",
+                f.path
+            )));
+        }
+    }
+    for (i, f) in files.iter().enumerate() {
+        if let Err(e) = std::fs::rename(tmp(f), abs(f)) {
+            let stuck: Vec<String> = files[..i]
+                .iter()
+                .filter_map(|g| {
+                    std::fs::write(abs(g), &g.old)
+                        .err()
+                        .map(|e| format!("{} ({e})", g.path))
+                })
+                .collect();
+            for g in &files[i..] {
+                let _ = std::fs::remove_file(tmp(g));
+            }
+            let tail = if stuck.is_empty() {
+                "nothing was renamed".to_owned()
+            } else {
+                format!(
+                    "restoring failed for {}: those files keep the new text",
+                    stuck.join(", ")
+                )
+            };
+            return Err(fail(format!("cannot replace {}: {e}; {tail}", f.path)));
+        }
+    }
+    Ok(())
+}
+
+/// Applies `fixes` (from [`rename`]) to the files under `root`, all or none: [`plan`] (every
+/// range verified against the on-disk text), then [`write_plan`]. Returns the files written,
+/// by path. The shared writer of `beacon rename` and MCP `rename_symbol`.
+pub fn apply(root: &Path, table: &SymbolTable, fixes: &[Fix]) -> Result<Vec<RelPath>, Diagnostic> {
+    let files = plan(root, table, fixes)?;
+    write_plan(root, &files)?;
+    Ok(files.into_iter().map(|f| f.path).collect())
 }
 
 #[cfg(test)]

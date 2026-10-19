@@ -17,19 +17,22 @@
 //!   `listen` mode).
 //!
 //! The bundle's own map is unusable for this (measured: esbuild writes `sources` relative to
-//! its temp outdir, or as `file:///D:/...` across drives). Dev-like builds therefore also
-//! write a **debug mirror** inside the project, `.beacon/debug/<target>/<output>/`, holding
-//! `<entry path below scripts/>.map` with `sources` relative to that folder (+ `sourcesContent`),
-//! so `${workspaceFolder}`-relative roots resolve with the editor's own path spelling.
+//! its outdir, or as `file:///D:/...` across drives). The bundler now runs esbuild inside
+//! `<project>/.beacon/tmp` and reports `sources` relative to the project root; dev-like builds
+//! also write a **debug mirror** inside the project, `.beacon/debug/<target>/<output>/<entry>.map`
+//! (`<entry>` is the BP-relative script path, `scripts/main.js`, which is how the game names
+//! the script), with `sources` relative to the map's folder (+ `sourcesContent`), so the roots
+//! resolve with the editor's own path spelling, on any drive.
 //! `targetModuleUuid` is the dev script module UUID (per worktree, 4.2), so committed
 //! `launch.json` entries carry only `beaconOutput` / `beaconTarget`; the VS Code extension
 //! fills in the rest at launch (a debug configuration provider for `minecraft-js`), and
 //! `beacon debug-config --json` prints the resolved configuration for other editors.
 
-use crate::config::ProjectConfig;
-use crate::diag::Diagnostic;
-use crate::lock::Lockfile;
+use crate::config::{Artifact, ProjectConfig};
+use crate::diag::{Code, Diagnostic};
+use crate::lock::{Lockfile, dev_uuid};
 use crate::path::RelPath;
+use serde_json::Value;
 use std::path::Path;
 
 /// Default port of the game's script debugger.
@@ -64,26 +67,80 @@ pub struct LaunchConfig {
 
 /// Debug mirror folder of one output of one dev-like target: `.beacon/debug/<target>/<output>`.
 pub fn mirror_dir(target: &str, output: &str) -> Result<RelPath, Diagnostic> {
-    let _ = (target, output);
-    todo!("phase 4 wave 1: debug interop")
+    RelPath::parse(&format!(".beacon/debug/{target}/{output}")).map_err(|e| {
+        Diagnostic::new(
+            Code::LaunchConfigStale,
+            format!("target {target:?} / output {output:?} is not a usable folder name: {e:?}"),
+        )
+    })
 }
 
-/// Rewrites a bundle map for the mirror: every source made relative to `mirror` (project
-/// relative), `file` set to the entry's file name, `sourcesContent` kept. Accepts esbuild's
-/// relative, absolute and `file://` forms; a source outside the project stays absolute.
+/// Rewrites a bundle map for the mirror: every source relative to `mirror` (the project-relative
+/// folder the map is written in), `file` set to `entry_file`, `sourcesContent` kept. Accepts the
+/// bundler's project-relative form and absolute / `file://` forms under the project; any other
+/// source is left as is. A map that is not a JSON object is an error.
 pub fn rewrite_map(
     map: &str,
     project_root: &Path,
     mirror: &RelPath,
     entry_file: &str,
 ) -> Result<String, Diagnostic> {
-    let _ = (map, project_root, mirror, entry_file);
-    todo!("phase 4 wave 1: debug interop")
+    let bad = |m: String| Diagnostic::new(Code::EmitFailed, format!("debug mirror: {m}"));
+    let mut v: Value =
+        serde_json::from_str(map).map_err(|e| bad(format!("bad source map: {e}")))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| bad("source map is not an object".into()))?;
+    let up = "../".repeat(mirror.as_str().split('/').count());
+    let root = project_root.to_string_lossy().replace(BS, "/");
+    let root = root.trim_start_matches("//?/").trim_end_matches('/');
+    for s in obj
+        .get_mut("sources")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(src) = s.as_str() else { continue };
+        let src = src.strip_prefix("file:///").unwrap_or(src).replace(BS, "/");
+        let under = src
+            .get(..root.len())
+            .filter(|p| p.eq_ignore_ascii_case(root) && src[root.len()..].starts_with('/'))
+            .map(|_| &src[root.len() + 1..]);
+        let rel = match under {
+            Some(r) => Some(r),
+            // not absolute (`/x`, `C:/x`) and not a URL: project relative
+            None if !src.starts_with('/') && !src.contains(':') => Some(src.as_str()),
+            None => None,
+        };
+        if let Some(r) = rel {
+            *s = Value::String(format!("{up}{}", r.trim_start_matches("./")));
+        }
+    }
+    obj.insert("file".into(), Value::String(entry_file.into()));
+    serde_json::to_string(&v).map_err(|e| bad(e.to_string()))
+}
+
+impl LaunchConfig {
+    /// Replaces the `${workspaceFolder}` prefix of the roots with the project's absolute path
+    /// (`/`-separated), for editors without that variable.
+    pub fn absolutize(&mut self, root: &Path) {
+        let abs = dunce::canonicalize(root).unwrap_or_else(|_| root.into());
+        let abs = abs.to_string_lossy().replace(BS, "/");
+        for r in [
+            &mut self.local_root,
+            &mut self.source_map_root,
+            &mut self.generated_source_root,
+        ] {
+            *r = r.replace("${workspaceFolder}", &abs);
+        }
+    }
 }
 
 /// The configuration for (`target`, `output`): roots as `${workspaceFolder}/...`, the dev
 /// script module UUID of this worktree. `LaunchConfigStale` for an unknown target/output
-/// or an output without scripts.
+/// or a target that is not a dev build.
+// ponytail: "output without scripts" is not checked here (the routing is the build's); a
+// scriptless output simply has an empty mirror. Check it if the editor needs the warning.
 pub fn launch_config(
     root: &Path,
     cfg: &ProjectConfig,
@@ -92,6 +149,32 @@ pub fn launch_config(
     output: &str,
     mode: Mode,
 ) -> Result<LaunchConfig, Diagnostic> {
-    let _ = (root, cfg, lock, target, output, mode);
-    todo!("phase 4 wave 1: debug interop")
+    let stale = |m: String| Diagnostic::new(Code::LaunchConfigStale, m);
+    match cfg.beacon.targets.get(target) {
+        Some(t) if t.artifact == Artifact::Dev => {}
+        Some(_) => return Err(stale(format!("target {target:?} is not a dev target"))),
+        None => return Err(stale(format!("unknown target {target:?}"))),
+    }
+    let release = lock.script_module_uuid(output).ok_or_else(|| {
+        stale(format!(
+            "unknown output {output:?} (or no lockfile entry yet)"
+        ))
+    })?;
+    let mirror = format!(
+        "${{workspaceFolder}}/{}",
+        mirror_dir(target, output)?.as_str()
+    );
+    Ok(LaunchConfig {
+        kind: "minecraft-js",
+        request: "attach",
+        name: format!("Beacon: {target}/{output}"),
+        mode,
+        host: (mode == Mode::Connect).then(|| "127.0.0.1".to_owned()),
+        port: DEFAULT_PORT,
+        local_root: mirror.clone(),
+        source_map_root: mirror.clone(),
+        generated_source_root: mirror,
+        target_module_uuid: dev_uuid(&release, root),
+    })
 }
+const BS: char = '\u{5c}';

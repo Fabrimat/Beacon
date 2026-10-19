@@ -224,7 +224,14 @@ impl Esbuild {
                 return res;
             }
         };
-        let tmp = match tempfile::tempdir() {
+        // Inside the project (`.beacon` is never indexed or watched): esbuild writes the map's
+        // `sources` relative to the outdir, which is then on the project's own drive (a system
+        // TEMP on another drive gives `file:///D:/...`, which no debugger resolves).
+        let scratch = req.root.join(".beacon").join("tmp");
+        let tmp = match std::fs::create_dir_all(&scratch)
+            .and_then(|()| tempfile::tempdir_in(&scratch))
+            .or_else(|_| tempfile::tempdir())
+        {
             Ok(t) => t,
             Err(e) => {
                 fail(&mut res, format!("cannot create temp dir: {e}"));
@@ -292,7 +299,9 @@ impl Esbuild {
             fail(&mut res, "esbuild produced no output".into());
         }
         if req.sourcemap {
-            res.map = std::fs::read_to_string(&map).ok();
+            res.map = std::fs::read_to_string(&map)
+                .ok()
+                .map(|m| root_relative_sources(&m, tmp.path(), req.root));
         }
         if let Some(v) = std::fs::read_to_string(&meta)
             .ok()
@@ -319,6 +328,36 @@ impl Esbuild {
         }
         res
     }
+}
+
+/// Rewrites a map's `sources` (esbuild: relative to the outdir `out`) to be relative to the
+/// project `root`, `/`-separated, so the engine can place the map anywhere in the project.
+/// A source that is not under `root` (or a map that does not parse) is left as is.
+fn root_relative_sources(map: &str, out: &Path, root: &Path) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(map) else {
+        return map.to_owned();
+    };
+    for s in v["sources"].as_array_mut().into_iter().flatten() {
+        let Some(src) = s.as_str() else { continue };
+        let p = Path::new(src);
+        if src.starts_with("file:") || p.is_absolute() {
+            continue;
+        }
+        let mut abs = PathBuf::new();
+        for c in out.join(p).components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    abs.pop();
+                }
+                c => abs.push(c),
+            }
+        }
+        if let Ok(rel) = abs.strip_prefix(root) {
+            let rel: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+            *s = Value::String(rel.join("/"));
+        }
+    }
+    v.to_string()
 }
 
 /// The target's `define` as compile-time constants: `--define:beacon.define.<K>=<json>`.

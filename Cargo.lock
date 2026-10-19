@@ -223,6 +223,7 @@ version = "0.0.0"
 dependencies = [
  "beacon-engine",
  "blake3",
+ "crossbeam-channel",
  "dirs",
  "getrandom 0.4.3",
  "libc",

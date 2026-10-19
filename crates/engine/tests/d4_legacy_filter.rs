@@ -73,17 +73,21 @@ fn env_is_scrubbed() {
         serde_json::from_str(&out(p.path(), "BP/env.json").unwrap()).unwrap();
     let allow = beacon_engine::legacy_filter::ENV_ALLOW;
     for k in v["env"].as_array().unwrap() {
-        // Windows adds nothing else to a cleared env; accept only the allowlist (plus LC_CTYPE,
-        // which Python itself sets on Unix when it coerces the C locale, PEP 538)
-        if k == "LC_CTYPE" {
-            continue;
-        }
+        let k = k.as_str().unwrap();
+        // cargo test always sets CARGO_* in this (parent) process: none may reach the filter
         assert!(
-            allow
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(k.as_str().unwrap())),
+            !k.starts_with("CARGO") && !k.starts_with("RUST"),
             "leaked {k}"
         );
+        // Windows adds nothing else to a cleared env; Unix (macOS) injects its own
+        // (LC_CTYPE from Python's C-locale coercion, __CF_USER_TEXT_ENCODING), so the exact
+        // allowlist is only checked on Windows
+        if cfg!(windows) {
+            assert!(
+                allow.iter().any(|a| a.eq_ignore_ascii_case(k)),
+                "leaked {k}"
+            );
+        }
     }
     assert_eq!(v["arg"], r#"{"k":"v"}"#);
     assert!(v["cwd"].as_str().unwrap().contains("beacon-lf-"));

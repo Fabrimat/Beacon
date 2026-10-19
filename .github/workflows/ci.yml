@@ -177,10 +177,20 @@ jobs:
           --accept-eula --yes
           --log bds-smoke.log
 
+      # Script debugger interop (6.6): BDS listens on 19144 and the game speaks first.
+      - name: BDS debug-listen smoke
+        timeout-minutes: 5
+        run: >-
+          cargo bds debug-listen
+          --world smoke-out/beacon-multipack-world.mcworld
+          --accept-eula --yes
+          --log bds-debug-listen.log
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bds-smoke-log
           path: |
             bds-smoke.log
+            bds-debug-listen.log
             .beacon-home/tools/bds-eula.log

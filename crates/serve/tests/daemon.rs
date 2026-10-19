@@ -40,17 +40,7 @@ fn daemon_main(project: &Path) -> i32 {
     let opts = daemon::DaemonOptions::new(project).expect("run dir");
     daemon::run(
         &opts,
-        Box::new(|root, trusted| {
-            let o = BuildOptions {
-                target: None,
-                all: false,
-                out: None,
-                frozen: false,
-                trusted,
-                release: None,
-            };
-            Session::new(root, o, Box::new(NoHost), None)
-        }),
+        Box::new(|root, o: BuildOptions| Session::new(root, o, Box::new(NoHost), None)),
     )
 }
 
@@ -96,6 +86,10 @@ fn main() {
         (
             "two_shims_meet_the_same_daemon",
             two_shims_meet_the_same_daemon,
+        ),
+        (
+            "stored_trust_is_demoted_when_plugins_change",
+            stored_trust_is_demoted_when_plugins_change,
         ),
         #[cfg(windows)]
         ("pipe_dacl_is_owner_only", pipe_dacl_is_owner_only),
@@ -491,6 +485,46 @@ fn two_shims_meet_the_same_daemon() {
     assert_eq!(a.close(), 0);
     assert_eq!(b.close(), 0);
     fx.wait_daemon_gone();
+}
+
+/// A connection trusted by the stored decision loses trust when `beacon.plugins` changes (the
+/// watcher sees `config.json`); one trusted by the shim's `--trust` keeps it.
+fn stored_trust_is_demoted_when_plugins_change() {
+    let fx = Fx::new();
+    let cfg = |plugins: &str| {
+        std::fs::write(
+            fx.p().join("config.json"),
+            format!(r#"{{"beacon":{{"plugins":{plugins}}}}}"#),
+        )
+        .unwrap();
+    };
+    cfg("[]");
+    // the daemon reads the store under the fixture's BEACON_HOME
+    // SAFETY: tests run one after the other on the main thread; children get their own env.
+    unsafe { std::env::set_var("BEACON_HOME", fx.home.path()) };
+    let root = discovery::canonical_root(fx.p());
+    beacon_engine::trust::trust(&root, &[]).unwrap();
+    let mut d = fx.daemon(60);
+    wait_until("discovery", || fx.discovery().is_some());
+    let trusted = |n: u64| {
+        wait_until("trusted clients", || {
+            fx.control(ControlRequest::Status).unwrap()["trustedClients"] == n
+        })
+    };
+    let (_stored, r) = fx.hello(&good_hello(Channel::Lsp));
+    assert!(r.ok);
+    let mut flag = good_hello(Channel::Mcp);
+    flag.trust = true;
+    let (_explicit, r) = fx.hello(&flag);
+    assert!(r.ok);
+    trusted(2);
+    cfg(r#"[{"id":"changed"}]"#);
+    trusted(1);
+    drop(_explicit);
+    trusted(0);
+    drop(_stored);
+    stop(&fx);
+    assert_eq!(wait_exit(&mut d), 0);
 }
 
 #[cfg(windows)]

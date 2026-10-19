@@ -132,6 +132,8 @@ fn help_json_lists_every_command() {
             "init",
             "fix",
             "mcp",
+            "serve",
+            "debug-config",
             "migrate",
             "add",
             "rename-output",

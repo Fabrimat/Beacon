@@ -36,10 +36,15 @@ const LINUX: Pinned = Pinned {
 };
 
 /// Console lines that are expected on a healthy run; each entry says why.
-const BENIGN: &[(&str, &str)] = &[];
+const BENIGN: &[(&str, &str)] = &[(
+    "Debugger connection failed",
+    "debug-listen: the probe disconnects after the first message and auto-attach logs it",
+)];
 
 /// Time to let behavior-pack scripts log after `Server started.` before sending `stop`.
 const SETTLE: Duration = Duration::from_secs(5);
+/// The game's script debugger port (what `beacon debug-config` prints).
+const DEBUG_PORT: u16 = 19144;
 const MAX_UNZIPPED: u64 = 2 << 30; // BDS is ~0.4 GB unzipped; guards against a zip bomb
 
 #[derive(Parser)]
@@ -75,18 +80,42 @@ enum Cmd {
         #[arg(long, default_value = "bds-smoke.log")]
         log: PathBuf,
     },
+    /// Run a .mcworld on BDS with the script debugger listening on 19144 (6.6) and check that a
+    /// TCP client reaches it and the game speaks first. Same trust rules as `smoke`.
+    DebugListen {
+        #[arg(long, value_name = "path.mcworld")]
+        world: PathBuf,
+        /// Whole-run limit in seconds (download excluded).
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        #[arg(long)]
+        accept_eula: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, default_value = "bds-debug-listen.log")]
+        log: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
-    let Cmd::Smoke {
-        world,
-        expect,
-        timeout,
-        accept_eula,
-        yes,
-        log,
-    } = Cli::parse().cmd;
-    let code = match smoke(&world, &expect, timeout, accept_eula, yes, &log) {
+    let (world, expect, timeout, accept_eula, yes, log, debug) = match Cli::parse().cmd {
+        Cmd::Smoke {
+            world,
+            expect,
+            timeout,
+            accept_eula,
+            yes,
+            log,
+        } => (world, expect, timeout, accept_eula, yes, log, false),
+        Cmd::DebugListen {
+            world,
+            timeout,
+            accept_eula,
+            yes,
+            log,
+        } => (world, vec![], timeout, accept_eula, yes, log, true),
+    };
+    let code = match smoke(&world, &expect, timeout, accept_eula, yes, &log, debug) {
         Ok(true) => 0,
         Ok(false) => 1,
         Err(e) => {
@@ -184,9 +213,17 @@ fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// `server.properties` for a smoke run (BDS ignores unknown keys, so extras are harmless).
-fn server_properties(port: u16) -> String {
+fn server_properties(port: u16, debug: bool) -> String {
+    let dbg = if debug {
+        // wait long at world load: the probe must reach the listener before the game moves on
+        format!(
+            "allow-inbound-script-debugging=true\nforce-inbound-debug-port={DEBUG_PORT}\nscript-debugger-auto-attach=listen\nscript-debugger-auto-attach-timeout=120\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "level-name=smoke\nallow-list=true\nmax-players=1\nonline-mode=true\n\
+        "{dbg}level-name=smoke\nallow-list=true\nmax-players=1\nonline-mode=true\n\
          server-port={port}\nserver-portv6={}\nenable-lan-visibility=false\n\
          transport=nethernet\ncontent-log-file-enabled=true\n",
         port.wrapping_add(1)
@@ -229,6 +266,29 @@ fn scan(lines: &[String], expect: &[(String, usize)]) -> Vec<String> {
     bad
 }
 
+/// One connection attempt to the debugger listener: `None` = nobody listening yet, `Some(Ok)` =
+/// the game's first bytes (the debugger protocol is length-prefixed JSON; any first message
+/// proves the listener is up).
+fn try_probe() -> Option<Result<Vec<u8>, String>> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], DEBUG_PORT));
+    let mut c = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut buf = [0u8; 4096];
+    Some(match c.read(&mut buf) {
+        Ok(0) => Err("closed without a message".into()),
+        // observed: 8 hex digits (length), newline, then {"type":"event","event":{"plugins":[..]}}
+        Ok(n) if buf[..n].windows(14).any(|w| w == b"\"type\":\"event\"") => Ok(buf[..n].to_vec()),
+        Ok(n) => Err(format!("unexpected first message: {}", preview(&buf[..n]))),
+        Err(e) => Err(format!("no first message in 10s ({e})")),
+    })
+}
+
+fn preview(b: &[u8]) -> String {
+    String::from_utf8_lossy(&b[..b.len().min(200)])
+        .escape_debug()
+        .to_string()
+}
+
 fn parse_expect(s: &str) -> Result<(String, usize), String> {
     let (m, n) = s
         .rsplit_once(':')
@@ -247,6 +307,7 @@ fn smoke(
     accept: bool,
     yes: bool,
     log: &Path,
+    debug: bool,
 ) -> Result<bool, String> {
     let expect: Vec<_> = expect
         .iter()
@@ -296,7 +357,7 @@ fn smoke(
     extract_zip(world, &w).map_err(|e| format!("{}: {e}", world.display()))?;
     std::fs::write(
         srv.join("server.properties"),
-        server_properties(free_port()),
+        server_properties(free_port(), debug),
     )
     .map_err(|e| e.to_string())?;
     std::fs::write(srv.join("allowlist.json"), "[]").map_err(|e| e.to_string())?;
@@ -336,6 +397,9 @@ fn smoke(
     }
     drop(tx);
     let mut stdin = child.0.stdin.take();
+    // debug mode: connect to the listener as soon as it is up; its first bytes are the proof
+    let mut probe: Option<Result<Vec<u8>, String>> = None;
+    let mut last_try = Instant::now() - Duration::from_secs(1);
 
     let (start, limit) = (Instant::now(), Duration::from_secs(timeout));
     let mut lines = Vec::new();
@@ -356,7 +420,14 @@ fn smoke(
             Err(mpsc::RecvTimeoutError::Disconnected) => break, // server exited
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if !stopped && started.is_some_and(|t| t.elapsed() >= SETTLE) {
+        if debug && probe.is_none() && last_try.elapsed() >= Duration::from_millis(500) {
+            last_try = Instant::now();
+            probe = try_probe();
+            if probe.is_some() {
+                started.get_or_insert_with(Instant::now);
+            }
+        }
+        if !stopped && (started.is_some_and(|t| t.elapsed() >= SETTLE) || probe.is_some()) {
             stopped = true;
             if let Some(mut s) = stdin.take() {
                 let _ = writeln!(s, "stop");
@@ -370,6 +441,12 @@ fn smoke(
             "timeout after {timeout}s (started: {})",
             started.is_some()
         ));
+    } else if debug {
+        match &probe {
+            Some(Ok(b)) => println!("debugger first message: {} bytes: {}", b.len(), preview(b)),
+            Some(Err(e)) => bad.push(format!("debugger on {DEBUG_PORT} connected but: {e}")),
+            None => bad.push(format!("nothing listened on 127.0.0.1:{DEBUG_PORT}")),
+        }
     } else if started.is_none() {
         bad.push("server exited before `Server started.`".into());
     }
@@ -407,7 +484,15 @@ mod tests {
             tempfile::NamedTempFile::new().unwrap(),
         );
         // no consent: exits before touching the tools dir or the network
-        let r = smoke(w.path(), &[], 1, false, false, &d.path().join("l.log"));
+        let r = smoke(
+            w.path(),
+            &[],
+            1,
+            false,
+            false,
+            &d.path().join("l.log"),
+            false,
+        );
         if std::env::var("BEACON_BDS_EULA").as_deref() != Ok("accept") {
             assert!(r.unwrap_err().contains("EULA"));
         }
@@ -467,7 +552,17 @@ mod tests {
 
     #[test]
     fn properties_as_specified() {
-        let s = server_properties(40000);
+        let s = server_properties(40000, false);
+        assert!(!s.contains("debug"));
+        let d = server_properties(40000, true);
+        for k in [
+            "allow-inbound-script-debugging=true",
+            "force-inbound-debug-port=19144",
+            "script-debugger-auto-attach=listen",
+            "script-debugger-auto-attach-timeout=120",
+        ] {
+            assert!(d.lines().any(|l| l == k), "{k}");
+        }
         for k in [
             "level-name=smoke",
             "allow-list=true",

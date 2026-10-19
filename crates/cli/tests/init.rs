@@ -76,8 +76,10 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     (home, ws, dir)
 }
 
-const EXPECTED: [&str; 10] = [
+const EXPECTED: [&str; 12] = [
     ".gitignore",
+    ".vscode/extensions.json",
+    ".vscode/launch.json",
     "AGENTS.md",
     "CLAUDE.md",
     "beacon.lock.json",

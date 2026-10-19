@@ -156,7 +156,7 @@ pub struct HelloError {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub enum ControlRequest {
-    /// Reply: `{"pid", "engine", "protocol", "clients", "uptimeMs", "rssBytes"}`.
+    /// Reply: `{"pid", "engine", "protocol", "clients", "trustedClients", "uptimeMs", "rssBytes"}`.
     Status,
     /// Stops the daemon if no other client is attached (or `force`).
     Stop {

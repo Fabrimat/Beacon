@@ -3,13 +3,14 @@
 //! the esbuild bundler.
 
 mod add;
+mod debug;
 mod fix;
 mod hook;
 mod init;
-mod mcp;
 mod migrate;
 mod pack;
 mod rename;
+mod serve;
 mod symbols;
 mod watch;
 
@@ -92,12 +93,12 @@ enum Cmd {
     Init(init::InitArgs),
     /// Apply safe fixes (e.g. regenerate the AGENTS.md section).
     Fix,
-    /// Read-only MCP server on stdio (check, project_info, explain).
-    Mcp {
-        /// Treat the project as trusted for this server's lifetime (operator-chosen; clients cannot set it).
-        #[arg(long)]
-        trust: bool,
-    },
+    /// MCP server on stdio: alias of `serve --stdio --mcp` (read tools; write tools need `--allow`).
+    Mcp(serve::McpArgs),
+    /// The per-project daemon (LSP + MCP), its stdio shim and control (`--stdio`, `--status`, `--stop`).
+    Serve(serve::ServeArgs),
+    /// Print the resolved minecraft-js debug configuration of a dev target and output.
+    DebugConfig(debug::DebugArgs),
     /// Convert a Regolith project (ModularMC, system_template) into a Beacon project, once.
     Migrate(migrate::MigrateArgs),
     /// Add an entity, item, block, or module from the convention templates.
@@ -382,7 +383,9 @@ fn main() {
         Cmd::Pack(a) => pack::run(&o, &a),
         Cmd::Init(a) => init::run(&o, a),
         Cmd::Fix => fix::run(&o),
-        Cmd::Mcp { trust } => mcp::run(&o, trust),
+        Cmd::Mcp(a) => serve::mcp(&o, &a),
+        Cmd::Serve(a) => serve::run(&o, &a),
+        Cmd::DebugConfig(a) => debug::run(&o, &a),
         Cmd::Migrate(a) => migrate::run(&o, &a),
         Cmd::Add {
             kind,

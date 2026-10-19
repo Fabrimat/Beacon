@@ -669,3 +669,61 @@ fn session_check_fills_the_table_with_generator_definitions_when_trusted() {
         assert!(s.symbols_mut().is_some());
     }
 }
+
+// ------------------------------------------------------------------ overlays and apply
+
+#[test]
+fn overlay_persists_across_update_until_closed() {
+    let p = tmp_project(&[
+        ("src/a/entities/x.entity.json", ENTITY),
+        ("src/a/functions/f.mcfunction", "summon demo:x\n"),
+    ]);
+    let f = rp("src/a/functions/f.mcfunction");
+    let (cfg, r, idx) = load(p.path());
+    let (mut t, _) = SymbolTable::build(&cfg, &r, &[], &idx, false);
+    t.overlay(&f, "summon demo:x\nsummon demo:x\n");
+    assert!(t.has_overlay(&f));
+    // a watcher-style update rescans changed files, never an open buffer
+    std::fs::write(p.path().join("src/a/functions/f.mcfunction"), "# empty\n").unwrap();
+    let (cfg, r, idx) = load(p.path());
+    t.update(&cfg, &r, &[], &idx);
+    assert_eq!(t.references(SymbolKind::Entity, "demo:x").len(), 2);
+    t.close_overlay(&f);
+    assert!(!t.has_overlay(&f));
+    t.update(&cfg, &r, &[], &idx);
+    assert_eq!(t.references(SymbolKind::Entity, "demo:x").len(), 0);
+}
+
+#[test]
+fn apply_writes_all_or_nothing_and_refuses_a_stale_table() {
+    let p = tmp_project(&[
+        ("src/a/entities/x.entity.json", ENTITY),
+        ("src/a/functions/f.mcfunction", "summon demo:x\n"),
+    ]);
+    let (t, _) = table_with(p.path(), &[]);
+    let fixes = symbols::rename(&t, None, "demo:x", "demo:y").unwrap();
+    // the file moved under the table: refused, nothing written (not even the first file)
+    let f = p.path().join("src/a/functions/f.mcfunction");
+    std::fs::write(&f, "summon  demo:x\n").unwrap();
+    let e = symbols::apply(p.path(), &t, &fixes).unwrap_err();
+    assert_eq!(e.code, Code::RenameBlocked);
+    assert!(e.message.contains("changed since"), "{}", e.message);
+    assert!(
+        std::fs::read_to_string(p.path().join("src/a/entities/x.entity.json"))
+            .unwrap()
+            .contains("demo:x")
+    );
+    std::fs::write(&f, "summon demo:x\n").unwrap();
+    let plan = symbols::plan(p.path(), &t, &fixes).unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "summon demo:x\n"); // dry run
+    let done = symbols::apply(p.path(), &t, &fixes).unwrap();
+    assert_eq!(done.len(), 2);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "summon demo:y\n");
+    // no temp files left
+    let left: Vec<_> = std::fs::read_dir(f.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+}

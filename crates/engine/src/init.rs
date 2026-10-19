@@ -246,6 +246,32 @@ fn config_json(p: &Plan) -> String {
     serde_json::to_string_pretty(&v).expect("json") + "\n"
 }
 
+/// `.vscode/launch.json`: one attach entry per dev target, carrying only what Beacon needs to
+/// resolve the rest (the VS Code extension, or `beacon debug-config`). `None` without a dev target.
+fn launch_json(p: &Plan) -> Option<String> {
+    if !p.artifacts.contains(&Artifact::Dev) {
+        return None;
+    }
+    let configs: Vec<Value> = p
+        .editions
+        .iter()
+        .map(|ed| match ed {
+            Edition::Bedrock => "dev".to_string(),
+            Edition::Education => "dev-edu".to_string(),
+        })
+        .map(|t| {
+            json!({ "type": "minecraft-js", "request": "attach", "name": format!("Beacon: {t}"),
+                    "beaconOutput": "main", "beaconTarget": t })
+        })
+        .collect();
+    let v = json!({ "version": "0.2.0", "configurations": configs });
+    Some(
+        serde_json::to_string_pretty(&v).expect("json")
+            + "
+",
+    )
+}
+
 /// Writes the project into `dir` (created if needed). Refuses a non-empty directory before
 /// writing anything. Records trust last, so a half-created project is never trusted.
 pub fn scaffold(dir: &Path, p: &Plan) -> Result<Created, Vec<Diagnostic>> {
@@ -269,6 +295,19 @@ pub fn scaffold(dir: &Path, p: &Plan) -> Result<Created, Vec<Diagnostic>> {
         (CONFIG_FILE.into(), config_json(p).into_bytes()),
         (".gitignore".into(), GITIGNORE.into()),
     ];
+    files.push((
+        ".vscode/extensions.json".into(),
+        (serde_json::to_string_pretty(
+            &json!({ "recommendations": ["mojang-studios.minecraft-debugger"] }),
+        )
+        .expect("json")
+            + "
+")
+        .into_bytes(),
+    ));
+    if let Some(l) = launch_json(p) {
+        files.push((".vscode/launch.json".into(), l.into_bytes()));
+    }
     for (rel, bytes) in MINIMAL {
         let bytes = match std::str::from_utf8(bytes) {
             Ok(t) => t
