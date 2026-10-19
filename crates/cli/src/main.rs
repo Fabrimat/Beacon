@@ -10,6 +10,7 @@ mod mcp;
 mod migrate;
 mod pack;
 mod rename;
+mod symbols;
 mod watch;
 
 use beacon_bundler::{Confirm, LazyEsbuild};
@@ -112,6 +113,26 @@ enum Cmd {
     },
     /// Rename an output, keeping its lockfile identities (UUIDs, releases).
     RenameOutput { from: String, to: String },
+    /// Rename an id (entity, item, block, ...) and every reference to it; all files or none.
+    Rename {
+        from: String,
+        to: String,
+        /// Rename only this kind's definitions (default: every kind `from` is defined as).
+        #[arg(long, value_name = "k", value_parser = symbols::parse_kind)]
+        kind: Option<beacon_engine::symbols::SymbolKind>,
+        /// Print the edits without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the project's ids with their definitions and reference counts.
+    Symbols {
+        /// Only names equal to, starting with, or containing this text (in that order).
+        #[arg(long, value_name = "x")]
+        find: Option<String>,
+        /// Only this kind.
+        #[arg(long, value_name = "k", value_parser = symbols::parse_kind)]
+        kind: Option<beacon_engine::symbols::SymbolKind>,
+    },
     /// Claude Code hook: reads the event JSON on stdin, prints the decision JSON (8.2).
     Hook { event: migrate::HookEvent },
 }
@@ -370,6 +391,13 @@ fn main() {
             force_convention,
         } => add::run(&o, kind, &name, module.as_deref(), force_convention),
         Cmd::RenameOutput { from, to } => rename::run(&o, &from, &to),
+        Cmd::Rename {
+            from,
+            to,
+            kind,
+            dry_run,
+        } => symbols::rename(&o, &from, &to, kind, dry_run),
+        Cmd::Symbols { find, kind } => symbols::symbols(&o, find.as_deref(), kind),
         Cmd::Hook { event } => hook::run(event),
     };
     process::exit(code);

@@ -135,6 +135,8 @@ fn help_json_lists_every_command() {
             "migrate",
             "add",
             "rename-output",
+            "rename",
+            "symbols",
             "hook"
         ]
     );

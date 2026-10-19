@@ -1168,6 +1168,85 @@ phase-3 row:
 - **Open**: The-Great-Adventure Education is the only Education project verified (5.9 risk
   stands); a legacy project with no BP/RP dependency gets Beacon's default BP->RP one.
 
+### 14.4 Phase 4 (in progress)
+
+Step 0 (2026-10-19) fixed the contract; code is the source of truth:
+`crates/engine/src/{symbols,api_index,debug,plugin}.rs`, `crates/serve/` (daemon, discovery,
+shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
+`BCN0140`-`BCN0180`. Decisions and deviations:
+
+- **Symbol table (5.7)** is lexical, per file class (JSON/JSONC, `.lang`, mcfunction,
+  script string literals): `serde_json` keeps no positions and ids hide in lang keys,
+  Molang, commands and scripts (4.3). Locations are **byte ranges** (like `diag::Fix`);
+  line/column and LSP UTF-16 positions are derived. Definitions come from known fields per
+  file kind and from generator output (a range only where the id is one literal in the
+  generator source, else not renameable). A lang key embedding an id (`entity.demo:car.name`)
+  is also a reference to that id, so renaming the entity renames the key. Phase-4 kinds:
+  entity, item, block, lang key, function, animation, animation/render controller, texture,
+  sound; loot/trade paths and families/tags later. `beacon rename <from> <to> [--kind]`
+  (all-or-nothing, `RenameBlocked`), `beacon symbols [--find] --json` (`schema: 1`).
+  Static outputs are indexed but never edited.
+- **`beacon serve`**: new crate `crates/serve` (10). Handshake line (`Hello` / `HelloReply`)
+  then the channel's own framing: LSP, MCP (the phase-2 newline JSON-RPC), control
+  (`status`, `stop`). Pipe/socket names and discovery as in 3, with a random suffix on the
+  Windows pipe name (squatting) and `File::try_lock` as the lifetime lock. Idle shutdown 60 s
+  after the last client. Trust per connection from the stored decision or the shim's
+  `--trust`; MCP write tools need the shim's `--allow edit|build|release|deploy`. One engine
+  thread owns sessions, symbols, document overlays and the API index. The CLI's warm path
+  through the daemon (3) and the TCP endpoint wait for phase 5 (the app). `beacon mcp`
+  becomes `beacon serve --stdio --mcp`.
+- **LSP crate: `lsp-server` + `lsp-types`**, not `tower-lsp` (supersedes 9.1): a minimal
+  stdio server measured 1.0 MB vs 2.8 MB with `tower-lsp-server` + tokio (Windows,
+  release, stripped), no async runtime in a resident process, and the codebase is
+  std-thread throughout. Subset: push diagnostics, definition, references, rename with
+  prepare, completion, hover; full-document sync.
+- **API index sources are MIT npm packages** (`@minecraft/server`, `server-ui`, ...,
+  `@minecraft/vanilla-data`, `@minecraft/bedrock-schemas`: `"license": "MIT"` in each
+  tarball's `package.json`, checked at build; only `bedrock-schemas` ships a `LICENSE` text,
+  (c) Microsoft, so the 13 checklist item for `@minecraft/*` stays open). bedrock-samples
+  `metadata/` (EULA) is not used in phase 4, so the 15 licensing risk no longer blocks the
+  index; commands and Molang grammars wait for the legal review. Tarballs are hash-pinned
+  per supported game version in `beacon-api`, the derived index is cached at
+  `<data dir>/beacon/api/<game version>/index.json`, and a missing index is a note
+  (`ApiIndexMissing`), never an error. Component checks use names from the schemas, not
+  full JSON Schema validation. Script checks are named imports and manifest module versions;
+  member-level checks stay with `check --full` (tsgo).
+- **Debugger (6.6), verified** against Mojang/minecraft-debugger `c69bc37` (2026-10-13) and
+  BDS 1.26.52.3: launch fields `type: minecraft-js`, `request: attach`,
+  `mode: connect|listen`, `localRoot`, `sourceMapRoot`, `generatedSourceRoot`, `host`,
+  `port` (19144), `targetModuleUuid`, `passcode`. BDS `server.properties` has
+  `allow-inbound-script-debugging`, `force-inbound-debug-port`,
+  `script-debugger-auto-attach=listen`, `script-debugger-auto-attach-timeout`,
+  `script-debugger-listen-address`, `script-debugger-passcode`. Today's bundle maps cannot
+  bind breakpoints (esbuild writes `sources` relative to its temp outdir, or `file:///D:/`
+  across drives); dev-like builds add a **debug mirror** `.beacon/debug/<target>/<output>/`
+  with project-relative `sources`. Dev `targetModuleUuid`s are per worktree, so committed
+  `launch.json` entries carry only `beaconOutput` / `beaconTarget`, and the VS Code extension
+  resolves them at launch (a debug configuration provider for `minecraft-js`);
+  `beacon debug-config --json` prints the resolved config for other editors. Beacon never
+  speaks the wire protocol (backlog B6).
+- **VS Code extension** lives in `integrations/vscode/` (next to `integrations/claude-code`;
+  10 said `apps/vscode`). It launches `beacon serve --stdio --lsp` from PATH (or a setting),
+  and contributes the LSP client, a trust prompt (`beacon trust --yes`), build/watch/deploy
+  commands, the `minecraft-js` debug configuration provider, and the official debugger as a
+  recommended extension. Previews and the content log channel wait for phase 5.
+- **ctxtruth-bedrock** lives in `integrations/ctxtruth-bedrock/` (npm package; 10 said
+  `packages/`), as specified in 8.4b; its Beacon-side inputs are `--help --json`,
+  `symbols --json` and `api --json` (`schema: 1` each).
+- **`beacon plugin update`** pins git-sourced plugins. The only runnable plugin kind is still
+  `legacyFilter`, which gains `id` + `source: {git, ref}`. The lockfile gets `plugins.<id>`
+  (`git`, full `commit`, blake3 tree `hash`; absent when empty, so existing lockfiles stay
+  byte-identical). Builds use pins only. Update resolves with the system `git`, shows the
+  diff, and writes on confirmation. The trust key becomes the plugin array plus the pins (only
+  when pins exist), so an update asks for trust again. JS transform plugins (5.10) are not in
+  phase 4.
+- **Exit verification**: rename by a fixture (`beacon rename` vs an expected tree, then a
+  clean `check`), and the same edit through the LSP. Breakpoints by a Windows e2e job
+  (`@vscode/test-electron`, pinned official VSIX, BDS with auto-attach `listen`, a TS-line
+  breakpoint observed as a DAP `stopped` event), plus one manual run on the Bedrock client.
+  The idle budget by `beacon-perf` (daemon + shim tree, 30 s after the last request, large
+  corpus).
+
 ---
 
 ## 15. Risks and open questions

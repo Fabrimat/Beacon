@@ -1,0 +1,18 @@
+{
+  "type": "minecraftBedrock",
+  "name": "beacon-rename",
+  "authors": ["Beacon"],
+  "targetVersion": "1.26.50",
+  "namespace": "demo",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP"
+  },
+  "beacon": {
+    "sources": ["./src"],
+    "outputs": [
+      { "id": "main", "include": ["src/**"] },
+      { "id": "vendor", "static": { "bp": "./vendor/BP" }, "dependsOn": ["main"] }
+    ]
+  }
+}

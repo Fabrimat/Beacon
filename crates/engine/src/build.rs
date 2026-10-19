@@ -106,6 +106,10 @@ pub struct Session {
     idx_diags: Vec<Diagnostic>,
     /// Last ledger written per pack dir; lets rebuilds skip unchanged outputs unstatted.
     ledgers: HashMap<PathBuf, Ledger>,
+    /// Symbol table of the last `build`/`check`, updated incrementally (per-file hashes) from
+    /// the routed items and the generator output of the first plan (the packs projection
+    /// for `check`).
+    symbols: Option<crate::symbols::SymbolTable>,
 }
 
 #[derive(Clone)]
@@ -386,6 +390,7 @@ impl Session {
             strict: false,
             idx_diags: Vec::new(),
             ledgers: HashMap::new(),
+            symbols: None,
         }
     }
 
@@ -411,6 +416,17 @@ impl Session {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Symbols as of the last `build`/`check` (`None` before the first one). Restricted
+    /// sessions have no generator definitions (5.5).
+    pub fn symbols(&self) -> Option<&crate::symbols::SymbolTable> {
+        self.symbols.as_ref()
+    }
+
+    /// Mutable symbols, for editor overlays (`SymbolTable::overlay`) between builds.
+    pub fn symbols_mut(&mut self) -> Option<&mut crate::symbols::SymbolTable> {
+        self.symbols.as_mut()
     }
 
     /// Re-indexes (fast path via the previous index), routes, runs generators (cached),
@@ -746,7 +762,9 @@ impl Session {
         }
         let mut built = Vec::with_capacity(plans.len());
         let mut blocked = Vec::with_capacity(plans.len());
-        for plan in &plans {
+        // generator output of the first plan: the symbol table's generated definitions
+        let mut generated = Vec::new();
+        for (n, plan) in plans.iter().enumerate() {
             let mut items: Vec<ContentItem> = routed
                 .items
                 .iter()
@@ -768,6 +786,9 @@ impl Session {
                     };
                     let (it, d, ran) = self.cache.run(&*self.host, g, &ctx, &vfs, persist);
                     a.generators_run += ran as usize;
+                    if n == 0 {
+                        generated.extend(it.iter().cloned());
+                    }
                     items.extend(it);
                     a.diags.extend(d);
                 }
@@ -948,6 +969,10 @@ impl Session {
                 }
             }
         }
+        // after emit: symbol diagnostics never change what a build writes
+        let symbols = self.symbols.get_or_insert_default();
+        symbols.update(&cfg, &routed, &generated, &vfs);
+        a.diags.extend(symbols.diagnostics(&cfg, !trusted));
         a.changed = vfs.changed.load(Ordering::Relaxed);
         self.index = Some(index);
         a

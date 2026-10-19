@@ -10,18 +10,25 @@
 //!   -> lock + manifest -> emit::emit (dir via ledger) | archive::write (.mcpack/.mcaddon)
 //! ```
 //!
+//! Phase-4 contract: `symbols` (symbol table + rename), `api_index` (versioned API index),
+//! `debug` (minecraft-debugger interop), `plugin` (git plugin pins, `plugin update`).
+//!
 //! Phase-2 seams: `statics::items` after routing, `registry::derive` before merge, and one
 //! writer per artifact kind in `artifact/`.
 
 // contract
+pub mod api_index;
 pub mod config;
+pub mod debug;
 pub mod diag;
 pub mod event;
 pub mod host;
 pub mod migrate;
 pub mod model;
 pub mod path;
+pub mod plugin;
 pub mod suffix;
+pub mod symbols;
 
 // owned by workstreams
 pub mod agents;

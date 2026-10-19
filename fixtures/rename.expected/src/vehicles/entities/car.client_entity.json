@@ -1,0 +1,16 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:client_entity": {
+    "description": {
+      "identifier": "demo:truck",
+      "materials": { "default": "entity_alphatest" },
+      "textures": { "default": "textures/entity/car" },
+      "geometry": { "default": "geometry.demo.car" },
+      "scripts": {
+        "pre_animation": ["v.is_car = q.is_name_any('demo:truck');"]
+      },
+      "render_controllers": ["controller.render.default"],
+      "spawn_egg": { "base_color": "#c0392b", "overlay_color": "#2c3e50" }
+    }
+  }
+}

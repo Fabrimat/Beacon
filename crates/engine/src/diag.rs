@@ -230,6 +230,58 @@ codes! {
     /// The Claude Code `PreToolUse` hook denied a direct edit to a generated file (lockfile,
     /// generated manifest, generated doc section); use the owning `beacon` command instead.
     HookDenied = "BCN0130", Note;
+    /// A reference names a namespaced id (entity, item, block, function, animation, texture,
+    /// sound, lang key) that no output defines and the game does not ship. Fix: correct the
+    /// id or define it.
+    SymbolUnresolved = "BCN0140", Warning;
+    /// The same id is defined twice across behavior packs (outputs or static packs); the game
+    /// keeps one of them. Resource-pack overrides are not duplicates (4.3).
+    SymbolDuplicate = "BCN0141", Error;
+    /// An output references an id defined only in an output it does not list in `dependsOn`
+    /// (4.3). Lint only: dependencies are never added automatically.
+    SymbolCrossOutput = "BCN0142", Warning;
+    /// A rename cannot be applied: the new id is invalid or already defined, or an occurrence
+    /// is not editable (a static output, an id computed by a generator). Nothing was written.
+    RenameBlocked = "BCN0143", Error;
+    /// No API index is available for this `targetVersion` (not downloaded yet, or no pins for
+    /// that version); component, vanilla-id and script-API checks were skipped. Fix: run
+    /// `beacon api --fetch` (asks before downloading).
+    ApiIndexMissing = "BCN0150", Note;
+    /// A JSON component or field is not part of this game version's schema (misspelled,
+    /// invented, or removed).
+    ApiUnknownComponent = "BCN0151", Warning;
+    /// A `minecraft:` id is not part of this game version's vanilla data.
+    ApiUnknownVanillaId = "BCN0152", Warning;
+    /// A script imports a name the `@minecraft/*` module version does not export.
+    ApiUnknownScriptMember = "BCN0153", Error;
+    /// A `scriptModules` version does not exist for this `targetVersion`, or differs from the
+    /// installed npm typings.
+    ApiScriptModuleVersion = "BCN0154", Error;
+    /// A script uses an API marked `@deprecated` in this module version.
+    ApiDeprecated = "BCN0155", Warning;
+    /// The running `beacon serve` daemon has a different engine or protocol version and other
+    /// clients are attached, so it was not restarted. Close them or run `beacon serve --stop`.
+    ServeVersionMismatch = "BCN0160", Error;
+    /// `beacon serve` could not be started or reached (lock held without a handshake, pipe or
+    /// socket error, start timeout).
+    ServeUnavailable = "BCN0161", Error;
+    /// An MCP write tool needs a grant the operator did not give on the server command line
+    /// (`beacon serve --stdio --mcp --allow edit,build,release,deploy`).
+    GrantRequired = "BCN0162", Error;
+    /// A file has unsaved changes in an editor; the edit was not written to disk. Save or
+    /// revert the buffer, then retry.
+    DocumentDirty = "BCN0163", Error;
+    /// A git-sourced plugin has no pin in `beacon.lock.json`. Fix: `beacon plugin update <id>`.
+    PluginUnpinned = "BCN0170", Error;
+    /// A pinned plugin's fetched tree does not match the content hash in the lockfile; it was
+    /// not run.
+    PluginHashMismatch = "BCN0171", Error;
+    /// `beacon plugin update` failed: git missing, fetch failed, the ref does not exist, or it
+    /// is not a full commit SHA or tag.
+    PluginUpdateFailed = "BCN0172", Error;
+    /// A Beacon debug configuration in `.vscode/launch.json` names an output or target that
+    /// does not exist, or an output without scripts.
+    LaunchConfigStale = "BCN0180", Warning;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

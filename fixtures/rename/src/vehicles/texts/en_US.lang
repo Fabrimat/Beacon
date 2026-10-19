@@ -1,0 +1,3 @@
+## Fahrzeuge – véhicules
+entity.demo:car.name=Auto (Wagen)
+item.spawn_egg.entity.demo:car.name=Auto-Ei

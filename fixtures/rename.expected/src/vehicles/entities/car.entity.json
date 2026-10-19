@@ -1,0 +1,22 @@
+{
+  // JSONC: comments are kept byte for byte
+  "format_version": "1.21.60",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "demo:truck", /* the definition */
+      "is_spawnable": true,
+      "is_summonable": true
+    },
+    "component_groups": {
+      "demo:car_parked": { "minecraft:is_stackable": {} }
+    },
+    "components": {
+      "minecraft:health": { "value": 20, "max": 20 },
+      "minecraft:collision_box": { "width": 1.6, "height": 1.2 },
+      "minecraft:physics": {}
+    },
+    "events": {
+      "demo:park": { "add": { "component_groups": ["demo:car_parked"] } }
+    }
+  }
+}

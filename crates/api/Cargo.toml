@@ -1,0 +1,18 @@
+[package]
+name = "beacon-api"
+description = "Beacon API index builder: hash-pinned @minecraft/* npm packages -> engine ApiIndex (8.4a)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+beacon-engine = { path = "../engine" }
+beacon-fetch = { path = "../fetch" }
+# parser only (no transformer/codegen/semantic): same pinned version as beacon-jshost
+oxc = "=0.146.0"
+tar = "0.4"
+flate2 = "1"
+blake3 = "1"
+serde_json = "1"
+tempfile = "3"

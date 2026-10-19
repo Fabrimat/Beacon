@@ -1,0 +1,7 @@
+{
+  "format_version": "1.21.60",
+  "minecraft:item": {
+    "description": { "identifier": "demo:horn", "menu_category": { "category": "items" } },
+    "components": {}
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "Vendor BP",
+    "description": "Prebuilt pack: indexed, never edited",
+    "uuid": "3c1f2a4e-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    { "type": "data", "uuid": "7d8e9f0a-1b2c-4d3e-9f4a-5b6c7d8e9f0a", "version": [1, 0, 0] }
+  ]
+}

@@ -98,6 +98,26 @@ redistributed.
 Via protocol, not embedding (both upstreams appear to be GPL-3.0, to verify). Plugins talk to
 `beacon serve`: open/save models and particles in the project, hot reload, id autocomplete.
 
+## B10. Text generation for non-JSON, non-TS files (needed)
+
+**Status: needed, not speculative.** Requested by the team on 2026-10-19 after the phase-3
+migrations. A way to *generate* `.mcfunction`, `.lang` and other text files from compact
+source, the way the subfunctions / system_template text templating did: loops
+(`for <i 1..11 1>:`), inline expressions (`eval:`), nested function definitions, function
+trees, schedules.
+
+Why: today `beacon migrate` freezes the oracle's expansion of subfunctions syntax into static
+files (14.3), so a loop of 11 becomes 11 hand-maintained copies. Generators already cover
+JSON and TS; text files have no equivalent besides writing a JS generator that emits strings.
+
+Design notes:
+- Runs in the JS host like generators (same sandbox, trust and cache rules), or as a small
+  built-in expander with a fixed grammar (no code), whichever keeps `check`/LSP able to see
+  definitions and references through it (rename of an id inside a loop must still work).
+- `beacon migrate` would then translate subfunctions syntax into this form instead of freezing
+  the expansion.
+- Scope: `.mcfunction` and `.lang` first; other text formats on demand.
+
 ## B9. Other
 
 - TUI for the CLI.

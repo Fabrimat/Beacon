@@ -1,0 +1,45 @@
+[package]
+name = "beacon-serve"
+description = "Beacon per-project daemon (beacon serve): LSP + MCP over a pipe/socket, stdio shim"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+beacon-engine = { path = "../engine" }
+# Sync LSP plumbing (rust-analyzer's): no async runtime, matches the std-thread daemon.
+lsp-server = "0.10"
+lsp-types = "0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+dirs = "7.0.0"
+getrandom = "0.4.3"
+# the watch loop shared by `beacon watch` and the daemon
+notify = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
+
+# The test binary is also the daemon and the shim it spawns (`daemon <project>`, `shim ...`):
+# its own `main`, so child processes get clean stdio.
+[[test]]
+name = "daemon"
+harness = false

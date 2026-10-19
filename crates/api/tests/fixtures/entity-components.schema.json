@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "minecraft:health": { "title": "Health", "description": "Hit points." },
+    "minecraft:physics": { "title": "Physics" },
+    "not_a_component": {}
+  }
+}

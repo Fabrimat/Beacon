@@ -11,7 +11,6 @@ use std::path::Path;
 /// `sharedEditionUuids`; script module UUID per output. Entries of outputs that disappeared
 /// are kept (identities survive; `rename-output` is phase 3). World templates and skin packs
 /// are keyed by project-relative folder and are never shared across editions.
-// ponytail: plugin sources are a phase 3 field.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lockfile {
@@ -27,6 +26,10 @@ pub struct Lockfile {
     /// Skin pack identities, keyed by skins folder.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skins: BTreeMap<String, EditionMap>,
+    /// Git-sourced plugin pins, keyed by plugin id (5.10, `plugin` module). Written only by
+    /// `beacon plugin update`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, crate::plugin::PluginLock>,
 }
 
 impl Default for Lockfile {
@@ -37,6 +40,7 @@ impl Default for Lockfile {
             outputs: BTreeMap::new(),
             worlds: BTreeMap::new(),
             skins: BTreeMap::new(),
+            plugins: BTreeMap::new(),
         }
     }
 }
