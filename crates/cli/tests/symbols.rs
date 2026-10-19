@@ -68,7 +68,7 @@ fn rename_car_to_truck_matches_expected_and_checks_clean() {
     let (home, _ws, dir) = copy();
     let o = beacon(home.path(), &dir, &["rename", "demo:car", "demo:truck"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
-    assert!(text(&o.stdout).contains("renamed demo:car to demo:truck: 11 edits in 7 files"));
+    assert!(text(&o.stdout).contains("renamed demo:car to demo:truck: 14 edits in 8 files"));
     let (got, want) = (tree(&dir), tree(&fixtures().join("rename.expected")));
     assert_eq!(
         got.iter().map(|(p, _)| p).collect::<Vec<_>>(),
@@ -116,7 +116,7 @@ fn dry_run_prints_edits_writes_nothing_and_json_is_deterministic() {
         (&1.into(), &true.into(), &false.into())
     );
     let edits = v["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), 11);
+    assert_eq!(edits.len(), 14);
     assert!(
         edits
             .iter()
@@ -135,6 +135,11 @@ fn dry_run_prints_edits_writes_nothing_and_json_is_deterministic() {
     );
     assert!(
         out.contains("src/vehicles/scripts/lib/ids.ts:6:35: car -> truck"),
+        "{out}"
+    );
+    // the template's loop body is one source line: one edit per literal, not per iteration
+    assert!(
+        out.contains("src/world/functions/convoy.mcfunction:3:24: demo:car -> demo:truck"),
         "{out}"
     );
     assert!(out.contains("nothing written"), "{out}");
@@ -208,7 +213,7 @@ fn symbols_json_is_schema_1_and_deterministic() {
         .iter()
         .find(|s| s["kind"] == "entity" && s["name"] == "demo:car")
         .unwrap();
-    assert_eq!(car["references"], 10);
+    assert_eq!(car["references"], 13);
     assert_eq!(
         car["definitions"][0],
         serde_json::json!({ "path": "src/vehicles/entities/car.entity.json", "line": 6, "column": 22 })

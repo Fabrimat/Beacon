@@ -160,7 +160,7 @@ fn walk(root: &Path) -> (BTreeMap<String, PathBuf>, Vec<String>) {
     (out, errs)
 }
 
-fn file_diff(path: &str, l: &[u8], r: &[u8], out: &mut Vec<Diff>) {
+pub(super) fn file_diff(path: &str, l: &[u8], r: &[u8], out: &mut Vec<Diff>) {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
     let name = path.rsplit('/').next().unwrap_or(path);
     if name == "level.dat"

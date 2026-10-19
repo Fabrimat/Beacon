@@ -95,10 +95,10 @@ pub struct EngineState {
     conns: Vec<Conn>,
     /// The watcher's latest check (of [`EngineState::watch_trusted`]'s session).
     pub last_check: Option<BuildOutcome>,
-    /// Paths open in an LSP client, tracked apart from the symbol table: files outside it
-    /// (`module.json`) have no overlay there. A path open in two clients is forgotten when
-    /// either closes it (ponytail: a count if that ever matters).
-    open_docs: std::collections::BTreeSet<RelPath>,
+    /// Paths open in an LSP client with the hash of the buffer's latest text, tracked apart from
+    /// the symbol table: files outside it (`module.json`) have no overlay there. A path open in
+    /// two clients is forgotten when either closes it (ponytail: a count if that ever matters).
+    open_docs: std::collections::BTreeMap<RelPath, String>,
 }
 
 impl EngineState {
@@ -144,24 +144,33 @@ impl EngineState {
         self.conns.iter().any(|c| c.trusted.load(Ordering::SeqCst))
     }
 
-    /// `path` is open with unsaved changes in an LSP client (an overlay in either session's
-    /// symbol table; MCP write tools refuse such files with `DocumentDirty`).
+    /// `path` is open in an LSP client and its buffer differs from the disk (MCP write tools and
+    /// the Settings form refuse such files with `DocumentDirty`). A clean open buffer is not
+    /// dirty. Fail-safe: a file that cannot be read counts as dirty.
     pub fn has_overlay(&self, path: &RelPath) -> bool {
-        self.open_docs.contains(path)
-            || self
-                .sessions
-                .iter()
-                .flatten()
-                .any(|s| s.symbols().is_some_and(|t| t.has_overlay(path)))
+        self.open_docs.get(path).is_some_and(|h| {
+            std::fs::read(self.root.join(path.as_str()))
+                .map_or(true, |disk| beacon_engine::settings::hash(&disk) != *h)
+        })
     }
 
-    /// An LSP client opened or changed `path` / closed it.
-    pub fn set_open(&mut self, path: &RelPath, open: bool) {
-        if open {
-            self.open_docs.insert(path.clone());
-        } else {
-            self.open_docs.remove(path);
+    /// An LSP client opened or changed `path` (`text`: its buffer) / closed it (`None`).
+    pub fn set_open(&mut self, path: &RelPath, text: Option<&str>) {
+        match text {
+            Some(t) => {
+                self.open_docs
+                    .insert(path.clone(), beacon_engine::settings::hash(t.as_bytes()));
+            }
+            None => {
+                self.open_docs.remove(path);
+            }
         }
+    }
+
+    /// `path` changed in a way the daemon cannot follow (a ranged `didChange` on a full-sync
+    /// server): dirty until the next full text or close. No hash equals the empty string.
+    pub fn set_open_unknown(&mut self, path: &RelPath) {
+        self.open_docs.insert(path.clone(), String::new());
     }
 
     /// Attached clients whose connection is trusted (`beacon serve --status`).

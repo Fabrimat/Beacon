@@ -354,7 +354,7 @@ fn rename_matches_the_cli_expected_tree() {
                 .unwrap()
                 .as_array()
                 .map_or_else(|| edit["changes"].as_object().unwrap().len(), Vec::len),
-            7
+            8
         );
         apply_edit(&edit);
         let (got, want) = (tree(&c.root), tree(&fixtures().join("rename.expected")));
@@ -385,14 +385,14 @@ fn definition_references_hover_completion() {
         slice_of(&c.root, &def[0], &[]),
         (CAR.into(), "demo:car".into())
     );
-    // from the definition to every use: 11 occurrences with it, 10 without
+    // from the definition to every use: 14 occurrences with it, 13 without
     let at = c.at(CAR, "demo:car", 0, 0);
     let all = c.references(at.clone(), true);
     let uses = c.references(at, false);
-    assert_eq!((all.len(), uses.len()), (11, 10), "{all:?}");
+    assert_eq!((all.len(), uses.len()), (14, 13), "{all:?}");
     let files: std::collections::BTreeSet<_> =
         all.iter().map(|l| slice_of(&c.root, l, &[]).0).collect();
-    assert_eq!(files.len(), 7, "{files:?}");
+    assert_eq!(files.len(), 8, "{files:?}");
     for l in &all {
         let (rel, text) = slice_of(&c.root, l, &[]);
         // the `${ns}:car` template head covers only its local name
@@ -429,6 +429,44 @@ fn definition_references_hover_completion() {
     c.shutdown();
 }
 
+const CONVOY: &str = "src/world/functions/convoy.mcfunction";
+
+#[test]
+fn ids_in_a_template_resolve_through_its_source_and_a_broken_buffer_recovers() {
+    let mut c = Client::start(false);
+    let src = c.read(CONVOY);
+    // definition from a literal id inside the loop body (the expansion has it three times)
+    let def = c.request("textDocument/definition", c.at(CONVOY, "demo:car", 1, 3));
+    let def = def.as_array().unwrap();
+    assert_eq!(def.len(), 1, "{def:?}");
+    assert_eq!(slice_of(&c.root, &def[0], &[]).0, CAR);
+    // references: the three literals of the source, once each, never the expansion's lines
+    let at = c.at(CAR, "demo:car", 0, 0);
+    let uses = c.references(at.clone(), false);
+    let hits: Vec<_> = uses
+        .iter()
+        .map(|l| slice_of(&c.root, l, &[]))
+        .filter(|(rel, _)| rel == CONVOY)
+        .collect();
+    assert_eq!(hits, vec![(CONVOY.to_owned(), "demo:car".to_owned()); 3]);
+    // an open template buffer is expanded again; a broken one has no symbols and no panic
+    let broken = format!(
+        "{src}  say misindented
+"
+    );
+    c.open(CONVOY, 1, &src);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    assert_eq!(c.references(at.clone(), false).len(), 13);
+    c.change(CONVOY, 2, &broken);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    assert_eq!(c.references(at.clone(), false).len(), 10);
+    diagnostics_of(&mut c, CONVOY, |d| d.iter().any(|d| d["code"] == "BCN0220"));
+    c.change(CONVOY, 3, &src);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    assert_eq!(c.references(at, false).len(), 13);
+    c.shutdown();
+}
+
 #[test]
 fn utf16_columns_with_non_ascii_text_before_the_id() {
     let mut c = Client::start(false);
@@ -456,15 +494,15 @@ fn utf16_columns_with_non_ascii_text_before_the_id() {
 fn open_buffer_overlay_survives_updates_and_ends_on_close() {
     let mut c = Client::start(false);
     let at = c.at(CAR, "demo:car", 0, 0);
-    assert_eq!(c.references(at.clone(), false).len(), 10);
+    assert_eq!(c.references(at.clone(), false).len(), 13);
     let buf = format!("{}summon demo:car\n", c.read(SPAWN));
     c.open(SPAWN, 1, &buf);
-    assert_eq!(c.references(at.clone(), false).len(), 11);
+    assert_eq!(c.references(at.clone(), false).len(), 14);
     // a check (what the watcher runs) re-reads the project; the buffer stays
     c.change(SPAWN, 2, &buf);
     diagnostics_of(&mut c, SPAWN, |_| true);
     let after = c.references(at.clone(), false);
-    assert_eq!(after.len(), 11, "{after:?}");
+    assert_eq!(after.len(), 14, "{after:?}");
     c.notify(
         "textDocument/didClose",
         json!({ "textDocument": { "uri": c.uri(SPAWN) } }),
@@ -476,7 +514,7 @@ fn open_buffer_overlay_survives_updates_and_ends_on_close() {
         json!({ "textDocument": { "uri": c.uri(CAR) } }),
     );
     let t0 = Instant::now();
-    while c.references(at.clone(), false).len() != 10 {
+    while c.references(at.clone(), false).len() != 13 {
         assert!(t0.elapsed() < WAIT, "overlay not closed");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -622,6 +660,21 @@ fn mcp_write_is_refused_for_a_buffer_open_in_lsp() {
 }
 
 #[test]
+fn mcp_write_is_allowed_for_a_clean_open_buffer() {
+    let mut c = Client::start(false);
+    let args = json!({ "from": "demo:car", "to": "demo:truck", "dryRun": false });
+    // open with exactly the disk text: nothing unsaved
+    let text = c.read(CAR);
+    c.open(CAR, 1, &text);
+    c.wait("textDocument/publishDiagnostics", |_| true);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    let r = mcp_tool(&c, "rename_symbol", args);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert!(c.read(CAR).contains("demo:truck"));
+    c.shutdown();
+}
+
+#[test]
 fn many_changes_then_close_leave_no_overlay() {
     let mut c = Client::start(false);
     let at = c.at(CAR, "demo:car", 0, 0);
@@ -630,7 +683,7 @@ fn many_changes_then_close_leave_no_overlay() {
     for v in 2..60 {
         c.change(SPAWN, v, &format!("{base}summon demo:car\n"));
     }
-    assert_eq!(c.references(at.clone(), false).len(), 11);
+    assert_eq!(c.references(at.clone(), false).len(), 14);
     c.notify(
         "textDocument/didClose",
         json!({ "textDocument": { "uri": c.uri(SPAWN) } }),
@@ -643,7 +696,7 @@ fn many_changes_then_close_leave_no_overlay() {
         json!({ "textDocument": { "uri": c.uri(CAR) } }),
     );
     let t0 = Instant::now();
-    while c.references(at.clone(), false).len() != 10 {
+    while c.references(at.clone(), false).len() != 13 {
         assert!(t0.elapsed() < WAIT, "overlay left behind");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -679,5 +732,26 @@ fn mcp_references_positions_follow_the_open_buffer() {
         (Some(line as u64), Some(col as u64)),
         "{t}"
     );
+    c.shutdown();
+}
+
+#[test]
+fn a_ranged_change_marks_the_buffer_dirty() {
+    let mut c = Client::start(false);
+    let args = json!({ "from": "demo:car", "to": "demo:truck", "dryRun": false });
+    let text = c.read(CAR);
+    c.open(CAR, 1, &text);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    // a client that ignores the advertised full sync: the daemon cannot follow the buffer
+    c.notify(
+        "textDocument/didChange",
+        json!({ "textDocument": { "uri": c.uri(CAR), "version": 2 },
+                "contentChanges": [{ "range": { "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 } }, "text": " " }] }),
+    );
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    let r = mcp_tool(&c, "rename_symbol", args);
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(c.read(CAR).contains("demo:car"));
     c.shutdown();
 }

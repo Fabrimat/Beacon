@@ -212,6 +212,10 @@ pub struct Routed {
     /// `module.json` is invalid are missing.
     pub modules: BTreeMap<RelPath, ModuleJson>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Template sources (`.mcfunction` with subfunction syntax, see `template::apply`) -> where the
+    /// template itself routes. Empty until the build stage has run; their passthrough items are
+    /// gone from `items` by then, so symbols finds the destination here.
+    pub templates: BTreeMap<RelPath, Dest>,
     /// [`route_key`] of what this was routed from when it is still exactly that (the builder
     /// zeroes it when it adds items); all zero = unknown, nothing derived from it may be reused.
     pub key: [u8; 32],

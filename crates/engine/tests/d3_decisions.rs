@@ -429,3 +429,46 @@ fn archive_packs_are_extracted_by_manifest() {
             .all(|d| d.code == beacon_engine::diag::Code::MigrateOracleDiff)
     );
 }
+
+#[test]
+fn subfunctions_syntax_the_expander_reproduces_stays_a_source() {
+    let t = tempfile::tempdir().unwrap();
+    let (r, e) = subfunction_project(t.path());
+    write(
+        &r,
+        &format!("{D}/m/f.mcfunction"),
+        "for <i 0..2>:\n    say `eval:i`\n",
+    );
+    let oracle = t.path().join("oracle");
+    write(&oracle, "BP/functions/m/f.mcfunction", "say 0\nsay 1");
+    write(&oracle, "BP/functions/m/other.mcfunction", "say other\n");
+    let plan = plan(&r, &e, Some(&oracle));
+    assert!(matches!(
+        body(&plan, "src/m/f.mcfunction"),
+        Some(Body::Passthrough(_))
+    ));
+    assert!(body(&plan, "src/m/scope.json").is_none());
+    assert!(plan.changes.iter().any(|c| matches!(c,
+        Change::Note(n) if n.code == beacon_engine::diag::Code::MigrateTranslated)));
+    assert!(
+        !plan
+            .report
+            .to_port
+            .iter()
+            .any(|t| t.kind == ToPortKind::SubfunctionSource)
+    );
+    // the oracle has a function the template does not make: frozen, with the reason
+    write(&oracle, "BP/functions/m/f/extra.mcfunction", "say x\n");
+    let plan = self::plan(&r, &e, Some(&oracle));
+    assert_eq!(
+        body(&plan, "src/m/f.mcfunction"),
+        Some(Body::Text("say 0\nsay 1".into()))
+    );
+    let tp = plan
+        .report
+        .to_port
+        .iter()
+        .find(|t| t.kind == ToPortKind::SubfunctionSource)
+        .unwrap();
+    assert!(tp.why.contains("does not produce"), "{}", tp.why);
+}

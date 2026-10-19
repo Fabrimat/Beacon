@@ -266,24 +266,40 @@ fn a_module_json_open_in_lsp_is_bcn0163() {
             .to_string_lossy()
             .replace('\\', "/")
     );
-    Message::from(Notification::new(
-        "textDocument/didOpen".into(),
-        json!({ "textDocument": { "uri": uri, "languageId": "json", "version": 1, "text": "{ }" } }),
-    ))
-    .write(&mut s)
-    .unwrap();
+    let open = |s: &mut beacon_serve::transport::Stream, text: &str| {
+        Message::from(Notification::new(
+            "textDocument/didOpen".into(),
+            json!({ "textDocument": { "uri": uri, "languageId": "json", "version": 1, "text": text } }),
+        ))
+        .write(s)
+        .unwrap();
+    };
+    // a clean buffer (same text as the disk) is not dirty: the write goes through
+    open(&mut s, MODULE);
     // requests are answered in order: once this one is, the open has been handled
     call(&mut s, 2, "workspace/nope", json!({}));
-    let e = c
+    let out = c
         .settings_write(
             dir.clone(),
             main_module(),
             doc.base.clone(),
+            json!({ "output": "y" }),
+        )
+        .unwrap_or_else(|e| panic!("clean open buffer: {e:?}"));
+    // the buffer now differs from the disk (and from a changed buffer): refused
+    open(&mut s, "{ }");
+    call(&mut s, 3, "workspace/nope", json!({}));
+    let before = on_disk(&dir);
+    let e = c
+        .settings_write(
+            dir.clone(),
+            main_module(),
+            out.base.clone(),
             json!({ "output": "x" }),
         )
         .expect_err("dirty");
     assert_eq!(e.code, "BCN0163", "{e:?}");
-    assert_eq!(on_disk(&dir), MODULE);
+    assert_eq!(on_disk(&dir), before);
     // closed: the same write goes through
     Message::from(Notification::new(
         "textDocument/didClose".into(),
@@ -291,11 +307,11 @@ fn a_module_json_open_in_lsp_is_bcn0163() {
     ))
     .write(&mut s)
     .unwrap();
-    call(&mut s, 3, "workspace/nope", json!({}));
+    call(&mut s, 4, "workspace/nope", json!({}));
     c.settings_write(
         dir.clone(),
         main_module(),
-        doc.base,
+        out.base,
         json!({ "output": "x" }),
     )
     .unwrap_or_else(|e| panic!("after close: {e:?}"));

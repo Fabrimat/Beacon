@@ -1,0 +1,11 @@
+{
+  "items": [
+    {"identifier": "apple"},
+    {"identifier": "bread"},
+    {"identifier": "carrot"}
+  ],
+  "game_state": {"lobby": 1},
+  "area": {"center": {"x": 10.5, "y": 64, "z": -3.25}, "radius": 2.5, "enabled": true},
+  "flag": false,
+  "str_part": "2"
+}

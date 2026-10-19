@@ -16,7 +16,12 @@ use beacon_engine::{route, sarif, trust};
 use beacon_jshost::{Host, Limits};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Set by the Ctrl-C handler: the run stops at its next checkpoint (BDS is told to `stop`, then
+/// killed on drop), the temp dir is removed by its own drop, and the exit code is 130.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// After `stop`: time for BDS to flush its last lines and exit before it is killed.
 const GRACE: Duration = Duration::from_secs(20);
@@ -61,7 +66,13 @@ pub fn run(o: &Opts, a: &TestArgs) -> i32 {
         test_timeout_secs: a.test_timeout,
         accept_eula: a.accept_eula,
     };
-    let (report, diags) = match test(o, &opts, a.trust) {
+    let _ = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst));
+    let res = test(o, &opts, a.trust);
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        eprintln!("interrupted");
+        return 130;
+    }
+    let (report, diags) = match res {
         Ok(r) => r,
         Err(d) => {
             print_diags(&d);
@@ -166,6 +177,7 @@ fn test(
         .map_err(|e| fail(Code::Internal, e.to_string()))?;
     let out = tmp.path().join("out");
     build(o, opts, &target, &out, trust_flag)?;
+    checkpoint()?;
 
     let tools = beacon_fetch::default_dir()
         .ok_or_else(|| fail(Code::BdsFailed, "no tools dir (set BEACON_HOME)"))?;
@@ -193,12 +205,15 @@ fn test(
         e => fail(Code::BdsFailed, format!("BDS download: {e}")),
     })?;
 
+    checkpoint()?;
     let srv = tmp.path().join("srv");
     let world =
         beacon_bds::install(&zip, &srv, "test", false).map_err(|e| fail(Code::BdsFailed, e))?;
     place(&out, &world).map_err(|e| fail(Code::BdsFailed, e))?;
 
+    checkpoint()?;
     let lines = console(&srv, opts)?;
+    checkpoint()?;
     let _ = std::fs::create_dir_all(o.project.join(".beacon"));
     let _ = std::fs::write(
         o.project.join(".beacon").join("test-bds.log"),
@@ -231,6 +246,15 @@ fn test(
         ));
     }
     Ok((report, diags))
+}
+
+/// `Err` (no diagnostics; `run` reports the interrupt) once Ctrl-C was pressed.
+fn checkpoint() -> Result<(), Vec<Diagnostic>> {
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        Err(Vec::new())
+    } else {
+        Ok(())
+    }
 }
 
 fn tail(lines: &[String], n: usize) -> String {
@@ -346,6 +370,25 @@ fn place(out: &Path, world: &Path) -> Result<(), String> {
     std::fs::write(&ld, gametest::beta_apis(&level)?).map_err(|e| e.to_string())
 }
 
+/// Every registered test has a verdict or ran past `per`, counted from its `Start` line, or from
+/// `Server started.` / the run command (`up_at`) when it never started.
+fn all_settled(
+    registered: &[String],
+    verdict: &HashSet<String>,
+    started: &HashMap<String, Instant>,
+    up_at: Option<Instant>,
+    per: Duration,
+) -> bool {
+    registered.iter().all(|n| {
+        verdict.contains(n)
+            || started
+                .get(n)
+                .copied()
+                .or(up_at)
+                .is_some_and(|t| t.elapsed() > per)
+    })
+}
+
 /// Runs BDS and drives the tests; returns the whole console.
 fn console(srv: &Path, opts: &TestOptions) -> Result<Vec<String>, Vec<Diagnostic>> {
     let (limit, per) = (
@@ -358,6 +401,7 @@ fn console(srv: &Path, opts: &TestOptions) -> Result<Vec<String>, Vec<Diagnostic
     let mut verdict: HashSet<String> = HashSet::new();
     let (mut up, mut done, mut stopping) = (false, false, false);
     let mut settled_at: Option<Instant> = None;
+    let mut up_at: Option<Instant> = None;
     let run = beacon_bds::run(srv, limit + GRACE, |l, stdin| {
         if let Some(l) = l {
             match gametest::parse_line(l) {
@@ -373,6 +417,7 @@ fn console(srv: &Path, opts: &TestOptions) -> Result<Vec<String>, Vec<Diagnostic
             }
             if !up && l.contains("Server started.") {
                 up = true;
+                up_at = Some(Instant::now());
                 if !registered.is_empty() {
                     let _ = writeln!(stdin, "{}", gametest::RUN_COMMAND);
                 }
@@ -381,19 +426,41 @@ fn console(srv: &Path, opts: &TestOptions) -> Result<Vec<String>, Vec<Diagnostic
         if stopping {
             return;
         }
-        let settled = up
-            && registered
-                .iter()
-                .all(|n| verdict.contains(n) || started.get(n).is_some_and(|t| t.elapsed() > per));
+        let settled = up && all_settled(&registered, &verdict, &started, up_at, per);
         // The shim's `done` prints a tick after the last verdict: give it a beat before `stop`.
         if settled && settled_at.is_none() {
             settled_at = Some(Instant::now());
         }
-        if done || settled_at.is_some_and(|t| t.elapsed() > SETTLE) || t0.elapsed() > limit {
+        if INTERRUPTED.load(Ordering::SeqCst)
+            || done
+            || settled_at.is_some_and(|t| t.elapsed() > SETTLE)
+            || t0.elapsed() > limit
+        {
             stopping = true;
             let _ = writeln!(stdin, "stop");
         }
     })
     .map_err(|e| fail(Code::BdsFailed, e))?;
     Ok(run.lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_but_never_started_times_out_from_server_up() {
+        let per = Duration::from_secs(10);
+        let old = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let reg = vec!["a:b".to_owned()];
+        let (v, st) = (HashSet::new(), HashMap::new());
+        assert!(!all_settled(&reg, &v, &st, Some(Instant::now()), per));
+        assert!(all_settled(&reg, &v, &st, Some(old), per));
+        assert!(!all_settled(&reg, &v, &st, None, per));
+        let v2: HashSet<String> = ["a:b".to_owned()].into();
+        assert!(all_settled(&reg, &v2, &st, None, per));
+        // a started test counts from its own start, not from server-up
+        let st2 = HashMap::from([("a:b".to_owned(), Instant::now())]);
+        assert!(!all_settled(&reg, &v, &st2, Some(old), per));
+    }
 }

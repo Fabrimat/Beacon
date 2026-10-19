@@ -1,4 +1,5 @@
 {
 	"label": "Golem",
-	"stack": 8
+	"stack": 8,
+	"waves": 3
 }

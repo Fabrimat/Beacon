@@ -20,6 +20,7 @@
 //! Then codemods in profile order, `config.json`, the lockfile and `MIGRATION.md`.
 
 use super::codemod::{self, AutoNameOpts};
+use super::equiv::file_diff;
 use super::regolith::map_profiles;
 use super::system_template::trim;
 use super::{
@@ -32,6 +33,7 @@ use crate::merge::{self, strip_comments};
 use crate::model::{Body, ContentItem, Dest, Edition, Merge, Pack};
 use crate::path::{RelPath, Vfs};
 use crate::suffix::route_file;
+use crate::template::{self, has_subfunctions};
 use crate::vfs::Index;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -333,6 +335,13 @@ struct Planner<'a> {
     manifests: [Option<Value>; 2],
     /// `pack.name` / `pack.description` values stripped from legacy lang files.
     pack_lang: BTreeMap<String, String>,
+    /// Subfunctions sources kept in syntax (their paths, or the migrated file for an evaluated
+    /// body): Beacon expands them at build time.
+    translated: BTreeSet<RelPath>,
+    /// Subfunctions sources whose oracle expansion was frozen instead, with the reason.
+    frozen: BTreeMap<RelPath, String>,
+    /// Per module: the scope names its translated templates read (written as `scope.json`).
+    scopes: BTreeMap<String, Map<String, Value>>,
 }
 
 fn pi(p: Pack) -> usize {
@@ -754,6 +763,167 @@ impl Planner<'_> {
         marked && self.eval.outputs.keys().any(|k| k.starts_with(&dir))
     }
 
+    /// The scope of `source` (a system_template system's file) from the static layers only,
+    /// lowest first: the root `scope.json`, the filter's `settings.scope`, then the
+    /// `_group_scope.json` and `_scope.json` of every folder from the root down to the file's.
+    /// What a map entry sets (computed in `_map.py`) is not recoverable: the oracle check
+    /// rejects a template that depends on it.
+    // ponytail: every folder's `_scope.json` counts, not only the system's; the oracle check
+    // catches a wrong layering, add the system lookup when a real project needs it.
+    fn static_scope(&self, source: &RelPath, settings: Option<&Value>) -> Result<Value, String> {
+        let root = format!(
+            "{}/system_template",
+            data_rel(self.project).ok_or("no data dir")?
+        );
+        let rest = source
+            .as_str()
+            .strip_prefix(&format!("{root}/"))
+            .ok_or_else(|| format!("{source} is outside {root}"))?;
+        let file = |path: String| -> Result<Map<String, Value>, String> {
+            let Some(b) = RelPath::parse(&path).ok().and_then(|p| self.read(&p)) else {
+                return Ok(Map::new());
+            };
+            let b = b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b);
+            match serde_json::from_slice(&strip_comments(b)) {
+                Ok(Value::Object(m)) => Ok(m),
+                _ => Err(format!("{path} is not a JSON object")),
+            }
+        };
+        let mut scope = file(format!("{root}/scope.json"))?;
+        if let Some(Value::Object(m)) = settings {
+            scope.extend(m.clone());
+        }
+        let parts: Vec<&str> = rest.split('/').collect();
+        for i in 1..parts.len() {
+            let dir = format!("{root}/{}", parts[..i].join("/"));
+            for name in ["_group_scope.json", "_scope.json"] {
+                scope.extend(file(format!("{dir}/{name}"))?);
+            }
+        }
+        Ok(Value::Object(scope))
+    }
+
+    /// Records the scope names a translated template reads in its module's `scope.json`; a
+    /// name another template of the module reads with another value cannot share the file.
+    fn keep_scope(
+        &mut self,
+        module: &str,
+        reads: &BTreeSet<String>,
+        scope: &Value,
+    ) -> Result<(), String> {
+        let new: Vec<(&String, &Value)> = reads
+            .iter()
+            .filter_map(|k| Some((k, scope.get(k)?)))
+            .collect();
+        let have = self.scopes.entry(module.to_string()).or_default();
+        if let Some((k, _)) = new
+            .iter()
+            .find(|(k, v)| have.get(*k).is_some_and(|h| h != *v))
+        {
+            return Err(format!(
+                "scope name `{k}` has another value in another template of module {module}; a module has one scope.json"
+            ));
+        }
+        have.extend(new.into_iter().map(|(k, v)| (k.clone(), v.clone())));
+        Ok(())
+    }
+
+    /// system_template: each `.mcfunction` source in subfunctions syntax whose evaluated
+    /// expansion (the legacy output) Beacon's own expander reproduces stays a source: returns
+    /// the evaluated outputs it replaces and a plain output per source standing in for them.
+    /// The others are recorded in `frozen` with the reason and keep their expanded outputs.
+    fn translate_st(&mut self, steps: &[&FilterRun]) -> (BTreeSet<String>, Vec<EvalOutput>) {
+        let eval = self.eval;
+        let settings = steps
+            .iter()
+            .find(|s| s.filter.as_deref() == Some("system_template"))
+            .and_then(|s| s.settings.as_ref()?.get("scope"));
+        let mut by_source: BTreeMap<&RelPath, Vec<&EvalOutput>> = BTreeMap::new();
+        for o in eval.outputs.values() {
+            if let [c] = &o.contributors[..]
+                && o.path.starts_with("BP/functions/")
+                && o.path.ends_with(".mcfunction")
+                && !matches!(o.body, Body::Passthrough(_))
+                && c.template == Template::None
+            {
+                by_source.entry(&c.source).or_default().push(o);
+            }
+        }
+        let (mut replaced, mut stand_ins) = (BTreeSet::new(), Vec::new());
+        for (source, outs) in by_source {
+            let Some(text) = self
+                .read(source)
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|t| has_subfunctions(t))
+            else {
+                continue;
+            };
+            // the template's own path: its output, or (`UNPACK:SUBFUNCTION`) the folder's name
+            let (name, c) = (source.file_name(), &outs[0].contributors[0]);
+            let stem = name.trim_end_matches(".mcfunction");
+            let Some(base) = outs
+                .iter()
+                .find_map(|o| {
+                    o.path
+                        .ends_with(&format!("/{name}"))
+                        .then(|| o.path.clone())
+                })
+                .or_else(|| {
+                    outs.iter().find_map(|o| {
+                        let i = o.path.rfind(&format!("/{stem}/"))?;
+                        Some(format!("{}.mcfunction", &o.path[..i + 1 + stem.len()]))
+                    })
+                })
+            else {
+                continue;
+            };
+            let expected: Vec<&str> = outs.iter().map(|o| o.path.as_str()).collect();
+            let oracle = |p: &str| eval.outputs.get(p).and_then(|o| self.text_of(&o.body));
+            let found = self.static_scope(source, settings).and_then(|scope| {
+                let x = expands_like_oracle(&text, &scope, source, &base, &expected, &oracle)?;
+                Ok((scope, x))
+            });
+            let module = self.module_of(c);
+            let found = found.and_then(|r| {
+                let rest = base.strip_prefix("BP/").unwrap_or_default();
+                match self.candidate(&module, name, Pack::Behavior, rest, &BTreeSet::new()) {
+                    Some(_) => Ok(r),
+                    None => Err("module path taken".to_string()),
+                }
+            });
+            let kept = found.and_then(|(scope, x)| {
+                self.keep_scope(&module, &x.scope_reads, &scope).map(|()| x)
+            });
+            match kept {
+                Ok(x) => {
+                    replaced.extend(
+                        x.files
+                            .iter()
+                            .map(|f| format!("BP/{}", f.dest))
+                            .chain(expected.iter().map(|e| e.to_string())),
+                    );
+                    self.translated.insert(source.clone());
+                    self.notes.push(note(
+                        Code::MigrateTranslated,
+                        format!(
+                            "{source}: subfunctions syntax kept, expanded at build time ({} file(s) equal the legacy output)",
+                            x.files.len()
+                        ),
+                    ));
+                    stand_ins.push(EvalOutput {
+                        path: base,
+                        body: Body::Passthrough(source.clone()),
+                        contributors: outs[0].contributors.clone(),
+                    });
+                }
+                Err(why) => {
+                    self.frozen.insert(source.clone(), why);
+                }
+            }
+        }
+        (replaced, stand_ins)
+    }
+
     /// Script sources under `src/_scripts/` (data-dir layout) and the barrel.
     fn scripts(&mut self, data: &RelPath) -> bool {
         let mut barrel = String::new();
@@ -1025,24 +1195,6 @@ fn is_st_script(path: &str, roots: &BTreeSet<String>) -> bool {
     roots.iter().any(|r| path.starts_with(r.as_str())) && CODE_EXT.iter().any(|e| path.ends_with(e))
 }
 
-/// regolith_subfunctions syntax in an `.mcfunction` (its evaluator would rewrite the file).
-fn has_subfunctions(text: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim_start();
-        [
-            "for <",
-            "if <",
-            "function <",
-            "definefunction <",
-            "var ",
-            "UNPACK:",
-        ]
-        .iter()
-        .any(|p| t.starts_with(p))
-            || (!t.starts_with('#') && l.contains("`eval:"))
-    })
-}
-
 /// Hint for unresolved imports of gitignored generated sources.
 fn hint(mut d: Diagnostic) -> Diagnostic {
     if d.message.contains("cannot resolve") && d.message.contains("generated/") {
@@ -1103,6 +1255,9 @@ pub(super) fn plan(
         consumed: BTreeSet::new(),
         manifests: [None, None],
         pack_lang: BTreeMap::new(),
+        translated: BTreeSet::new(),
+        frozen: BTreeMap::new(),
+        scopes: BTreeMap::new(),
     };
     for o in eval.outputs.values().filter(|o| o.path.ends_with(".json")) {
         if let Some(v) = p0.json_of(&o.body) {
@@ -1142,6 +1297,14 @@ pub(super) fn plan(
     let mut p = p0;
 
     // outputs
+    let steps = main_profile(project);
+    let (translated, stand_ins) = p.translate_st(&steps);
+    // placed first: `translate_st` checked their module paths are free
+    for o in &stand_ins {
+        if let Some((pack, rest)) = pack_of(&o.path) {
+            p.output(o, pack, rest);
+        }
+    }
     let mut skip_bundle: BTreeSet<String> = BTreeSet::new();
     let es_roots = esbuild_roots(eval);
     let has_subscripts = !es_roots.is_empty();
@@ -1164,7 +1327,7 @@ pub(super) fn plan(
         .flat_map(|o| o.contributors.iter().map(|c| &c.source))
         .collect();
     for (path, o) in &eval.outputs {
-        if skip_bundle.contains(path) {
+        if skip_bundle.contains(path) || translated.contains(path) {
             continue;
         }
         let Some((pack, rest)) = pack_of(path) else {
@@ -1212,7 +1375,6 @@ pub(super) fn plan(
     };
 
     // codemods
-    let steps = main_profile(project);
     let mmc_settings = steps
         .iter()
         .find(|s| s.filter.as_deref() == Some("modular_mc"))
@@ -1504,6 +1666,21 @@ pub(super) fn plan(
             let change = Change::Write {
                 to: to.clone(),
                 body,
+            };
+            let f = File {
+                change,
+                pack_path: None,
+                fragment: false,
+            };
+            p.files.insert(to, f);
+        }
+        // the scope names the module's translated templates read
+        if let Some(s) = p.scopes.get(m)
+            && let Ok(to) = RelPath::parse(&format!("src/{m}/{}", template::SCOPE_FILE))
+        {
+            let change = Change::Write {
+                to: to.clone(),
+                body: Body::Json(Value::Object(s.clone())),
             };
             let f = File {
                 change,
@@ -2099,8 +2276,67 @@ fn called_functions(text: &str) -> Vec<String> {
     out
 }
 
+/// Expands `text` (a template at the pack path `base`, `BP/...`) with Beacon's expander and
+/// checks every file it writes against the oracle's, as `equiv` compares text; `expected` are
+/// the oracle files the template has to account for. `Err`: why it cannot be translated.
+fn expands_like_oracle(
+    text: &str,
+    scope: &Value,
+    source: &RelPath,
+    base: &str,
+    expected: &[&str],
+    oracle: &dyn Fn(&str) -> Option<String>,
+) -> Result<template::Expansion, String> {
+    let dest = base
+        .strip_prefix("BP/")
+        .and_then(|d| RelPath::parse(d).ok())
+        .ok_or_else(|| format!("{base} is not a behavior pack path"))?;
+    let x = template::expand(text, scope, source, &dest)
+        .map_err(|d| format!("{}: {}", d.code.id(), d.message))?;
+    let made: BTreeSet<String> = x.files.iter().map(|f| format!("BP/{}", f.dest)).collect();
+    for f in &x.files {
+        let path = format!("BP/{}", f.dest);
+        let Some(o) = oracle(&path) else {
+            return Err(format!("the legacy output has no {path}"));
+        };
+        let mut diffs = Vec::new();
+        file_diff(&path, o.as_bytes(), f.text.as_bytes(), &mut diffs);
+        if !diffs.is_empty() {
+            return Err(format!(
+                "{path} differs from the legacy output (a scope computed in `_map.py`?)"
+            ));
+        }
+    }
+    match expected.iter().find(|e| !made.contains(**e)) {
+        Some(e) => Err(format!(
+            "the legacy output has {e}, which the template does not produce"
+        )),
+        None => Ok(x),
+    }
+}
+
+/// Oracle functions below the folder `stem` (`BP/functions/x` -> `BP/functions/x/**`).
+fn generated_under(oracle: &std::path::Path, stem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(oracle.join(stem), stem.to_string())];
+    while let Some((dir, rel_dir)) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let r = format!("{rel_dir}/{name}");
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push((e.path(), r)),
+                Ok(t) if t.is_file() && name.ends_with(".mcfunction") => out.push(r),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Functions still in subfunctions syntax (it ran after the evaluated maps), with `--oracle`:
-/// the expansion is taken from the legacy output, frozen. Generated functions it calls (or
+/// kept as sources when Beacon's expander reproduces the legacy expansion (with no scope: the
+/// standalone filter has none to recover), else the expansion is taken from the legacy output,
+/// frozen. Generated functions it calls (or
 /// under its own `X/` folder) that no migrated file accounts for come along.
 fn freeze_subfunctions(p: &mut Planner, oracle: &std::path::Path) {
     let read = |p: &Planner, f: &File| -> Option<String> {
@@ -2116,20 +2352,41 @@ fn freeze_subfunctions(p: &mut Planner, oracle: &std::path::Path) {
         .values()
         .filter_map(|f| f.pack_path.clone())
         .collect();
-    let todo: Vec<(RelPath, String)> = p
+    let todo: Vec<(RelPath, String, String)> = p
         .files
         .iter()
+        .filter(
+            |(_, f)| !matches!(&f.change, Change::Copy { from, .. } if p.translated.contains(from)),
+        )
         .filter_map(|(to, f)| {
             let pp = f.pack_path.clone()?;
             (pp.starts_with("BP/functions/") && pp.ends_with(".mcfunction"))
                 .then(|| read(p, f))
                 .flatten()
                 .filter(|t| has_subfunctions(t))
-                .map(|_| (to.clone(), pp))
+                .map(|t| (to.clone(), pp, t))
         })
         .collect();
     let why = "frozen subfunctions expansion (from the oracle)";
-    for (to, pp) in todo {
+    for (to, pp, text) in todo {
+        let stem = pp.trim_end_matches(".mcfunction").to_string();
+        let kids = generated_under(oracle, &stem);
+        let kids: Vec<&str> = kids.iter().map(String::as_str).collect();
+        let read_oracle = |r: &str| std::fs::read_to_string(oracle.join(r)).ok();
+        let reason = match expands_like_oracle(&text, &json!({}), &to, &pp, &kids, &read_oracle) {
+            Ok(x) => {
+                p.translated.insert(to.clone());
+                p.notes.push(note(
+                    Code::MigrateTranslated,
+                    format!(
+                        "{pp}: subfunctions syntax kept, expanded at build time ({} file(s) equal the legacy output)",
+                        x.files.len()
+                    ),
+                ));
+                continue;
+            }
+            Err(r) => r,
+        };
         let Ok(expanded) = std::fs::read_to_string(oracle.join(&pp)) else {
             continue; // stays reported as subfunctions syntax
         };
@@ -2147,20 +2404,8 @@ fn freeze_subfunctions(p: &mut Planner, oracle: &std::path::Path) {
         }
         let mut frozen = vec![pp.clone()];
         // generated functions: `X/**` and whatever the expansion calls, transitively
-        let stem = pp.trim_end_matches(".mcfunction").to_string();
         let mut queue: Vec<String> = called_functions(&expanded);
-        let mut stack = vec![(oracle.join(&stem), stem.clone())];
-        while let Some((dir, rel_dir)) = stack.pop() {
-            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let r = format!("{rel_dir}/{name}");
-                match e.file_type() {
-                    Ok(t) if t.is_dir() => stack.push((e.path(), r)),
-                    Ok(t) if t.is_file() && name.ends_with(".mcfunction") => queue.push(r),
-                    _ => {}
-                }
-            }
-        }
+        queue.extend(kids.iter().map(|k| k.to_string()));
         while let Some(g) = queue.pop() {
             if accounted.contains(&g) || RelPath::parse(&g).is_err() {
                 continue;
@@ -2196,7 +2441,7 @@ fn freeze_subfunctions(p: &mut Planner, oracle: &std::path::Path) {
             kind: ToPortKind::SubfunctionSource,
             path: to.clone(),
             why: format!(
-                "{why}: {} file(s) taken from the legacy output; edit the expanded functions or port them to a generator",
+                "{why} ({reason}): {} file(s) taken from the legacy output; edit the expanded functions or port them to a generator",
                 frozen.len()
             ),
         });
@@ -2330,7 +2575,7 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
         }
     }
     // subfunctions ran after the evaluated maps (ModularMC profiles): the migrated functions
-    // still hold its syntax, which Beacon does not expand
+    // still hold its syntax; Beacon expands only the supported subset at build time
     if steps
         .iter()
         .any(|s| s.filter.as_deref() == Some("subfunctions"))
@@ -2340,6 +2585,8 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
                 .pack_path
                 .as_deref()
                 .is_some_and(|pp| pp.ends_with(".mcfunction"))
+                || p.translated.contains(to)
+                || matches!(&f.change, Change::Copy { from, .. } if p.translated.contains(from))
             {
                 continue;
             }
@@ -2354,33 +2601,40 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
                 out.push(ToPort {
                     kind: ToPortKind::SubfunctionSource,
                     path: to.clone(),
-                    why: "still uses subfunctions syntax (`for <..>`, `if <..>`, `function <..>`, `eval:`), which Beacon does not expand: expand it by hand or port it to a generator".into(),
+                    why: "still uses subfunctions syntax: Beacon expands the supported `.mcfunction` subset at build time; unsupported constructs, `.lang` files and computed scopes stay frozen from the oracle expansion or need porting by hand".into(),
                 });
             }
         }
     }
-    // subfunctions: expanded functions were kept expanded
-    if steps
+    // subfunctions: expanded functions were kept expanded (Beacon's expander does not take
+    // them: `frozen` has the reason when system_template ran it)
+    let filter_ran = steps
         .iter()
-        .any(|s| s.filter.as_deref() == Some("subfunctions"))
+        .any(|s| s.filter.as_deref() == Some("subfunctions"));
+    for o in p
+        .eval
+        .outputs
+        .values()
+        .filter(|o| o.path.ends_with(".mcfunction"))
     {
-        for o in p
-            .eval
-            .outputs
-            .values()
-            .filter(|o| o.path.ends_with(".mcfunction"))
+        for c in o
+            .contributors
+            .iter()
+            .filter(|_| !matches!(o.body, Body::Passthrough(_)))
+            .filter(|c| !p.translated.contains(&c.source))
         {
-            for c in o
-                .contributors
-                .iter()
-                .filter(|_| !matches!(o.body, Body::Passthrough(_)))
-            {
-                out.push(ToPort {
-                    kind: ToPortKind::SubfunctionSource,
-                    path: c.source.clone(),
-                    why: "its expanded functions were kept as static files; port the subfunctions by hand".into(),
-                });
-            }
+            let reason = match p.frozen.get(&c.source) {
+                Some(r) => format!(" ({r})"),
+                None if filter_ran => String::new(),
+                None => continue,
+            };
+            out.push(ToPort {
+                kind: ToPortKind::SubfunctionSource,
+                path: c.source.clone(),
+                why: format!(
+                    "subfunctions syntax Beacon did not translate{reason}; its expanded functions were kept as static files: port the subfunctions by hand"
+                ),
+            });
         }
     }
     for d in tdiags.iter().filter(|d| d.code == Code::MigrateToPort) {

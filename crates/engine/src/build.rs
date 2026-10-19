@@ -27,7 +27,7 @@ use crate::model::{Body, ContentItem, Dest, Edition, GenCtx, Merge, OutputId, Pa
 use crate::path::{Hash, RelPath, Vfs};
 use crate::release::{self, OutGen};
 use crate::vfs::Index;
-use crate::{merge, packlist, registry, route, sarif, statics};
+use crate::{merge, packlist, registry, route, sarif, statics, template};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind};
@@ -596,8 +596,20 @@ impl Session {
         };
         a.diags.append(&mut routed.diagnostics);
         let (st, d) = statics::items(&cfg, &vfs);
+        // templates expand before static packs join (those are copied as-is); no target or
+        // edition input, so once per attempt. Their outputs are folded into the key, not zeroed
+        // like the statics, so the symbols memo survives unchanged templates.
+        let expanded =
+            template::apply(&mut routed.items, &mut routed.templates, &vfs, &mut a.diags);
         if st.is_empty() {
-            routed.key = key;
+            routed.key = match expanded {
+                Some(h) => *blake3::Hasher::new()
+                    .update(&key)
+                    .update(&h)
+                    .finalize()
+                    .as_bytes(),
+                None => key,
+            };
         }
         routed.items.extend(st);
         a.diags.extend(d);

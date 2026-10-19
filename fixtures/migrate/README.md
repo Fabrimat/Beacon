@@ -42,8 +42,13 @@ legacy filters, and are committed.
 - conflict pairs `golem` -> `ruby`: `merge`, `overwrite`, `skip`, and the `.lang` default
   (append at end; system_template inserts a blank line);
 - glob source; a `data/` target (`data/st_notes/golem.txt`);
-- no `.mcfunction` targets (subfunctions are on by default for them and are out of scope).
-  Every system needs a `_scope.json`, even `{}`, or system_template ignores it.
+- two `.mcfunction` targets in subfunctions syntax: `golem/waves.mcfunction` (`for` + `eval` over
+  `waves`/`label` of `golem/_scope.json`, plus a `function <boss>:`: translated) and
+  `golem/gated.mcfunction` (an `if`, which Beacon does not expand: frozen). Their expected files
+  (`BP/functions/golem/**`) and log entries were derived by hand from the filter's rules, not
+  produced by the pinned tools; `d3_migrate` checks them through Beacon's own expander and the
+  equivalence check.
+- Every system needs a `_scope.json`, even `{}`, or system_template ignores it.
 
 ## How the expected trees were generated
 

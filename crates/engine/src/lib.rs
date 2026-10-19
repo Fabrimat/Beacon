@@ -57,6 +57,7 @@ pub mod route;
 pub mod sarif;
 pub mod scaffold;
 pub mod statics;
+pub mod template;
 pub mod trust;
 pub mod vfs;
 pub mod world;

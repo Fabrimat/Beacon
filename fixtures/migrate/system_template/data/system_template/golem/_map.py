@@ -37,6 +37,14 @@
     {
         "source": "notes.txt",
         "target": "data/st_notes/golem.txt"
+    },
+    {
+        "source": "waves.mcfunction",
+        "target": "BP/functions/golem/waves.mcfunction"
+    },
+    {
+        "source": "gated.mcfunction",
+        "target": "BP/functions/golem/gated.mcfunction"
     }
 ] + [
     {

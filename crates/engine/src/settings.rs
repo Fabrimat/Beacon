@@ -257,7 +257,7 @@ pub fn read(root: &Path, rel: &RelPath) -> Result<Doc, Diagnostic> {
 /// step; the daemon runs this on its single engine thread, which is the single writer.
 pub fn write(root: &Path, rel: &RelPath, base: &str, new: &Value) -> Result<Doc, Diagnostic> {
     let (bytes, doc) = plan(root, rel, base, new)?;
-    atomic_write(&root.join(rel.as_str()), &bytes)
+    atomic_write(root, &root.join(rel.as_str()), &bytes)
         .map_err(|e| bad(rel, format!("cannot write: {e}")))?;
     Ok(doc)
 }
@@ -289,6 +289,10 @@ pub fn plan(
     if text.ends_with('\n') || old.is_empty() {
         out.push('\n');
     }
+    if text.contains("\r\n") {
+        // JSON strings escape their newlines: only the layout changes
+        out = out.replace('\n', "\r\n");
+    }
     let mut bytes = if old.starts_with(&BOM) {
         BOM.to_vec()
     } else {
@@ -302,16 +306,25 @@ pub fn plan(
     Ok((bytes, doc))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `bytes` to a temp file in `<root>/.beacon/` (the watcher ignores it and a crash leaves
+/// nothing in the sources), then renames it over `path`. Falls back to a sibling temp file when
+/// `.beacon` cannot be used (including a rename across filesystems).
+fn atomic_write(root: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(std::io::Error::other)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{:x}.tmp", u64::from_le_bytes(rnd)));
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let name = format!("module.json.{:x}.tmp", u64::from_le_bytes(rnd));
+    let via = |tmp: &Path| {
+        std::fs::write(tmp, bytes)
+            .and_then(|()| std::fs::rename(tmp, path))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(tmp);
+            })
+    };
+    let dir = root.join(".beacon");
+    if std::fs::create_dir_all(&dir).is_ok() && via(&dir.join(&name)).is_ok() {
+        return Ok(());
+    }
+    via(&path.with_file_name(name))
 }
 
 #[cfg(test)]
@@ -497,6 +510,25 @@ mod tests {
 
     fn disk(d: &tempfile::TempDir) -> String {
         std::fs::read_to_string(d.path().join("src/m/module.json")).unwrap()
+    }
+
+    #[test]
+    fn crlf_is_kept_and_no_tmp_file_is_left_in_the_module_dir() {
+        let text = "{\r\n  \"autoTextures\": true\r\n}\r\n";
+        let (d, rel) = project(Some(text));
+        let doc = read(d.path(), &rel).unwrap();
+        let mut v = doc.value.clone();
+        v["autoTextures"] = json!(false);
+        write(d.path(), &rel, &doc.base, &v).unwrap();
+        assert_eq!(disk(&d), text.replace("true", "false"));
+        let names = |p: &str| -> Vec<String> {
+            std::fs::read_dir(d.path().join(p))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names("src/m"), ["module.json"]);
+        assert!(names(".beacon").is_empty(), "the tmp file was renamed away");
     }
 
     #[test]

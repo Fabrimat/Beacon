@@ -128,12 +128,13 @@ pub fn rule_for(file_name: &str) -> Option<&'static Rule> {
         .max_by_key(|r| r.suffix.len())
 }
 
-/// Never routed, never `UnknownSuffix` (code, data modules, config).
+/// Never routed, never `UnknownSuffix` (code, data modules, config, template scope).
 pub fn is_unrouted(file_name: &str) -> bool {
     file_name == crate::config::MODULE_FILE
         || file_name.ends_with(".ts")
         || file_name.ends_with(".js")
         || file_name.ends_with(".data.json")
+        || file_name == crate::template::SCOPE_FILE
 }
 
 /// Convention destination of a file: `module` = module name, `rel` = module-relative path

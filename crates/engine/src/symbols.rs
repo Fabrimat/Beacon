@@ -36,6 +36,14 @@
 //! - Generator output (content files, `*.gen.ts`) defines ids too: its location is the
 //!   generator file, with a range only where the id appears there as exactly one string
 //!   literal (`item("demo:key", ...)`), else none (computed: `rename` is `RenameBlocked`).
+//! - Templates (`.mcfunction` with subfunction syntax, [`template`]) are scanned through their
+//!   **expansion**, never the source text ([`scan_template`]): every output file of the template
+//!   is scanned and each occurrence is mapped back to the source through the expansion's line
+//!   map. An occurrence whose text is a verbatim copy of its source keeps that range (the
+//!   iterations of a loop collapse into one); one that came through an `eval` hole or a
+//!   rewritten header has no range (computed: it resolves and is checked, `rename` is
+//!   `RenameBlocked`). Every expanded `functions/` file defines a function. The module's
+//!   `scope.json` is part of a template's scan: its hash is recorded and a change rescans.
 //! - Incremental: per-file results are keyed by the file's index hash; [`SymbolTable::update`]
 //!   rescans only files whose hash (or routing) changed. Resolution happens at query time.
 //! - Restricted mode (5.5) builds the table without generator output (literals in generator
@@ -48,9 +56,11 @@ use crate::model::{Body, ContentItem, OutputId, Pack};
 use crate::path::{Hash, RelPath, Vfs};
 use crate::route::Routed;
 use crate::suffix::is_generator;
+use crate::template::{self, LineOrigin};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Kinds of identifiers. Serialized in `symbols --json` (versioned output, 6.2): new kinds
 /// may be added, existing names never change.
@@ -175,6 +185,15 @@ struct FileSyms {
     overlay: bool,
     /// Sorted by range (`None` first).
     occs: Vec<Occurrence>,
+    /// Templates only, parallel to `occs`: the source command an occurrence came from, so a
+    /// computed one (no range) still reports a line.
+    anchors: Vec<Option<ByteRange>>,
+    /// Scanned through [`template::expand`]: a `scope.json` change rescans it.
+    template: bool,
+    /// Hash of the module's `scope.json` when scanned (zero = none).
+    scope: Hash,
+    /// An overlay whose template does not expand (the build reports the disk's own error).
+    error: Option<Diagnostic>,
 }
 
 impl FileSyms {
@@ -217,6 +236,8 @@ pub struct SymbolTable {
     /// The wanted-files map of the last `update`, by `Routed::key` (rebuilding it allocates a
     /// path per project file).
     want_memo: Option<([u8; 32], std::sync::Arc<Want>)>,
+    /// `scope.json` of every module: (hash, value), reloaded by `update` when the hash moves.
+    scopes: BTreeMap<RelPath, (Hash, Arc<Value>)>,
 }
 
 /// path -> (dest, output)
@@ -362,6 +383,152 @@ pub fn scan(path: &RelPath, dest: Option<&RelPath>, text: &str) -> Vec<Occurrenc
     };
     out.sort_by_key(|o| o.range.map(|r| (r.start, r.end)));
     out
+}
+
+/// What [`scan_file`] found in one file.
+#[derive(Default)]
+struct Scanned {
+    occs: Vec<Occurrence>,
+    anchors: Vec<Option<ByteRange>>,
+    template: bool,
+    error: Option<Diagnostic>,
+}
+
+/// [`scan`] of a file as the table sees it: a template routed to a BP destination is scanned
+/// through its expansion ([`scan_template`]); one that does not expand (a syntax error) has no
+/// symbols and carries its diagnostic.
+fn scan_file(path: &RelPath, dest: Option<&RelPath>, text: &str, scope: &Value) -> Scanned {
+    let base = dest
+        .and_then(|d| d.as_str().strip_prefix("BP/"))
+        .and_then(|d| RelPath::parse(d).ok())
+        .filter(|_| classify(path) == FileClass::McFunction && template::has_subfunctions(text));
+    let Some(base) = base else {
+        return Scanned {
+            occs: scan(path, dest, text),
+            ..Scanned::default()
+        };
+    };
+    match template::expand(text, scope, path, &base) {
+        Ok(x) if x.modified => {
+            let (occs, anchors) = scan_template(text, &x.files, &base);
+            Scanned {
+                occs,
+                anchors,
+                template: true,
+                error: None,
+            }
+        }
+        Ok(_) => Scanned {
+            occs: scan(path, dest, text),
+            template: true,
+            ..Scanned::default()
+        },
+        Err(e) => Scanned {
+            template: true,
+            error: Some(e),
+            ..Scanned::default()
+        },
+    }
+}
+
+/// (name, range of the name) of every `... <name>:` header line of a template source with a
+/// literal subfunction name.
+fn header_names(text: &str) -> Vec<(&str, ByteRange)> {
+    let mut at = 0;
+    let mut out = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let l = line.trim();
+        if let Some(h) = l.strip_suffix(">:")
+            && let Some(lt) = h.rfind('<')
+            && template::is_fn_name(&h[lt + 1..])
+        {
+            let s = start + (l.as_ptr() as usize - line.as_ptr() as usize) + lt + 1;
+            out.push((
+                &h[lt + 1..],
+                ByteRange {
+                    start: s,
+                    end: s + h.len() - lt - 1,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Scans the output files of a template and maps every occurrence back to `text`, the
+/// template source, with each file's line map. Output lines are stripped commands, so an
+/// offset in a line is an offset in its source command. A range survives only where the source
+/// holds the very same bytes there (so not past an `eval` hole or in a rewritten header tail);
+/// the lines of a loop body all map to one source line and identical occurrences collapse into
+/// one. `anchors` is parallel to the occurrences.
+fn scan_template(
+    text: &str,
+    files: &[template::Expanded],
+    base: &RelPath,
+) -> (Vec<Occurrence>, Vec<Option<ByteRange>>) {
+    let src_starts = line_starts(text);
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let cmd_start = |o: &LineOrigin| {
+        src_starts[o.src_line as usize - 1] as usize
+            + o.src_cols.start as usize
+            + if o.src_line == 1 { bom } else { 0 }
+    };
+    let headers = header_names(text);
+    let mut all: Vec<(Occurrence, Option<ByteRange>)> = Vec::new();
+    for f in files {
+        let Ok(dest) = RelPath::parse(&format!("BP/{}", f.dest)) else {
+            continue;
+        };
+        let out_starts = line_starts(&f.text);
+        for mut o in scan_mcfunction(&f.text, Some(&dest)) {
+            let mut anchor = None;
+            if let Some(r) = o.range {
+                o.range = None;
+                let l = out_starts.partition_point(|&s| s as usize <= r.start);
+                if let Some(origin) = f.line_map.get(l - 1) {
+                    let cmd = cmd_start(origin);
+                    let src_cmd = text.get(cmd..cmd + origin.src_cols.len()).unwrap_or("");
+                    let off = r.start - out_starts[l - 1] as usize;
+                    let end = off + r.end - r.start;
+                    anchor = Some(ByteRange {
+                        start: cmd,
+                        end: cmd + origin.src_cols.len(),
+                    });
+                    // only before the first byte where output and source part (an `eval`
+                    // hole, a rewritten header): later offsets do not line up
+                    let same = src_cmd
+                        .bytes()
+                        .zip(f.text[out_starts[l - 1] as usize..].bytes())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if end <= same && text.get(cmd + off..cmd + end) == f.text.get(r.start..r.end) {
+                        o.range = Some(ByteRange {
+                            start: cmd + off,
+                            end: cmd + end,
+                        });
+                    }
+                }
+            } else if o.role == Role::Definition && f.dest != *base {
+                // a subfunction: the name inside its header when exactly one literal header
+                // can have named it (headers nest: `a/b` is named by `<b>` under `<a>`)
+                let hit: Vec<_> = headers
+                    .iter()
+                    .filter(|(n, _)| o.name == *n || o.name.ends_with(&format!("/{n}")))
+                    .collect();
+                if let [(_, r)] = hit.as_slice() {
+                    o.range = Some(*r);
+                }
+            }
+            all.push((o, anchor));
+        }
+    }
+    all.sort_by(|(a, _), (b, _)| {
+        (a.range, &a.name, a.kind, a.role as u8).cmp(&(b.range, &b.name, b.kind, b.role as u8))
+    });
+    all.dedup_by(|(b, _), (a, _)| a == b);
+    all.into_iter().unzip()
 }
 
 /// Skips `//` and `/* */` comments at `i`; returns the new position (unchanged if none).
@@ -727,6 +894,19 @@ fn generated_defs(v: &Value) -> Vec<(SymbolKind, String)> {
     out
 }
 
+/// Name of the function a generated text file defines (`functions/a/b.mcfunction` -> `a/b`).
+fn generated_function(dest: &crate::model::Dest) -> Option<String> {
+    (dest.pack == Pack::Behavior)
+        .then(|| {
+            dest.path
+                .as_str()
+                .strip_prefix("functions/")?
+                .strip_suffix(".mcfunction")
+        })
+        .flatten()
+        .map(str::to_owned)
+}
+
 const CHECKED: [SymbolKind; 4] = [
     SymbolKind::Entity,
     SymbolKind::Item,
@@ -755,6 +935,16 @@ impl SymbolTable {
     fn wanted(routed: &Routed, vfs: &dyn Vfs) -> Want {
         let mut want = Want::new();
         let mut module_out: HashMap<&RelPath, &OutputId> = HashMap::new();
+        // templates left `items` when they expanded; their source is scanned at its own route
+        for (src, d) in &routed.templates {
+            want.insert(
+                src.clone(),
+                (
+                    RelPath::parse(&format!("BP/{}", d.path)).ok(),
+                    Some(d.output.clone()),
+                ),
+            );
+        }
         for i in &routed.items {
             module_out.entry(&i.module).or_insert(&i.dest.output);
             let Body::Passthrough(src) = &i.body else {
@@ -834,6 +1024,19 @@ impl SymbolTable {
             self.want_memo = Some((routed.key, w.clone()));
             w
         });
+        let mut old_scopes = std::mem::take(&mut self.scopes);
+        for m in routed.modules.keys() {
+            let hash = m
+                .join(template::SCOPE_FILE)
+                .ok()
+                .and_then(|p| vfs.hash(&p).ok())
+                .unwrap_or_default();
+            let scope = match old_scopes.remove(m) {
+                Some((h, v)) if h == hash => v,
+                _ => Arc::new(template::load_scope(vfs, m, &mut Vec::new())),
+            };
+            self.scopes.insert(m.clone(), (hash, scope));
+        }
         let mut old = std::mem::take(&mut self.files);
         for (path, (dest, output)) in want.iter() {
             let (path, dest, output) = (path.clone(), dest.clone(), output.clone());
@@ -845,12 +1048,14 @@ impl SymbolTable {
             let Ok(hash) = vfs.hash(&path) else { continue };
             let ns = ns_of(output.as_deref());
             let editable = !output.as_deref().is_some_and(is_static);
+            let scope = self.scope_of(&path);
             if let Some(f) = old.remove(&path).filter(|f| {
                 f.hash == hash
                     && f.dest == dest
                     && f.output == output
                     && f.ns == ns
                     && f.editable == editable
+                    && (!f.template || f.scope == scope.0)
             }) {
                 self.files.insert(path, f);
                 continue;
@@ -861,18 +1066,23 @@ impl SymbolTable {
                 .ok()
                 .and_then(|b| String::from_utf8(b).ok())
                 .unwrap_or_default();
-            let occs = resolve(scan(&path, dest.as_ref(), &text), &ns);
+            // a disk template's syntax error is the build's diagnostic, not the table's
+            let s = scan_file(&path, dest.as_ref(), &text, &scope.1);
             self.files.insert(
                 path,
                 FileSyms {
                     hash,
                     dest,
                     output,
-                    ns,
+                    ns: ns.clone(),
                     editable,
                     lines: line_starts(&text),
                     overlay: false,
-                    occs,
+                    occs: resolve(s.occs, &ns),
+                    anchors: s.anchors,
+                    template: s.template,
+                    scope: scope.0,
+                    error: None,
                 },
             );
         }
@@ -880,8 +1090,16 @@ impl SymbolTable {
         self.generated.clear();
         let mut seen = BTreeSet::new();
         for i in items.iter().filter(|i| is_generator(i.origin.file_name())) {
-            let Body::Json(v) = &i.body else { continue };
-            for (k, id) in generated_defs(v) {
+            let defs = match &i.body {
+                Body::Json(v) => generated_defs(v),
+                // a generated function defines itself, like a routed one
+                Body::Text(_) => generated_function(&i.dest)
+                    .map(|id| (SymbolKind::Function, id))
+                    .into_iter()
+                    .collect(),
+                _ => continue,
+            };
+            for (k, id) in defs {
                 if !seen.insert((i.origin.clone(), k, id.clone())) {
                     continue;
                 }
@@ -963,15 +1181,18 @@ impl SymbolTable {
         let has_gen = self.files.keys().any(|p| is_generator(p.file_name()));
         let mut suppressed = 0;
         for (p, f) in &self.files {
-            for o in f
+            for (i, o) in f
                 .occs
                 .iter()
-                .filter(|o| o.typed && o.role == Role::Reference)
+                .enumerate()
+                .filter(|(_, o)| o.typed && o.role == Role::Reference)
             {
                 let Some(k) = o.kind.filter(|k| CHECKED.contains(k)) else {
                     continue;
                 };
-                let span = f.span(p, o.range);
+                // a computed occurrence of a template reports its source command
+                let anchor = f.anchors.get(i).copied().flatten();
+                let span = f.span(p, o.range.or(anchor));
                 let at = |d: Diagnostic| Diagnostic {
                     span: Some(span.clone()),
                     ..d
@@ -1017,6 +1238,7 @@ impl SymbolTable {
                 }
             }
         }
+        out.extend(self.files.values().filter_map(|f| f.error.clone()));
         if suppressed > 0 {
             let mut d = Diagnostic::new(
                 Code::SymbolUnresolved,
@@ -1037,13 +1259,35 @@ impl SymbolTable {
     /// builds) until [`SymbolTable::close_overlay`]; calling `overlay` again replaces the
     /// buffer text. An overlaid file that leaves the routing (deleted, moved out of a
     /// module) drops out like any other file.
+    ///
+    /// A template buffer is expanded again from the buffer text with its module's `scope.json`.
+    /// One that does not expand has no symbols while it is broken and carries its diagnostic
+    /// (in [`SymbolTable::diagnostics`]); fixing the buffer clears both.
     pub fn overlay(&mut self, path: &RelPath, text: &str) {
+        let scope = self.scope_of(path).1;
         if let Some(f) = self.files.get_mut(path) {
-            f.occs = resolve(scan(path, f.dest.as_ref(), text), &f.ns);
+            let s = scan_file(path, f.dest.as_ref(), text, &scope);
+            f.occs = resolve(s.occs, &f.ns);
+            f.anchors = s.anchors;
+            f.template = s.template;
+            f.error = s.error;
             f.lines = line_starts(text);
             f.hash = [0; 32];
             f.overlay = true;
         }
+    }
+
+    /// The `scope.json` (hash, value) of the module holding `path`; (zero, null) outside one.
+    fn scope_of(&self, path: &RelPath) -> (Hash, Arc<Value>) {
+        self.scopes
+            .iter()
+            .find(|(m, _)| {
+                path.as_str()
+                    .strip_prefix(m.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+            })
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
     }
 
     /// Ends the overlay of `path` (the editor closed the buffer): the next

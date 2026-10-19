@@ -305,6 +305,10 @@ fn fixture_table_definitions_and_references() {
             "src/vehicles/spawner.gen.ts",
             "src/vehicles/texts/en_US.lang",
             "src/vehicles/texts/en_US.lang",
+            // the template: its loop body maps to the one source line
+            "src/world/functions/convoy.mcfunction",
+            "src/world/functions/convoy.mcfunction",
+            "src/world/functions/convoy.mcfunction",
             "src/world/functions/spawn.mcfunction",
             "src/world/functions/spawn.mcfunction",
         ]
@@ -344,7 +348,7 @@ fn find_ranks_exact_prefix_substring_and_is_schema_1() {
     assert_eq!(lamp.len(), 1);
     assert_eq!(lamp[0].definitions[0].line, Some(4));
     let car = &t.find("demo:car", &[SymbolKind::Entity], 1)[0];
-    assert_eq!(car.references, 10);
+    assert_eq!(car.references, 13);
     assert_eq!(
         (car.definitions[0].line, car.definitions[0].column),
         (Some(6), Some(22))
@@ -400,7 +404,7 @@ fn rename_car_matches_the_expected_tree() {
     }
     // `demo:car_key` and `demo:car_parked` are other names
     assert!(fixes.iter().all(|f| f.end - f.start <= "demo:car".len()));
-    assert_eq!(fixes.len(), 11);
+    assert_eq!(fixes.len(), 14);
 }
 
 #[test]
@@ -425,7 +429,7 @@ fn rename_multi_kind_renames_block_and_item_together() {
     assert!(e.message.contains("ambiguous"), "{}", e.message);
     // `--kind` with a single defining kind is not ambiguous
     let f = symbols::rename(&t, Some(SymbolKind::Entity), "demo:car", "demo:truck").unwrap();
-    assert_eq!(f.len(), 11);
+    assert_eq!(f.len(), 14);
 }
 
 #[test]

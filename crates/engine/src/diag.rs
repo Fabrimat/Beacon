@@ -221,6 +221,10 @@ codes! {
     /// A legacy map read an environment variable; its value at migration time decided the
     /// output. Port the branch to a target `define` or `ctx.edition`.
     MigrateEnvRead = "BCN0106", Note;
+    /// Migration kept a subfunctions `.mcfunction` source as it is: Beacon expands it at build
+    /// time, and its expansion was checked equal to the legacy output. Its module's
+    /// `scope.json` holds the scope names it reads.
+    MigrateTranslated = "BCN0107", Note;
     /// A `legacy_filter` plugin (a Regolith filter run as an external process) failed or
     /// exited non-zero.
     LegacyFilterFailed = "BCN0120", Error;
@@ -307,6 +311,20 @@ codes! {
     /// This build has no update key or no update feed, so the updater is off. Updates are
     /// never installed without a verified signature.
     UpdateDisabled = "BCN0211", Note;
+    /// An `.mcfunction` template (subfunctions syntax) or its module's `scope.json` is
+    /// malformed: bad indentation, a malformed block header, `UNPACK:SUBFUNCTION` not on line 1,
+    /// a command where only definitions are allowed, a subfunction defined twice, or a
+    /// construct Beacon does not expand (`if`, `functiontree`, `UNPACK:HERE`, `>`, `assert`):
+    /// expand that part by hand or port it to a generator. Reported at the template's line.
+    TemplateSyntax = "BCN0220", Error;
+    /// An `eval` expression of an `.mcfunction` template failed (unknown name, missing key,
+    /// wrong type) or uses syntax Beacon does not evaluate: only names, int/float/string
+    /// literals, `x[i]`/`x['k']`, parentheses and `+ - *` are expanded; `foreach` takes lists.
+    TemplateExpr = "BCN0221", Error;
+    /// An `.mcfunction` template hit a limit (loop iterations, evaluated lines, output lines,
+    /// files or bytes, block or expression nesting). Templates run untrusted, so every limit
+    /// is an error, never a truncated output.
+    TemplateLimit = "BCN0222", Error;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

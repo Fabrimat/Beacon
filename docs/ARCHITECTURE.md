@@ -1160,8 +1160,13 @@ phase-3 row:
   (concurrent `stop` entries first, as `MapTs.apply`), case-insensitive source lookup with a
   portability warning, `UNPACK:SUBFUNCTION` folders, the content-guide fields stripped like the
   filter does, `text_replacer` on fragments and script sources (import specifiers kept),
-  subfunctions syntax left after ModularMC frozen from the oracle's expansion (Beacon does not
-  implement the subfunctions language), data-dir `package.json` moved to the root with `file:`
+  subfunctions syntax in `.mcfunction` sources translated or frozen, oracle-gated (Beacon
+  expands the supported subset at build time: a source whose expansion, from a scope rebuilt from
+  the static layers `scope.json` + `settings.scope` -> `_group_scope.json` -> `_scope.json`,
+  equals the legacy output stays a source and its module gets a `scope.json` of the names it
+  reads (`MigrateTranslated`); anything else, such as an unsupported construct, a scope computed
+  in `_map.py`, conflicting values in one module, or any `.lang`, is frozen from the legacy
+  expansion with the reason listed to port), data-dir `package.json` moved to the root with `file:`
   packages vendored under `vendor/`, `scriptModules` from the legacy manifest's `module_name`
   dependencies, `packMeta.packDependencies` from the legacy BP/RP dependency directions.
 - **Build changes made for migration**: bundler externals are exactly `@minecraft/server` plus
@@ -1302,15 +1307,17 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   rebuilt only on key-set changes, merge by sorted runs, ledger written without read-back,
   symbols memo; local JSON p95 60.6 -> 36 ms (macOS CI had reached 95.5 ms of 100).
 
-### 14.5 Phase 5 (in progress)
+### 14.5 Phase 5 as built (alpha; human exit criteria open)
 
 Managed dev world: the default is now real (14.2), so Play needs no manual world or pack
 activation; the API index is not preselected in the setup wizard (decision 6).
 
 Roadmap row: desktop app (Play, visual settings and `module.json` forms, trust prompt) + setup
-wizard + `beacon test` on BDS + signing/distribution + updater. Exit criteria (both need a
-human, both **OPEN**): (1) clean Windows machine: install -> Play in under 5 minutes, no other
-installs; (2) a non-coder completes it unaided.
+wizard + `beacon test` on BDS + signing/distribution + updater. **Built** (the waves below);
+the exit criteria need a human and are **OPEN**: (1) clean Windows 11 machine: install -> Play
+in under 5 minutes, no other installs, ending in the in-game world with the chat line
+`<namespace> loaded`; (2) a non-coder completes it unaided. Phase 4's human F5 breakpoint run
+is also still open.
 
 Binding decisions for this phase: release artifacts are **unsigned** and **nothing is
 published** (no GitHub release, no store, no live update feed); signing is a hook that is off.
@@ -1387,7 +1394,7 @@ is verified only on The-Great-Adventure.
   `settings_write` validates with the same parsers the build uses (`ModuleJson`,
   `ProjectConfig`) and writes through a new daemon MCP write tool (`write_settings`, grant
   `edit`): stale base = `DocumentStale` (new, `BCN0164`), dirty editor buffer =
-  `DocumentDirty`. **As built in the alpha: `module.json` forms only (wave 4, pending);**
+  `DocumentDirty`. **As built in the alpha: `module.json` forms only (built in wave 4);**
   `config.json` forms come after. The writer edits only the changed values in the existing text (key order,
   comments and formatting of untouched parts kept); it never re-serializes the whole file.
 

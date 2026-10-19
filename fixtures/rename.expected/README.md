@@ -13,6 +13,9 @@ test copies this project to a temp dir, renames, and compares byte for byte.
 - `summon demo:car` and `@e[type=demo:car]` in another module (`src/world`);
 - a script literal `"demo:car"` and a template head `` `${ns}:car` `` (`scripts/lib/ids.ts`);
 - a literal in a generator (`spawner.gen.ts`).
+- three literals in a `.mcfunction` template (`src/world/functions/convoy.mcfunction`, with
+  `src/world/scope.json`): scanned through the expansion, edited once per source literal, not once
+  per loop iteration.
 
 `demo:car_key` and `demo:car_parked` are other names and stay. `demo:lamp` is a block and an
 item under one name (renamed together). `demo:horn` is referenced from the static output

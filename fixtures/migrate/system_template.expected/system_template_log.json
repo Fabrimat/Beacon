@@ -87,6 +87,22 @@
 			}
 		]
 	},
+	"BP/functions/golem/waves.mcfunction": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/waves.mcfunction",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/functions/golem/gated.mcfunction": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/gated.mcfunction",
+				"status": "Created."
+			}
+		]
+	},
 	"BP/spawn_rules/golem_red.json": {
 		"sources": [
 			{

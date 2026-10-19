@@ -79,7 +79,7 @@ pub fn with_table<R>(
 
 /// Opens (or replaces) the overlay of `rel` in the session's table.
 pub fn set_overlay(st: &mut crate::daemon::EngineState, trusted: bool, rel: &RelPath, text: &str) {
-    st.set_open(rel, true);
+    st.set_open(rel, Some(text));
     with_table(st, trusted, |_, _| ());
     if let Some(t) = st.session(trusted).symbols_mut() {
         t.overlay(rel, text);
@@ -88,7 +88,7 @@ pub fn set_overlay(st: &mut crate::daemon::EngineState, trusted: bool, rel: &Rel
 
 /// Never creates a session: none means nothing is open.
 pub fn close_overlays(st: &mut crate::daemon::EngineState, trusted: bool, rels: &[RelPath]) {
-    rels.iter().for_each(|r| st.set_open(r, false));
+    rels.iter().for_each(|r| st.set_open(r, None));
     if let Some(t) = st.session_if_exists(trusted).and_then(|s| s.symbols_mut()) {
         for r in rels {
             t.close_overlay(r);

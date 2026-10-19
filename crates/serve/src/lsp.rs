@@ -275,7 +275,8 @@ impl Server<'_> {
                 let Ok(p) = serde_json::from_value::<DidChangeTextDocumentParams>(n.params) else {
                     return false;
                 };
-                // full sync: the last change is the whole text (a ranged one is not ours)
+                // full sync: the last change is the whole text; a ranged one is not ours, so
+                // the buffer is unknown: dirty (writes refuse it) until a full text or close
                 match p.content_changes.into_iter().last() {
                     Some(c) if c.range.is_none() => self.set(
                         &p.text_document.uri,
@@ -283,7 +284,16 @@ impl Server<'_> {
                         c.text,
                         opened,
                     ),
-                    _ => false,
+                    _ => {
+                        if let Some(rel) = convert::rel_of(&self.root, &p.text_document.uri)
+                            && self.docs.contains_key(&rel)
+                        {
+                            let _ = catch_unwind(AssertUnwindSafe(|| {
+                                self.handle.call(move |st| st.set_open_unknown(&rel));
+                            }));
+                        }
+                        false
+                    }
                 }
             }
             "textDocument/didClose" => {
