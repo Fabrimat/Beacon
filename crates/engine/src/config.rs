@@ -246,7 +246,7 @@ pub struct TargetDef {
     pub define: BTreeMap<String, Value>,
     /// Project-relative world folder (`dev` world, `mcworld`, `mctemplate`, `marketplace`).
     #[serde(default)]
-    pub world: Option<String>,
+    pub world: WorldSetting,
     /// Overrides the world's `LevelName`.
     #[serde(default)]
     pub world_name: Option<String>,
@@ -267,6 +267,38 @@ pub struct TargetDef {
     pub level_dat: BTreeMap<String, Value>,
     #[serde(default)]
     pub template: TemplateOptions,
+}
+
+/// `targets.<t>.world`: a folder, `false` (no world), or absent (`dev`: a managed world).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WorldSetting {
+    #[default]
+    Default,
+    Off,
+    Dir(String),
+}
+
+impl WorldSetting {
+    /// The project world folder, if one is set.
+    pub fn dir(&self) -> Option<&String> {
+        match self {
+            WorldSetting::Dir(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for WorldSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Null => Ok(WorldSetting::Default),
+            Value::Bool(false) => Ok(WorldSetting::Off),
+            Value::String(s) => Ok(WorldSetting::Dir(s)),
+            _ => Err(serde::de::Error::custom(
+                "expected a world folder (string) or false",
+            )),
+        }
+    }
 }
 
 fn yes() -> bool {

@@ -298,8 +298,8 @@ fn validate_release(
                         .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_owned())
                 };
                 let (world, skins) = match d.artifact {
-                    Artifact::McTemplate => (trim(&d.world), None),
-                    Artifact::Marketplace => (trim(&d.world), trim(&d.skins)),
+                    Artifact::McTemplate => (trim(&d.world.dir().cloned()), None),
+                    Artifact::Marketplace => (trim(&d.world.dir().cloned()), trim(&d.skins)),
                     Artifact::SkinPack => (None, trim(&d.skins)),
                     _ => (None, None),
                 };

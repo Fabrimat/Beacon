@@ -158,7 +158,7 @@ pub struct Step {
     /// Download size in bytes, from the pin.
     pub bytes: u64,
     pub status: StepStatus,
-    /// Pre-selected in the wizard (esbuild and the API index; BDS never is).
+    /// Pre-selected in the wizard (esbuild only; the API index and BDS never are).
     pub default_selected: bool,
     /// The step needs the Minecraft EULA accepted first (BDS).
     pub needs_eula: bool,

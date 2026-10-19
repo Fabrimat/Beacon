@@ -46,6 +46,13 @@ fn seed_esbuild(home: &Path) -> PathBuf {
 }
 
 /// Nothing was downloaded: no file other than what the test seeded is in the tools dir.
+/// BDS has no pin on macOS: there it is `unsupported`, elsewhere `missing` until installed.
+const BDS_ABSENT: &str = if cfg!(target_os = "macos") {
+    "unsupported"
+} else {
+    "missing"
+};
+
 fn tools_files(home: &Path) -> usize {
     std::fs::read_dir(home.join("tools")).map_or(0, |d| d.count())
 }
@@ -77,10 +84,18 @@ fn dry_run_json_shape() {
         .collect();
     assert_eq!(tools, ["esbuild", "apiIndex", "bds"]);
     for s in v["steps"].as_array().unwrap() {
-        assert_eq!(s["status"], "missing");
-        assert!(s["bytes"].as_u64().unwrap() > 0 && !s["version"].as_str().unwrap().is_empty());
+        let absent = if s["tool"] == "bds" {
+            BDS_ABSENT
+        } else {
+            "missing"
+        };
+        assert_eq!(s["status"], absent, "{}", s["tool"]);
+        if absent == "missing" {
+            assert!(s["bytes"].as_u64().unwrap() > 0 && !s["version"].as_str().unwrap().is_empty());
+        }
     }
     assert_eq!(step(&v, "esbuild")["defaultSelected"], true);
+    assert_eq!(step(&v, "apiIndex")["defaultSelected"], false);
     assert_eq!(step(&v, "bds")["defaultSelected"], false);
     assert_eq!(step(&v, "bds")["needsEula"], true);
     assert_eq!(tools_files(h.path()), 0, "dry run downloads nothing");
@@ -94,7 +109,7 @@ fn named_tool_only_and_no_names_installs_nothing() {
     let v = json(&beacon(h.path(), &["setup", "--json", "--yes"]));
     assert_eq!(step(&v, "esbuild")["status"], "installed");
     assert_eq!(step(&v, "apiIndex")["status"], "missing");
-    assert_eq!(step(&v, "bds")["status"], "missing");
+    assert_eq!(step(&v, "bds")["status"], BDS_ABSENT);
     // esbuild named and present: stays installed, the others are untouched (no download)
     let o = beacon(h.path(), &["setup", "esbuild", "--json", "--yes"]);
     assert_eq!(o.status.code(), Some(0));
@@ -119,7 +134,7 @@ fn unconfirmed_download_is_declined() {
         assert_eq!(step(&v, t)["status"], "declined", "{t}");
         assert_eq!(step(&v, t)["diagnostic"]["code"], code_needs_confirm());
     }
-    assert_eq!(step(&v, "bds")["status"], "missing");
+    assert_eq!(step(&v, "bds")["status"], BDS_ABSENT);
     assert_eq!(tools_files(h.path()), 0);
 }
 
@@ -131,6 +146,9 @@ fn code_needs_confirm() -> String {
 
 #[test]
 fn bds_without_eula_is_bcn0193_and_downloads_nothing() {
+    if cfg!(target_os = "macos") {
+        return; // no BDS pin on macOS: the step is unsupported (unit-tested in setup.rs)
+    }
     let h = tempfile::tempdir().unwrap();
     let o = beacon(h.path(), &["setup", "bds", "--json", "--yes"]);
     assert_eq!(o.status.code(), Some(2));

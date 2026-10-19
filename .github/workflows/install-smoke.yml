@@ -1,0 +1,105 @@
+# Install smoke (phase 5, 3B): the automatable half of exit criterion 1 ("clean Windows: install ->
+# Play in under 5 minutes, no other installs"), on a fresh windows-latest, against the unsigned
+# installer that `desktop.yml` built. Times silent install -> first launch -> project -> Play into a
+# temp com.mojang -> packs deployed (fails over 5 minutes), then reinstall and uninstall with the
+# Play daemon alive, and checks the data dir survives. Also measures the app budgets
+# (app_idle_rss_mb, installer_size_mb) with `perf app`.
+#
+# NOT covered, stays OPEN: launching Minecraft (CI has no game and no signed-in account:
+# BEACON_COM_MOJANG skips the launch) and a human on a clean machine (docs/alpha-test.md).
+#
+# "No other installs": the windows-latest image ships Node, Python, Git and more, so a clean machine
+# is not available. The scrub is at the process level: scripts/install-smoke.ps1 removes every PATH
+# directory holding node/npm/pnpm/yarn/python/pip/git/deno/bun and verifies none resolves before it
+# launches the app. It proves the app never needs them on PATH, not that they are not on disk; use
+# scripts/sandbox/install-smoke.wsb (Windows Sandbox) for a truly clean machine. The runner is an
+# elevated admin: "no UAC prompt" is therefore only checked indirectly here (per-user dir, HKCU-only
+# registration); a standard-user run (Sandbox is admin too; a plain VM) proves the rest.
+name: install-smoke
+
+on:
+  workflow_run:
+    workflows: [desktop]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: "desktop.yml run id whose beacon-windows-nsis artifact to test"
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows:
+    name: windows (install -> packs deployed, budgets)
+    # workflow_run fires for every desktop run and runs privileged (token, default-branch workflow):
+    # only successful runs of this repository's own code (never a fork PR) are used.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run-id }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: beacon-windows-nsis
+          path: installer
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Install smoke (timings, fails over 5 minutes)
+        shell: pwsh
+        run: |
+          $i = (Get-ChildItem installer/*-setup.exe | Select-Object -First 1).FullName
+          ./scripts/install-smoke.ps1 -Installer $i -OutJson install-smoke-timings.json -MaxMinutes 5
+        env:
+          NO_COLOR: "1"
+
+      - name: Timings to the job summary
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path install-smoke-timings.json) {
+            $r = Get-Content install-smoke-timings.json -Raw | ConvertFrom-Json
+            "### Install smoke: $(if ($r.pass) { 'PASS' } else { 'FAIL' }), install -> packs deployed $($r.installToPacksDeployedSeconds) s (limit $($r.limitSeconds) s)" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "| step | ok | seconds |`n|---|---|---|" | Add-Content $env:GITHUB_STEP_SUMMARY
+            $r.steps | ForEach-Object { "| $($_.step) | $($_.ok) | $($_.seconds) |" } | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      # App budgets: needs the installed app (the smoke above uninstalled it), so install again.
+      # Toolchain pinned by rust-toolchain.toml; the harness is a plain workspace crate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: App budgets (app_idle_rss_mb, installer_size_mb; enforced)
+        shell: pwsh
+        run: |
+          cargo build --release -p beacon-perf
+          $i = (Get-ChildItem installer/*-setup.exe | Select-Object -First 1).FullName
+          $p = Start-Process $i -ArgumentList '/S' -PassThru -Wait
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Beacon'
+          $app = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notin 'beacon.exe', 'esbuild.exe', 'uninstall.exe' } | Select-Object -First 1
+          try {
+            ./target/release/beacon-perf.exe app --app $app.FullName --installer $i --enforce --json app-budgets.json 2>&1 | Tee-Object -FilePath app-budgets.txt
+            if ($LASTEXITCODE -ne 0) { throw "app budgets failed ($LASTEXITCODE)" }
+          } finally {
+            Get-Content app-budgets.txt -ErrorAction SilentlyContinue | Add-Content $env:GITHUB_STEP_SUMMARY
+            Start-Process (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -Wait
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: install-smoke-timings
+          path: |
+            install-smoke-timings.json
+            app-budgets.json
+            app-budgets.txt
+          if-no-files-found: warn

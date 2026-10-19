@@ -11,6 +11,16 @@ packs.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Backlog](docs/BACKLOG.md)
 
+## Install (alpha, Windows)
+
+Alpha builds are **unsigned** and not published: the Windows installer comes from a link
+someone gives you. Windows shows "Windows protected your PC": click **More info**, then **Run
+anyway**. No administrator rights are needed.
+
+Requirements: Windows 11, and Minecraft (Bedrock, from the Store) started once, signed in, and
+left at the main menu. Then open Beacon, click Continue on Setup, create a project and click
+Play. Step-by-step test script: [docs/alpha-test.md](docs/alpha-test.md).
+
 ## Development
 
 ```sh

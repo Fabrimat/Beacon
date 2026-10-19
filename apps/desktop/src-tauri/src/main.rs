@@ -13,6 +13,8 @@
 //! bundler's `download::verified` expects: `AppCore::first_launch` does it (hash-checked, see
 //! `crates/serve/src/app/setup.rs`).
 
+mod smoke;
+
 use beacon_serve::app::{
     AppCore, AppError, AppInfo, AppResult, PlayReport, ProjectSummary, SettingsDoc, SettingsFile,
     TrustPrompt, TrustState,
@@ -182,6 +184,10 @@ fn beacon_exe() -> PathBuf {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--smoke") {
+        std::process::exit(smoke::run(&args));
+    }
     tauri::Builder::default()
         .manage(AppCore::new(beacon_exe()).first_launch())
         .manage(TailStop::default())

@@ -1,0 +1,17 @@
+<!-- Windows Sandbox: a clean Windows with no Node, Python or Git and no Minecraft.
+     Copy the installer (*-setup.exe) and scripts\install-smoke.ps1 into C:\beacon-smoke (or edit
+     HostFolder), then open this file. It runs the smoke and leaves install-smoke-timings.json in
+     that folder. The Sandbox user is an administrator, so "no UAC" is not provable there; use a
+     standard-user VM for that line. Needs the "Windows Sandbox" feature (Windows 11 Pro). -->
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\beacon-smoke</HostFolder>
+      <SandboxFolder>C:\smoke</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$i = (Get-ChildItem C:\smoke\*-setup.exe | Select-Object -First 1).FullName; C:\smoke\install-smoke.ps1 -Installer $i -OutJson C:\smoke\install-smoke-timings.json"</Command>
+  </LogonCommand>
+</Configuration>

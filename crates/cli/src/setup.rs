@@ -48,7 +48,7 @@ fn step(tool: Tool, version: &str, bytes: u64, status: StepStatus) -> Step {
         version: version.to_owned(),
         bytes,
         status,
-        default_selected: tool != Tool::Bds,
+        default_selected: tool == Tool::Esbuild,
         needs_eula: tool == Tool::Bds,
         diagnostic: None,
     }

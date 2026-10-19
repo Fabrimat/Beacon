@@ -9,9 +9,26 @@
 # = every artifact is unsigned (SmartScreen / Gatekeeper prompts are part of the human test).
 name: desktop
 
+# The 45-minute jobs run only when something they build changed.
 on:
   push:
+    paths:
+      - "apps/desktop/**"
+      - "crates/**"
+      - "templates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop.yml"
   pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "crates/**"
+      - "templates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop.yml"
   workflow_dispatch:
 
 permissions:
@@ -41,8 +58,16 @@ jobs:
             . -> target
             apps/desktop/src-tauri -> target
 
+      # Exact version (the one the installer was verified with), binary cached: no 5-minute rebuild.
+      - name: Cache the Tauri CLI
+        id: tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri*
+          key: tauri-cli-2.12.3-${{ runner.os }}
       - name: Install the Tauri CLI
-        run: cargo install tauri-cli --locked --version "^2"
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --locked --version 2.12.3
 
       - name: Install UI dependencies
         working-directory: apps/desktop
@@ -104,7 +129,13 @@ jobs:
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
-      - run: cargo install tauri-cli --locked --version "^2"
+      - id: tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri*
+          key: tauri-cli-2.12.3-${{ runner.os }}
+      - if: steps.tauri-cli.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --locked --version 2.12.3
       - working-directory: apps/desktop
         run: pnpm install --frozen-lockfile
       - working-directory: apps/desktop

@@ -463,3 +463,15 @@ Content log (verified): `ContentLog<date>_1.txt`, one per game start, lines `HH:
 Settings > Creator > "Enable Content Log File" is on: with it off, both games wrote only
 `Debug_Log*.txt` on today's launches. UWP/Preview folders unverified: not tailed. The shell must
 call `AppCore::content_log_tail` after `play` (see `crates/serve/src/app/play.rs`).
+
+## 3C notes (2026-10-19)
+
+- `docs/alpha-test.md`, the README install section and ARCHITECTURE 14.5 (as built) done.
+- Mismatches found: (a) the template prints `<namespace> loaded` (e.g. `my_addon loaded`), not
+  "Beacon minimal loaded"; (b) the template's `dev` target has no `world`, so no managed dev
+  world is made and the tester must create a world and activate the dev packs by hand; (c)
+  `init_create` makes a trusted project, so the trust prompt is not shown in the happy path;
+  (d) Setup.tsx preselects the API index (`defaultSelected`) inside the collapsed "Optional
+  tools", so Continue downloads it, against decision 6 (optional, Settings); (e) the plan's
+  14.5 text on trust (`DocumentStale`), grants, PATH, updater, esbuild was stale: fixed in
+  ARCHITECTURE only (the text above is the original contract).

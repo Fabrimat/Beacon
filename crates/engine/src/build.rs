@@ -686,8 +686,8 @@ impl Session {
                 skins.push((trim_rel(d).to_owned(), t.edition)); // store zip embeds the skin pack
             }
             let (list, dir) = match t.artifact {
-                Artifact::McTemplate | Artifact::Marketplace => (&mut worlds, &t.world),
-                Artifact::SkinPack => (&mut skins, &t.skins),
+                Artifact::McTemplate | Artifact::Marketplace => (&mut worlds, t.world.dir()),
+                Artifact::SkinPack => (&mut skins, t.skins.as_ref()),
                 _ => continue,
             };
             if let Some(d) = dir {
@@ -751,8 +751,8 @@ impl Session {
                     ids.extend([o.clone(), format!("{o}/BP"), format!("{o}/RP")]);
                 }
                 let (world, skins) = match (plan.artifact, plan.def.as_ref()) {
-                    (Some(Artifact::McTemplate), Some(d)) => (d.world.as_ref(), None),
-                    (Some(Artifact::Marketplace), Some(d)) => (d.world.as_ref(), d.skins.as_ref()),
+                    (Some(Artifact::McTemplate), Some(d)) => (d.world.dir(), None),
+                    (Some(Artifact::Marketplace), Some(d)) => (d.world.dir(), d.skins.as_ref()),
                     (Some(Artifact::SkinPack), Some(d)) => (None, d.skins.as_ref()),
                     _ => (None, None),
                 };

@@ -3,6 +3,8 @@
 //! ```text
 //! cargo perf run   --beacon <exe> --project <dir> [--runs 50] [--idle-secs 30] [--json out.json]
 //!                  [--enforce] [--phase 1]
+//! cargo perf app   --app <installed app exe> [--installer <setup.exe>] [--idle-secs 90] [--json out.json]
+//!                  [--enforce]      (phase 5: app_idle_rss_mb, installer_size_mb; see `app.rs`)
 //! cargo perf local <path-to-real-project> [same flags except --project; --beacon defaults to
 //!                  target/release/beacon[.exe]]
 //! ```
@@ -15,6 +17,8 @@
 //! Drives the real `beacon` (always `--trust`; `BEACON_ESBUILD` is inherited). Cold build = no
 //! `.beacon/` and no `packs/`; the OS file cache stays warm. Watch latency = byte-changing edit
 //! of an `*.item.json` / `scripts/*.ts` -> timestamp of the next `built` event of `watch --json`.
+
+mod app;
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -498,7 +502,14 @@ fn real_main() -> Result<bool, String> {
                 .join(exe)
         }),
         runs: num("--runs", 50)? as usize,
-        idle: Duration::from_secs(num("--idle-secs", 30)?),
+        idle: Duration::from_secs(num(
+            "--idle-secs",
+            if args.first().is_some_and(|a| a == "app") {
+                90
+            } else {
+                30
+            },
+        )?),
         json: val("--json").map(PathBuf::from),
         enforce: args.iter().any(|a| a == "--enforce"),
         phase: num("--phase", 1)? as u32,
@@ -507,6 +518,14 @@ fn real_main() -> Result<bool, String> {
         return Err("--runs must be >= 1".into());
     }
     let tmp = env::temp_dir().join(format!("beacon-perf-{}", process::id()));
+    if args.first().map(String::as_str) == Some("app") {
+        let app = val("--app").ok_or("--app required")?;
+        return app::run(
+            &o,
+            Path::new(&app),
+            val("--installer").as_deref().map(Path::new),
+        );
+    }
     match args.first().map(String::as_str) {
         Some(cmd @ ("run" | "local")) => {
             let src = if cmd == "run" {

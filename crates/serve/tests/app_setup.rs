@@ -14,7 +14,7 @@ fn step(tool: Tool) -> Step {
         version: "1".into(),
         bytes: 1,
         status: StepStatus::Missing,
-        default_selected: tool != Tool::Bds,
+        default_selected: tool == Tool::Esbuild,
         needs_eula: tool == Tool::Bds,
         diagnostic: None,
     }

@@ -316,8 +316,8 @@ scripts, and functions, plus new content depending on all of them).
     world, and used for dev deploy.
 - **Dev deploy and order**: `development_*_packs` folders carry no order of their own; order
   comes from the world's pack list. The `dev` target therefore manages a **dev world**
-  (`targets.dev.world`, default: a Beacon-created world per project) whose pack lists it
-  writes on every deploy.
+  (`targets.dev.world`, default: a Beacon-created world per project, `false` for none) whose
+  pack lists it writes on every deploy.
 - No folder renaming, no symlinks (the VFS makes them unnecessary).
 - Absent `outputs`: one implicit output mapped to `packs.behaviorPack` / `packs.resourcePack`.
 - **Dependencies are declared** (`dependsOn`); each BP depends on its own RP by default.
@@ -1070,6 +1070,11 @@ truth (`crates/engine/src/{path,model,host,diag,event}.rs` are the contract modu
   afterwards Beacon owns only its two pack-list files; a world folder without Beacon's
   ledger, or reached through a link, is refused. Two dev targets of one edition get separate
   folders but share dev UUIDs (deploy one at a time).
+  **Default is real (phase 5):** a dev target without `world` seeds a generated flat creative
+  world (cheats on, `LevelName` = project name, edition table applied) on its first deploy,
+  existing projects included; `"world": false` opts out. Only a folder with Beacon's ledger is
+  ever rewritten. Verified: the game lists worlds under `Users/Shared/.../minecraftWorlds`
+  and loads this `level.dat` without a corruption event.
 - **Derived registries:** `item_texture.json` / `terrain_texture.json` fragments (`ns:<stem>`)
   from sibling pngs, `item()/block({texture})`, and `module.json` `itemTextures` /
   `terrainTextures`; `hooks.tick` -> `functions/tick.json`; `hooks.init` ->
@@ -1299,6 +1304,9 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
 
 ### 14.5 Phase 5 (in progress)
 
+Managed dev world: the default is now real (14.2), so Play needs no manual world or pack
+activation; the API index is not preselected in the setup wizard (decision 6).
+
 Roadmap row: desktop app (Play, visual settings and `module.json` forms, trust prompt) + setup
 wizard + `beacon test` on BDS + signing/distribution + updater. Exit criteria (both need a
 human, both **OPEN**): (1) clean Windows machine: install -> Play in under 5 minutes, no other
@@ -1332,7 +1340,11 @@ is verified only on The-Great-Adventure.
   project operations (check, Play's build + deploy, settings writes) go to the project's
   daemon over the owner-only pipe, through `shim::connect` (same discovery, version restart
   and lifetime lock as every other client), on the MCP channel with grants
-  `edit,build,deploy` (never `release`). Things that are not per-project daemon state run in
+  `edit,deploy` (never `build` or `release`: Play uses the MCP `deploy` tool, and the `build`
+  tool refuses dev targets). Each action opens its own connection (`shim::connect`) carrying
+  only that action's grant (Play: `deploy`; settings: `edit`), with read deadlines on the
+  stream, so a trust grant applies on the next click and the daemon can idle out. The daemon
+  command is `[beacon_exe, "serve", "--project", root]`, never the app's own executable. Things that are not per-project daemon state run in
   process: the trust store (`engine::trust`), `init` (`engine::init`). `setup` and `test`
   run the bundled `beacon` binary with `--json` (one implementation for CLI, VS Code and app;
   long downloads and BDS runs are a cancellable child process).
@@ -1343,9 +1355,10 @@ is verified only on The-Great-Adventure.
 - **Trust (5.5)**: the app never sends `trust: true` in its `Hello`; connections are trusted
   only by the stored decision. The prompt (`trust_prompt`) lists what will run (generators,
   script bundling, each plugin, "runs arbitrary code" for external processes) and carries the
-  trust key it was built from; `trust_grant(root, key)` records trust only if the key still
-  matches, else `DocumentStale` and the prompt is shown again (no TOCTOU between what the
-  user read and what is trusted). Projects without code need no prompt (14.1).
+  list it showed (`TrustPrompt.key`); `trust_grant(root, shown)` records trust only if that
+  list still hashes to the project's current trust key. A stale list writes nothing and the
+  call returns `Untrusted` (no `DocumentStale` on the trust path), so the prompt is shown again
+  (no TOCTOU between what the user read and what is trusted). Projects without code need no prompt (14.1).
 - **IPC command set** (`app::COMMANDS`): `app_info`, `setup_status`, `setup_run`,
   `project_open`, `trust_prompt`, `trust_grant`, `init_questions`, `init_create`, `check`,
   `play`, `settings_read`, `settings_write`, `test_run`, `update_check`, `update_install`,
@@ -1356,10 +1369,16 @@ is verified only on The-Great-Adventure.
   webview only through `app::sanitize` (ANSI and control characters stripped, 16 KiB cap) and
   is rendered as React text, never as HTML.
 - **Play** = `build` + `deploy` of the first `dev`-artifact target through the daemon, then the
-  game is launched by URI (`minecraft://` Bedrock, `minecraft-preview://`,
-  `minecraftedu://`; to verify per install). Diagnostics stream in; the content log is tailed
-  from the detected install. Play does not open a specific world (no verified URI for it); the
-  managed dev world (4.3) is in the game's world list.
+  game is launched by URI. Verified 2026-10-19: `minecraft:` (Bedrock GDK) and
+  `minecraftedu:` (Education). Bedrock UWP and Preview are **not verified**: the packs are
+  deployed and `launched` is `false`; no URI is guessed. Nothing is launched when
+  `BEACON_COM_MOJANG` overrides the folder. Diagnostics come back in the report. **Content-log
+  caveat**: the game writes `ContentLog*.txt` (in `%APPDATA%\Minecraft Bedrock\logs\` or
+  `%APPDATA%\Minecraft Education Edition\logs\`) only when Settings > Creator > "Enable Content
+  Log File" is on, otherwise only `Debug_Log*.txt`; the tail then times out quietly. Play does
+  not open a world. The template's `dev` target has no `world`, so the managed dev world (4.3)
+  is generated on the first Play (named after the project, packs applied): the tester opens it
+  from Play > Worlds, nothing to activate (`docs/alpha-test.md`).
 - **Visual settings and `module.json` forms**: rendered from Beacon's own JSON Schemas for
   `module.json` and the `beacon` key of `config.json` (embedded in the engine, also usable as
   `$schema` in editors). A small own form renderer (the field kinds are few: string, enum,
@@ -1368,18 +1387,20 @@ is verified only on The-Great-Adventure.
   `settings_write` validates with the same parsers the build uses (`ModuleJson`,
   `ProjectConfig`) and writes through a new daemon MCP write tool (`write_settings`, grant
   `edit`): stale base = `DocumentStale` (new, `BCN0164`), dirty editor buffer =
-  `DocumentDirty`. The writer edits only the changed values in the existing text (key order,
+  `DocumentDirty`. **As built in the alpha: `module.json` forms only (wave 4, pending);**
+  `config.json` forms come after. The writer edits only the changed values in the existing text (key order,
   comments and formatting of untouched parts kept); it never re-serializes the whole file.
 
 **Setup wizard (9).** `beacon setup [--json] [--dry-run] [--yes] [--accept-eula] [<tool>...]`,
 rendered by the app and the VS Code extension from `engine::setup::SetupReport`
 (`schema: 1`):
 
-- Downloads exactly three things, each on demand, each hash-pinned in the binary: **esbuild**
-  (`crates/bundler` pin, pre-selected), the **API index** (`crates/api` pins, pre-selected),
-  **BDS** (`crates/bds` pin, never pre-selected, only for `beacon test`, only after EULA
-  acceptance). Nothing else is installed: no Node, no Python, no VS Code. Defaults
-  pre-selected, one "Continue".
+- Tools, each hash-pinned in the binary: **esbuild** ships in the installer (second
+  `externalBin`) and is copied into the tools dir on first launch, where the existing hash
+  check finds it, so the first Play needs no download; the **API index** (`crates/api` pins)
+  and **BDS** (`crates/bds` pin, never pre-selected, only for `beacon test`, only after EULA
+  acceptance) are optional downloads. Nothing else is installed: no Node, no Python, no VS
+  Code. One "Continue".
 - **Minecraft detection** (`setup::detect`): Bedrock GDK (`%APPDATA%\Minecraft
   Bedrock\Users\Shared\games\com.mojang`) before UWP (`%LOCALAPPDATA%\Packages\
   Microsoft.MinecraftUWP_8wekyb3d8bbwe\LocalState\games\com.mojang`; a machine that moved to
@@ -1389,7 +1410,8 @@ rendered by the app and the VS Code extension from `engine::setup::SetupReport`
   the edition, never Preview implicitly (`artifact::com_mojang` now delegates to it; behavior
   unchanged). `BEACON_COM_MOJANG` still overrides. No install found = `MinecraftNotFound`
   (`BCN0200`, a warning: build works, Play cannot deploy).
-- `beacon` on PATH is done by the installer (per-user PATH), not by the wizard.
+- **No PATH change** in the alpha: neither the installer nor the wizard puts `beacon` on PATH
+  (nothing on the exit path needs it).
 - **Deviation from 9 step 2**: the VS Code / Cursor / Windsurf extension and MCP registration
   offers move out of the first-run wizard into Settings > Integrations (after the first Play),
   to keep the 5-minute path to one screen.
@@ -1418,8 +1440,10 @@ rendered by the app and the VS Code extension from `engine::setup::SetupReport`
 - **Windows**: Tauri bundler **NSIS**, `installMode: "currentUser"` (per-user, no admin, no
   UAC prompt), WebView2 `embedBootstrapper` (Windows 11 ships WebView2; the bootstrapper
   covers Windows 10 machines without it; the fully offline installer variant is later). The
-  `beacon` CLI is an `externalBin` sidecar; an NSIS installer hook adds the install folder to
-  the per-user PATH and removes it on uninstall. MSI is not used (per-machine, needs admin).
+  `beacon` CLI and `esbuild` are `externalBin` sidecars. An NSIS hook (`windows/hooks.nsh`)
+  makes the default install dir `%LOCALAPPDATA%\Programs\Beacon`, so it never shares a folder
+  with Beacon's data dir `%LOCALAPPDATA%\Beacon`; the installer's directory page may still
+  display the old default (cosmetic). MSI is not used (per-machine, needs admin).
 - **macOS**: `.dmg`, unsigned with an ad-hoc signature (needed for Apple silicon to launch).
   **Linux**: AppImage built, not tested, not release-gated (6.1).
 - **Unsigned pipeline**: `.github/workflows/desktop.yml` builds Windows and macOS on every push
@@ -1436,7 +1460,10 @@ rendered by the app and the VS Code extension from `engine::setup::SetupReport`
 
 **Updater (9).** Contract `serve::update`:
 
-- `tauri-plugin-updater` with Tauri's static feed JSON (`version`, `notes`, `pub_date`,
+- **Alpha: policy only.** There is no `tauri-plugin-updater`; the app has the tested
+  fail-closed `serve::update` and About shows "Updates are off in this build." The rest of
+  this list (plugin, rollback, channels) is the post-alpha design.
+- Design: `tauri-plugin-updater` with Tauri's static feed JSON (`version`, `notes`, `pub_date`,
   `platforms.<os-arch>.{url, signature}`); the plugin verifies the downloaded installer's
   **minisign** signature against the public key compiled into the build before running it
   (minisign as 9.2 names it). The key is generated by the maintainer later
@@ -1465,6 +1492,13 @@ rendered by the app and the VS Code extension from `engine::setup::SetupReport`
 "installer_size_mb", "label": "Windows installer (app + beacon CLI + WebView2 bootstrapper)",
 "budget": 25, "unit": "MB", "phase": 5, "tolerance_pct": 10}`. The CLI's 30 MB binary row is
 unchanged; the app binary is covered by the installer row.
+
+**Status.**
+
+- Waves 1-2 built: desktop shell, setup/doctor, Play, setup wizard.
+- Wave 3 (install smoke, app budgets, human test kit `docs/alpha-test.md`): in progress.
+- Wave 4 pending: `beacon test` on BDS, `module.json` forms, updater UI.
+- Both exit criteria are **OPEN** and need a human.
 
 **Deviations, summarized**: no TCP endpoint (Tauri IPC); the app shell is outside the root
 workspace; editor-extension and MCP offers leave the first-run wizard; WebView2 bootstrapper

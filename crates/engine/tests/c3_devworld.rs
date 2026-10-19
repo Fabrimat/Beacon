@@ -234,7 +234,20 @@ fn missing_world_is_world_not_found() {
 }
 
 #[test]
-fn dev_without_world_deploys_packs_only() {
+fn world_false_deploys_packs_only() {
+    let p = project(
+        r#"[{ "id": "game", "include": ["src/game/**"] }]"#,
+        &dev(r#", "world": false"#),
+    );
+    let out = tempfile::tempdir().unwrap();
+    let r = deploy(p.path(), "dev", out.path());
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    assert_eq!(names(out.path()), ["development_behavior_packs"]);
+}
+
+/// No `world` on the dev target: a generated flat creative world named after the project.
+#[test]
+fn default_world_is_generated_and_only_lists_are_rewritten() {
     let p = project(
         r#"[{ "id": "game", "include": ["src/game/**"] }]"#,
         &dev(""),
@@ -242,7 +255,70 @@ fn dev_without_world_deploys_packs_only() {
     let out = tempfile::tempdir().unwrap();
     let r = deploy(p.path(), "dev", out.path());
     assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
-    assert_eq!(names(out.path()), ["development_behavior_packs"]);
+    let w = worlds(out.path());
+    assert_eq!(w.len(), 1, "{w:?}");
+    let name = w[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("c3 dev-") && name.len() == "c3 dev-".len() + 8,
+        "{name}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w[0].join("levelname.txt")).unwrap(),
+        "c3 dev"
+    );
+    let level = std::fs::read(w[0].join("level.dat")).unwrap();
+    let (_, root) = beacon_engine::nbt::parse_level_dat(&level).unwrap();
+    let get = |k| beacon_engine::nbt::get(&root, k).and_then(|t| t.as_i64());
+    assert_eq!(get("GameType"), Some(1), "creative");
+    assert_eq!(get("Generator"), Some(2), "flat");
+    assert_eq!(get("commandsEnabled"), Some(1), "cheats on");
+    let bp = json(&w[0].join("world_behavior_packs.json"));
+    let dev_manifest = names(&out.path().join("development_behavior_packs"));
+    let manifest = json(
+        &out.path()
+            .join("development_behavior_packs")
+            .join(&dev_manifest[0])
+            .join("manifest.json"),
+    );
+    assert_eq!(ids(&bp), [manifest["header"]["uuid"].as_str().unwrap()]);
+    assert_eq!(bp[0]["version"], manifest["header"]["version"]);
+
+    // second deploy: world data and level.dat untouched, only the lists are rewritten
+    let before = snapshot(&w[0]);
+    let r = deploy(p.path(), "dev", out.path());
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    let after = snapshot(&w[0]);
+    for (path, (bytes, _)) in &before {
+        assert_eq!(&after[path].0, bytes, "{path:?}");
+    }
+    assert_eq!(before.len(), after.len());
+    assert_eq!(std::fs::read(w[0].join("level.dat")).unwrap(), level);
+
+    // deterministic: a fresh deploy of the same project gives the same level.dat
+    let out2 = tempfile::tempdir().unwrap();
+    deploy(p.path(), "dev", out2.path());
+    let w2 = worlds(out2.path());
+    assert_eq!(std::fs::read(w2[0].join("level.dat")).unwrap(), level);
+}
+
+#[test]
+fn default_world_never_touches_a_foreign_folder() {
+    let p = project(
+        r#"[{ "id": "game", "include": ["src/game/**"] }]"#,
+        &dev(""),
+    );
+    let out = tempfile::tempdir().unwrap();
+    deploy(p.path(), "dev", out.path());
+    let w = worlds(out.path());
+    // the player's world now: no ledger
+    std::fs::remove_file(w[0].join(".beacon-emit.json")).unwrap();
+    std::fs::write(w[0].join("world_behavior_packs.json"), b"[\"mine\"]").unwrap();
+    let r = deploy(p.path(), "dev", out.path());
+    assert!(!errors(&r).is_empty(), "{:?}", r.diagnostics);
+    assert_eq!(
+        std::fs::read(w[0].join("world_behavior_packs.json")).unwrap(),
+        b"[\"mine\"]"
+    );
 }
 
 #[test]

@@ -5,8 +5,10 @@
 //! (`<name>-<target>-<worktree8>`): same-named folders would share a ledger, so each deploy
 //! would delete the other's files.
 //!
-//! `targets.<t>.world`: a managed copy of the project world at
-//! `minecraftWorlds/<name>[-<target>]-<worktree8>/`, seeded once (edition transform applied).
+//! The managed dev world (4.3) lives at `minecraftWorlds/<name>[-<target>]-<worktree8>/` and is
+//! seeded once. `targets.<t>.world` set: a copy of that project world (edition transform
+//! applied). Absent (the default): a generated flat creative world with cheats on, named
+//! after the project. `"world": false`: none.
 //! After that only its two pack list files are written (ledger-owned, every deploy); `db/`,
 //! `level.dat` and everything else belong to the game and the player. The source world is
 //! only read. An existing world folder is written only if it is not a link and carries a
@@ -25,10 +27,11 @@ use super::{
     ArtifactCx, com_mojang, contained, escape, fail, link_ok, pack_name, safe_name, worktree8,
 };
 use crate::build::{Attempt, trim_rel};
-use crate::config::Artifact;
+use crate::config::{Artifact, WorldSetting};
 use crate::diag::{Code, Diagnostic};
 use crate::emit;
 use crate::model::{Body, Pack};
+use crate::nbt::{self, Tag};
 use crate::packlist;
 use crate::path::RelPath;
 use crate::world::{self, LevelSpec};
@@ -57,12 +60,16 @@ pub(crate) fn write(cx: &ArtifactCx, a: &mut Attempt) {
     };
     // ponytail: the source world is collected and its level.dat transformed on every deploy
     // (in-memory index, small file); only needed when seeding. Cache if watch gets slow.
-    let source = match plan.def.as_ref().and_then(|d| d.world.as_deref()) {
-        Some(w) => match source(cx, a, trim_rel(w)) {
+    let source = match plan.def.as_ref().map(|d| &d.world) {
+        Some(WorldSetting::Dir(w)) => match source(cx, a, trim_rel(w)) {
             Some(s) => Some(s),
             None => return,
         },
-        None => None,
+        Some(WorldSetting::Default) => match generated(cx, a) {
+            Some(s) => Some(s),
+            None => return,
+        },
+        _ => None,
     };
     let wt = worktree8(cx.root);
     let dev_targets = cx
@@ -135,6 +142,104 @@ fn source(cx: &ArtifactCx, a: &mut Attempt, dir: &str) -> Option<Source> {
             a.diags.push(Diagnostic::new(
                 Code::LevelDatInvalid,
                 format!("{dir}/level.dat: {e}"),
+            ));
+            None
+        }
+    }
+}
+
+/// The default world: no files but a generated `level.dat` (flat, creative, cheats on).
+/// Fixed values only, so the output is deterministic.
+fn generated(cx: &ArtifactCx, a: &mut Attempt) -> Option<Source> {
+    let (plan, def) = (cx.plan, cx.plan.def.as_ref()?);
+    let name = def.world_name.as_deref().unwrap_or(&cx.cfg.name);
+    let v = world::version_parts(&plan.target_version).map(|n| Tag::Int(n as i32));
+    let ver = |tail: [i32; 2]| {
+        Tag::List(
+            nbt::INT,
+            v.iter().cloned().chain(tail.map(Tag::Int)).collect(),
+        )
+    };
+    let layers = r#"{"biome_id":1,"block_layers":[{"block_name":"minecraft:bedrock","count":1},{"block_name":"minecraft:dirt","count":2},{"block_name":"minecraft:grass_block","count":1}],"encoding_version":6,"structure_options":null,"world_version":"version.post_1_18"}"#;
+    let c = |v: Vec<(&str, Tag)>| {
+        Tag::Compound(
+            v.into_iter()
+                .map(|(k, t)| (k.as_bytes().to_vec(), t))
+                .collect(),
+        )
+    };
+    let b = Tag::Byte;
+    let root = c(vec![
+        ("StorageVersion", Tag::Int(10)),
+        ("NetworkVersion", Tag::Int(766)),
+        ("LevelName", Tag::string(name)),
+        ("GameType", Tag::Int(1)),
+        ("Difficulty", Tag::Int(1)),
+        ("Generator", Tag::Int(2)),
+        ("RandomSeed", Tag::Long(0)),
+        ("SpawnX", Tag::Int(0)),
+        ("SpawnY", Tag::Int(4)),
+        ("SpawnZ", Tag::Int(0)),
+        ("LastPlayed", Tag::Long(0)),
+        ("Time", Tag::Long(0)),
+        ("currentTick", Tag::Long(0)),
+        ("SizeOnDisk", Tag::Long(0)),
+        ("ForceGameType", b(0)),
+        ("commandsEnabled", b(1)),
+        ("hasBeenLoadedInCreative", b(1)),
+        ("educationFeaturesEnabled", b(0)),
+        ("eduOffer", Tag::Int(0)),
+        ("spawnMobs", b(1)),
+        ("pvp", b(1)),
+        ("lightningLevel", Tag::Float(0.0)),
+        ("rainLevel", Tag::Float(0.0)),
+        ("lightningTime", Tag::Int(100_000)),
+        ("rainTime", Tag::Int(100_000)),
+        ("FlatWorldLayers", Tag::string(layers)),
+        ("InventoryVersion", Tag::string(&plan.target_version)),
+        ("baseGameVersion", Tag::string("*")),
+        ("MinimumCompatibleClientVersion", ver([0, 0])),
+        ("lastOpenedWithVersion", ver([0, 0])),
+        (
+            "abilities",
+            c(vec![
+                ("flySpeed", Tag::Float(0.05)),
+                ("walkSpeed", Tag::Float(0.1)),
+                ("mayfly", b(0)),
+                ("flying", b(0)),
+                ("instabuild", b(0)),
+                ("invulnerable", b(0)),
+            ]),
+        ),
+        (
+            "experiments",
+            c(vec![
+                ("experiments_ever_used", b(0)),
+                ("saved_with_toggled_experiments", b(0)),
+            ]),
+        ),
+        ("world_policies", c(vec![])),
+    ]);
+    let base = nbt::write_level_dat(10, &root);
+    match world::transform_level_dat(
+        &base,
+        &LevelSpec {
+            edition: plan.edition,
+            target_version: &plan.target_version,
+            name,
+            experiments: &def.experiments,
+            overrides: &def.level_dat,
+        },
+    ) {
+        Ok(level) => Some(Source {
+            files: Vec::new(),
+            level,
+            name: name.to_owned(),
+        }),
+        Err(e) => {
+            a.diags.push(Diagnostic::new(
+                Code::LevelDatInvalid,
+                format!("target {:?}: generated level.dat: {e}", plan.target),
             ));
             None
         }

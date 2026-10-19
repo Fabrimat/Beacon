@@ -42,7 +42,7 @@ pub(crate) fn assemble(
     let def = plan.def.as_ref()?;
     let cfg_at = |d: Diagnostic| d.at(RelPath::parse(CONFIG_FILE).expect("const"), None, None);
     let not_found = |msg: String| Diagnostic::new(Code::WorldNotFound, msg);
-    let Some(world_dir) = def.world.as_deref().map(trim_rel) else {
+    let Some(world_dir) = def.world.dir().map(|w| trim_rel(w)) else {
         a.diags.push(cfg_at(not_found(format!(
             "target {:?}: no `world` folder",
             plan.target
