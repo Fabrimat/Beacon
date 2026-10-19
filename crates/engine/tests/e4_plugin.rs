@@ -26,6 +26,13 @@ struct Env {
 
 /// One `BEACON_HOME` for the whole binary (set before any test touches the environment), and
 /// a hostile `GIT_TEMPLATE_DIR` whose `post-checkout` hook creates `marker`.
+/// Every test here runs git with the process-wide hostile template (`env()`), so a clone in one
+/// test fires the hook marker another test is asserting on: run them one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn env() -> &'static Env {
     static E: OnceLock<Env> = OnceLock::new();
     E.get_or_init(|| {
@@ -156,6 +163,7 @@ fn update(p: &Path, id: &str) -> Vec<PluginUpdate> {
 
 #[test]
 fn unpinned_plugin_is_an_error() {
+    let _serial = serial();
     env();
     if !have_git() {
         return;
@@ -173,6 +181,7 @@ fn unpinned_plugin_is_an_error() {
 
 #[test]
 fn tampered_checkout_is_a_hash_mismatch() {
+    let _serial = serial();
     env();
     if !have_git() {
         return;
@@ -224,6 +233,7 @@ fn tampered_checkout_is_a_hash_mismatch() {
 
 #[test]
 fn update_pins_and_changes_the_trust_key() {
+    let _serial = serial();
     env();
     if !have_git() {
         return;
@@ -266,6 +276,7 @@ fn update_pins_and_changes_the_trust_key() {
 
 #[test]
 fn project_without_pins_keeps_its_trust() {
+    let _serial = serial();
     env();
     let plugins = [json!({"legacyFilter": {"run": [PY, "f.py"], "cwd": "tools"}})];
     let cfg = json!({"type":"minecraftBedrock","name":"p","targetVersion":"1.21.100",
@@ -286,6 +297,7 @@ fn project_without_pins_keeps_its_trust() {
 
 #[test]
 fn hooks_in_the_cloned_repo_never_run() {
+    let _serial = serial();
     let e = env();
     if !have_git() {
         return;
@@ -308,6 +320,7 @@ fn hooks_in_the_cloned_repo_never_run() {
 
 #[test]
 fn hostile_git_environment_is_ignored() {
+    let _serial = serial();
     let e = env();
     if !have_git() {
         return;
