@@ -613,6 +613,8 @@ fn mcp_write_is_refused_for_a_buffer_open_in_lsp() {
         "textDocument/didClose",
         json!({ "textDocument": { "uri": c.uri(rel) } }),
     );
+    // a request round-trip on the same connection: the close was handled before the MCP call
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
     let r = mcp_tool(&c, "rename_symbol", args);
     assert_eq!(r["result"]["isError"], false, "{r}");
     assert!(c.read(rel).contains("demo:truck"));
