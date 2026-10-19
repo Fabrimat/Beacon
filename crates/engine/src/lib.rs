@@ -23,18 +23,21 @@ pub mod path;
 pub mod suffix;
 
 // owned by workstreams
+pub mod agents;
 pub mod archive;
 mod artifact;
 pub mod build;
 mod cache;
 pub mod canonical;
 pub mod emit;
+pub mod init;
 pub mod lock;
 pub mod manifest;
 pub mod merge;
 pub mod nbt;
 mod packlist;
 pub mod registry;
+pub mod release;
 pub mod route;
 pub mod sarif;
 pub mod statics;

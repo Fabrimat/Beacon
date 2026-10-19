@@ -28,7 +28,6 @@ pub(crate) struct ArtifactCx<'a> {
     pub root: &'a Path,
     pub plan: &'a Plan,
     pub cfg: &'a ProjectConfig,
-    #[allow(dead_code)] // read by the phase-2 writers (world, skin, store)
     pub lock: &'a Lockfile,
     /// Every output id, in config order.
     #[allow(dead_code)] // pack order of worlds (4.3)

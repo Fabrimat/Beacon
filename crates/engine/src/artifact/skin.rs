@@ -8,6 +8,7 @@ use crate::config::CONFIG_FILE;
 use crate::diag::{Code, Diagnostic};
 use crate::model::Body;
 use crate::path::RelPath;
+use crate::release;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -90,7 +91,7 @@ pub(crate) fn assemble(
     let name = meta.and_then(|m| m.name.as_deref()).unwrap_or(&cx.cfg.name);
     let desc = meta.and_then(|m| m.description.as_deref()).unwrap_or("");
     let clean = |s: &str| s.replace(['\r', '\n'], " ");
-    // ponytail: release version semantics (4.2.1) come with `beacon pack`; always 1.0.0
+    // placeholder: stamped with the settled version below (the hash blanks it)
     let version = [1, 0, 0];
     let mut entries: Vec<(String, Body)> = vec![(
         "manifest.json".into(),
@@ -139,6 +140,10 @@ pub(crate) fn assemble(
     }
     entries.push(("texts/en_US.lang".into(), Body::Text(en)));
     entries.push(("texts/languages.json".into(), Body::Json(json!(langs))));
+    let hash = release::content_hash(entries.iter().map(|(p, b)| (p.as_str(), b)), cx.vfs);
+    let key = format!("skins:{dir}");
+    let v = release::resolve(&mut a.rel, cx.lock, &mut a.diags, &key, plan.edition, hash)?;
+    release::stamp(&mut entries[0].1, v);
 
     let mut out = Vec::new();
     for (p, b) in entries {

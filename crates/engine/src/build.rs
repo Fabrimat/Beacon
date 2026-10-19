@@ -25,6 +25,7 @@ use crate::lock::Lockfile;
 use crate::manifest::{self, ManifestInput};
 use crate::model::{Body, ContentItem, Dest, Edition, GenCtx, Merge, OutputId, Pack, Version};
 use crate::path::{Hash, RelPath, Vfs};
+use crate::release::{self, OutGen};
 use crate::vfs::Index;
 use crate::{merge, packlist, registry, route, sarif, statics};
 use serde_json::Value;
@@ -52,12 +53,13 @@ pub struct BuildOptions {
 /// Version changes of a release build (4.2.1).
 #[derive(Debug, Clone, Default)]
 pub struct ReleaseOptions {
-    /// `--bump`: at least this bump for changed packs (`auto` policy).
+    /// `--bump`: bump the targeted packs (all, or `only`) by this much even if unchanged;
+    /// changed packs not targeted follow the policy.
     pub bump: Option<Bump>,
     /// `--set-version` (`manual` policy).
     pub set_version: Option<Version>,
     /// `--pack <id>`: only this pack.
-    pub only: Option<String>,
+    pub only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,8 @@ pub(crate) struct Attempt {
     pub artifacts: Vec<String>,
     /// Release builds: the version of every pack written.
     pub packs: Vec<PackVersion>,
+    /// Release build: the versions decided so far and the lock they produce.
+    pub rel: Option<release::State>,
     pub inputs: BTreeSet<RelPath>,
     pub generators_run: usize,
     pub changed: bool,
@@ -690,6 +694,45 @@ impl Session {
             None
         };
 
+        if let (Some(l), Some(r)) = (&lock, &self.opts.release) {
+            if !plans.is_empty() && plans.iter().all(|p| p.artifact == Some(Artifact::Dev)) {
+                a.diags.push(Diagnostic::new(
+                    Code::ConfigField,
+                    "no release targets: dev targets never change versions; pass an archive target or run `beacon pack` without --target",
+                ));
+            }
+            // `--pack` ids must name a pack of a release plan
+            let mut ids = BTreeSet::new();
+            for plan in plans.iter().filter(|p| p.artifact != Some(Artifact::Dev)) {
+                for o in plan.outputs.iter().filter(|o| !is_static(o)) {
+                    ids.extend([o.clone(), format!("{o}/BP"), format!("{o}/RP")]);
+                }
+                let (world, skins) = match (plan.artifact, plan.def.as_ref()) {
+                    (Some(Artifact::McTemplate), Some(d)) => (d.world.as_ref(), None),
+                    (Some(Artifact::Marketplace), Some(d)) => (d.world.as_ref(), d.skins.as_ref()),
+                    (Some(Artifact::SkinPack), Some(d)) => (None, d.skins.as_ref()),
+                    _ => (None, None),
+                };
+                ids.extend(world.map(|d| format!("world:{}", trim_rel(d))));
+                ids.extend(skins.map(|d| format!("skins:{}", trim_rel(d))));
+            }
+            if let Some(bad) = r.only.iter().find(|o| !ids.contains(*o)) {
+                let valid: Vec<&str> = ids.iter().map(String::as_str).collect();
+                a.diags.push(Diagnostic::new(
+                    Code::ConfigField,
+                    format!(
+                        "--pack {bad:?} matches no pack of this release; valid ids: {}",
+                        valid.join(", ")
+                    ),
+                ));
+            }
+            a.rel = Some(release::State::new(
+                r.clone(),
+                &cfg,
+                self.opts.frozen,
+                l.clone(),
+            ));
+        }
         let mut built = Vec::with_capacity(plans.len());
         let mut blocked = Vec::with_capacity(plans.len());
         for plan in &plans {
@@ -749,6 +792,7 @@ impl Session {
                 }
                 scripted.insert(o.clone());
             }
+            let mut gens = Vec::new();
             if let Some(lock) = &lock {
                 for o in plan.outputs.iter().filter(|o| !is_static(o)) {
                     let has = |p: Pack| {
@@ -772,6 +816,12 @@ impl Session {
                         has_bp,
                         has_rp,
                     }));
+                    gens.push(OutGen {
+                        output: o.clone(),
+                        has_bp,
+                        has_rp,
+                        script_entry: scripted.contains(o).then_some(SCRIPT_ENTRY),
+                    });
                 }
             }
             let (derived, d) = registry::derive(&cfg, &routed, plan, &items, &vfs);
@@ -780,6 +830,22 @@ impl Session {
             let (mut merged, d) = merge::resolve(items, &vfs);
             a.diags.extend(d);
             languages(&mut merged, &is_static);
+            // release builds decide versions; archive builds only report a stale release
+            let archive = plan.artifact.is_some_and(|x| x != Artifact::Dev);
+            if let Some(lock) = &lock
+                && (archive || (a.rel.is_some() && plan.artifact != Some(Artifact::Dev)))
+            {
+                release::settle_packs(
+                    &mut a.rel,
+                    lock,
+                    &mut a.diags,
+                    &cfg,
+                    plan,
+                    &gens,
+                    &mut merged,
+                    &vfs,
+                );
+            }
             // two packs with one UUID: report it, and write nothing for this plan
             let present: BTreeSet<(&OutputId, Pack)> = merged
                 .iter()
@@ -806,17 +872,24 @@ impl Session {
         if let Some(lock) = lock.as_ref().filter(|_| emit)
             && !vfs.changed.load(Ordering::Relaxed)
         {
-            for ((plan, merged), _) in plans
-                .iter()
-                .zip(&built)
-                .zip(&blocked)
-                .filter(|(_, blocked)| !**blocked)
+            // a failed release writes nothing and records nothing
+            let skip = a.rel.is_some() && artifact::has_errors(&a.diags);
+            let releasing = a.rel.is_some(); // dev targets are not part of a release
+            for ((plan, merged), _) in
+                plans
+                    .iter()
+                    .zip(&built)
+                    .zip(&blocked)
+                    .filter(|((plan, _), blocked)| {
+                        !(**blocked || skip || releasing && plan.artifact == Some(Artifact::Dev))
+                    })
             {
+                let work = a.rel.as_ref().map(|s| s.work.clone());
                 let cx = ArtifactCx::new(
                     &self.root,
                     plan,
                     &cfg,
-                    lock,
+                    work.as_ref().unwrap_or(lock),
                     &outputs,
                     merged,
                     &vfs,
@@ -825,6 +898,22 @@ impl Session {
                     &mut self.ledgers,
                 );
                 artifact::write(&cx, &mut a);
+            }
+            // the lock changes only after every artifact succeeded
+            if let Some(st) = a.rel.take()
+                && !skip
+                && !artifact::has_errors(&a.diags)
+            {
+                a.packs = st.packs;
+                if st.work != *lock
+                    && let Err(e) = st.work.save(&self.root)
+                {
+                    a.packs.clear();
+                    a.diags.push(Diagnostic::new(
+                        Code::EmitFailed,
+                        format!("cannot write {}: {e}", crate::config::LOCK_FILE),
+                    ));
+                }
             }
         }
         a.changed = vfs.changed.load(Ordering::Relaxed);

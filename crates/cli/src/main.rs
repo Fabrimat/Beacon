@@ -2,10 +2,14 @@
 //! The pipeline is `beacon_engine::build::Session`; this crate wires in the QuickJS host and
 //! the esbuild bundler.
 
+mod fix;
+mod init;
+mod mcp;
+mod pack;
 mod watch;
 
 use beacon_bundler::{Confirm, LazyEsbuild};
-use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
+use beacon_engine::build::{BuildOptions, BuildOutcome, ReleaseOptions, Session};
 use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, Severity, exit};
 use beacon_engine::event::BuildEvent;
@@ -74,6 +78,21 @@ enum Cmd {
     Explain { code: String },
     /// Remember that you trust this project's generators and plugins.
     Trust,
+    /// Release build: bump pack versions from content changes and write the lockfile.
+    ///
+    /// Without `--target`/`--all` this releases the packs projection (`packs.*`), not an archive.
+    /// With `--target`/`--all` it releases the archive targets; dev targets never change versions.
+    Pack(pack::PackArgs),
+    /// Create a new project (prompts on a TTY; flags, `--yes` or `--from` otherwise).
+    Init(init::InitArgs),
+    /// Apply safe fixes (e.g. regenerate the AGENTS.md section).
+    Fix,
+    /// Read-only MCP server on stdio (check, project_info, explain).
+    Mcp {
+        /// Treat the project as trusted for this server's lifetime (operator-chosen; clients cannot set it).
+        #[arg(long)]
+        trust: bool,
+    },
 }
 
 /// `beacon --help --json`: the clap command tree, versioned.
@@ -122,13 +141,17 @@ fn plugins(project: &Path) -> Vec<Value> {
 }
 
 fn session(o: &Opts, a: &BuildArgs) -> Session {
+    session_with(o, a, None)
+}
+
+fn session_with(o: &Opts, a: &BuildArgs, release: Option<ReleaseOptions>) -> Session {
     let opts = BuildOptions {
         target: a.target.clone(),
         all: a.all,
         out: a.out.clone(),
         frozen: a.frozen,
         trusted: a.trust || trust::is_trusted(&o.project, &plugins(&o.project)),
-        release: None,
+        release,
     };
     // Restricted mode never runs the sidecar (5.5), and locating it executes it (`--version`)
     // and may download it: only when trusted. The lookup is lazy (first bundle), so a missing
@@ -228,13 +251,17 @@ fn check(o: &Opts, trusted: bool) -> i32 {
         trust: trusted,
         frozen: false,
     };
-    let r = session(o, &a).check();
+    let mut diags = session(o, &a).check().diagnostics;
+    diags.extend(fix::agent_diags(&o.project));
     if o.json {
-        println!("{}", serde_json::to_string(&r.report.sarif).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string(&sarif::to_sarif(&diags)).unwrap()
+        );
     } else {
-        print_diags(&r.diagnostics);
+        print_diags(&diags);
     }
-    exit_code(&r.diagnostics)
+    exit_code(&diags)
 }
 
 fn explain(code: &str, json: bool) -> i32 {
@@ -310,6 +337,10 @@ fn main() {
         Cmd::Check { trust } => check(&o, trust),
         Cmd::Explain { code } => explain(&code, cli.json),
         Cmd::Trust => trust_cmd(&o),
+        Cmd::Pack(a) => pack::run(&o, &a),
+        Cmd::Init(a) => init::run(&o, a),
+        Cmd::Fix => fix::run(&o),
+        Cmd::Mcp { trust } => mcp::run(&o, trust),
     };
     process::exit(code);
 }

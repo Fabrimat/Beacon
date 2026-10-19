@@ -10,6 +10,7 @@ use crate::diag::{Code, Diagnostic};
 use crate::model::{Body, Pack};
 use crate::packlist;
 use crate::path::RelPath;
+use crate::release;
 use crate::world::{self, LevelSpec};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -166,7 +167,7 @@ pub(crate) fn assemble(
         let desc = meta.and_then(|m| m.description.as_deref()).unwrap_or("");
         let clean = |s: &str| s.replace(['\r', '\n'], " ");
         let t = &def.template;
-        // ponytail: release version semantics (4.2.1) come with `beacon pack`; always 1.0.0
+        // placeholder: stamped with the settled version below (the hash blanks it)
         let version = [1, 0, 0];
         let base = world::version_parts(
             t.base_game_version
@@ -218,12 +219,21 @@ pub(crate) fn assemble(
     for (p, b) in &embedded {
         entries.insert(p, b);
     }
-    Some(
-        entries
-            .into_iter()
-            .map(|(p, b)| (p.clone(), b.clone()))
-            .collect(),
-    )
+    let mut out: Vec<(RelPath, Body)> = entries
+        .into_iter()
+        .map(|(p, b)| (p.clone(), b.clone()))
+        .collect();
+    if kind == Artifact::McTemplate {
+        // the template's content includes the pack lists and embedded packs, so a pack bump
+        // bumps it too (4.2.1)
+        let hash = release::content_hash(out.iter().map(|(p, b)| (p.as_str(), b)), cx.vfs);
+        let key = format!("world:{world_dir}");
+        let v = release::resolve(&mut a.rel, cx.lock, &mut a.diags, &key, plan.edition, hash)?;
+        if let Some((_, b)) = out.iter_mut().find(|(p, _)| p.as_str() == "manifest.json") {
+            release::stamp(b, v);
+        }
+    }
+    Some(out)
 }
 
 /// Writes `entries` as `dist/<name>-<target>.<ext>` (or `--out`) through the containment and

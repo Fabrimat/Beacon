@@ -112,7 +112,7 @@ mod tests {
         let pl = |h: String| PackLock {
             header: h,
             module: String::new(),
-            release: None,
+            ..Default::default()
         };
         let mut l = Lockfile::default();
         for id in ids {

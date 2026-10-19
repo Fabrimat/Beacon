@@ -732,7 +732,7 @@ Transport of `beacon serve`: **stdio** via the shim (3). A read-only subset (`ch
 ### 8.3 Generated agent context
 
 `beacon init` / `migrate` generate `AGENTS.md` (+ `CLAUDE.md` pointer) and skills from the
-actual project, between `<!-- beacon:begin ... -->` markers. Generated regions are short and
+actual project, between `<!-- beacon:generated:start -->` / `<!-- beacon:generated:end -->` markers. Generated regions are short and
 deterministic (they are loaded every session). Regenerated on demand; `beacon check` fails if
 stale.
 
@@ -783,7 +783,7 @@ public tool by the same author, run alongside Beacon, not inside it).
   - Uses the `beacon` from the environment (option `beacon`), never a binary inside the analyzed
     checkout. `environment: true` checks become unknown on past commits, so `--new-only` and
     `blame` never attribute false drift.
-  - The plugin declares `ignoreRegions` for `<!-- beacon:begin ... -->` / `<!-- beacon:end ... -->`,
+  - The plugin declares `ignoreRegions` for `<!-- beacon:generated:start -->` / `<!-- beacon:generated:end -->`,
     so users need no extra config.
   - `suggestion` replaces the whole claim value: for commands it is the full corrected command
     line, not just the wrong flag.
@@ -794,7 +794,7 @@ public tool by the same author, run alongside Beacon, not inside it).
   - Requires on the Beacon side: stable `--help --json`, `symbols --json`, `api --json` outputs
     (versioned JSON output policy, 6.2).
 - Division of labor: Beacon **generates** the generated sections of agent docs (8.3, between
-  `<!-- beacon:begin ... -->` markers) and fails `beacon check` if they are stale; ctxtruth
+  `<!-- beacon:generated:start/end -->` markers) and fails `beacon check` if they are stale; ctxtruth
   **verifies** everything written by hand.
 - ctxtruth needs Node; Beacon users do not. It is therefore optional for end users and
   standard in contributor/CI/agent environments: `beacon check --context` runs the built-in
@@ -1048,6 +1048,48 @@ truth (`crates/engine/src/{path,model,host,diag,event}.rs` are the contract modu
 - **Measured (large corpus, Windows):** watch JSON p95 ~50-80 ms, TS p95 ~130-160 ms, cold
   ~2-3 s, warm ~0.8 s, idle RSS ~7 MB, binary 7.5 MB. CI enforces the phase-1 budgets on
   Windows and macOS and checks byte-identical `.mcaddon` output across both.
+
+### 14.2 Phase 2 as built (2026-10-16)
+
+- **Artifacts:** `dev`, `mcpack`, `mcaddon`, `mcworld`, `mctemplate`, `skinpack`, `marketplace`
+  (`Content/world_template/`, optional `Content/skin_pack/`, `Store Art/`, `Marketing Art/`).
+- **level.dat:** hand-rolled little-endian NBT; round-trips real Bedrock and Education files
+  byte-identically. Edition table as in 5.9, then per-target `levelDat` dotted-path overrides
+  (they win). `MinimumCompatibleClientVersion` = `[major, minor, patch, 0, 0]`.
+- **World UUIDs:** `lock.worlds["<folder>"][edition]` and `lock.skins[...]`, keyed by folder,
+  never shared across editions. A plain `.mcworld` has no manifest UUID.
+- **Static outputs:** prebuilt packs passed through byte-identically, UUID/version read from
+  their manifest, never bumped; duplicate pack UUIDs anywhere are an error and block the plan.
+- **Pack lists:** `world_*_packs.json` in `beacon.outputs` order (first = top). RP stack
+  direction in the client is still to be confirmed manually.
+- **Managed dev world:** seeded once into `minecraftWorlds/<name>[-<target>]-<worktree8>/`;
+  afterwards Beacon owns only its two pack-list files; a world folder without Beacon's
+  ledger, or reached through a link, is refused. Two dev targets of one edition get separate
+  folders but share dev UUIDs (deploy one at a time).
+- **Derived registries:** `item_texture.json` / `terrain_texture.json` fragments (`ns:<stem>`)
+  from sibling pngs, `item()/block({texture})`, and `module.json` `itemTextures` /
+  `terrainTextures`; `hooks.tick` -> `functions/tick.json`; `hooks.init` ->
+  `functions/beacon/init.mcfunction` (called by the project). `blocks.json` and `sounds.json`
+  derivation are deferred.
+- **Content files:** `*.entity.ts`, `*.item.ts`, `*.block.ts` default exports.
+- **Versions (4.2.1):** only `beacon pack` changes release versions; `build` uses the last
+  released version and warns `PackReleaseBehind`; dev never touches versions. Content hash and
+  RP -> BP -> world template -> skin/marketplace order as specified; two targets producing
+  different content for one release entry is an error.
+- **Tools:** esbuild 0.28.2 is downloaded on demand (hash-pinned per platform, confirm via
+  `--yes` / `BEACON_DOWNLOAD`, trusted sessions only). BDS 1.26.52.3 is pinned for
+  `cargo bds smoke` (EULA acceptance logged); CI runs it on every push.
+- **Fixtures target 1.26.50**: packs with `min_engine_version` newer than the released game
+  are rejected by BDS and by clients.
+- **`beacon init`** (question spec via `init --describe --json`, built-in `minimal` template,
+  trusted), **AGENTS.md** generated region with `AgentDocsStale` + safe fix, **`beacon fix`**,
+  **`beacon mcp`** (read-only stdio; tools `check`, `project_info`, `explain`; trust only from
+  the stored decision or the command line). The `symbols.*` / `schema.*` MCP tools need the
+  symbol table and API index and move to phase 4; `beacon add` moves to phase 3.
+- **`pack` never releases dev targets**; with `sharedEditionUuids`, release records are
+  still kept per edition (content differs by `min_engine_version` and edition transforms).
+- Not yet evidenced: the second half of the phase-2 exit ("the team builds a real release of
+  a new project") is a process step for the team.
 
 ---
 

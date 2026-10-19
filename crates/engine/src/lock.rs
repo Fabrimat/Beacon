@@ -81,12 +81,23 @@ pub struct EditionLock {
     pub rp: PackLock,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PackLock {
     pub header: String,
     pub module: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<Release>,
+    /// Releases per edition, for packs whose identity is shared across editions
+    /// (`sharedEditionUuids`): their content differs per edition, so must their release.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub releases: BTreeMap<Edition, Release>,
+}
+
+impl PackLock {
+    /// The last release for `edition`.
+    pub fn release_of(&self, edition: Edition) -> Option<&Release> {
+        self.releases.get(&edition).or(self.release.as_ref())
+    }
 }
 
 fn uuid4() -> String {
@@ -113,7 +124,7 @@ fn new_pack() -> PackLock {
     PackLock {
         header: uuid4(),
         module: uuid4(),
-        release: None,
+        ..Default::default()
     }
 }
 
@@ -216,6 +227,44 @@ impl Lockfile {
         }
     }
 
+    /// The lock entry of a release key: `<output>/BP|RP`, `world:<dir>`, `skins:<dir>`
+    /// (the `PackVersion.pack` strings).
+    pub fn entry(&self, key: &str, edition: Edition) -> Option<&PackLock> {
+        if let Some(d) = key.strip_prefix("world:") {
+            return self.worlds.get(d)?.editions.get(&edition);
+        }
+        if let Some(d) = key.strip_prefix("skins:") {
+            return self.skins.get(d)?.editions.get(&edition);
+        }
+        let (out, p) = key.rsplit_once('/')?;
+        self.pack_lock(
+            out,
+            if p == "BP" {
+                Pack::Behavior
+            } else {
+                Pack::Resource
+            },
+            edition,
+        )
+    }
+
+    /// [`Lockfile::entry`], mutable.
+    pub fn entry_mut(&mut self, key: &str, edition: Edition) -> Option<&mut PackLock> {
+        if let Some(d) = key.strip_prefix("world:") {
+            return self.worlds.get_mut(d)?.editions.get_mut(&edition);
+        }
+        if let Some(d) = key.strip_prefix("skins:") {
+            return self.skins.get_mut(d)?.editions.get_mut(&edition);
+        }
+        let (out, p) = key.rsplit_once('/')?;
+        let o = self.outputs.get_mut(out)?;
+        let e = match o.shared.as_mut() {
+            Some(s) => s,
+            None => o.editions.get_mut(&edition)?,
+        };
+        Some(if p == "BP" { &mut e.bp } else { &mut e.rp })
+    }
+
     /// Release UUID of a pack header; `None` if `ensure` did not cover the output/edition.
     pub fn pack_uuid(&self, output: &str, pack: Pack, edition: Edition) -> Option<String> {
         self.pack_lock(output, pack, edition)
@@ -240,7 +289,7 @@ impl Lockfile {
     /// Version of a pack: its last release, else `[1, 0, 0]`.
     pub fn version_of(&self, output: &str, pack: Pack, edition: Edition) -> Version {
         self.pack_lock(output, pack, edition)
-            .and_then(|p| p.release.as_ref())
+            .and_then(|p| p.release_of(edition))
             .map_or([1, 0, 0], |r| r.version)
     }
 

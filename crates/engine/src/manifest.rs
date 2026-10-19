@@ -14,7 +14,7 @@ pub struct ManifestInput<'a> {
     pub edition: Edition,
     /// The target's `targetVersion` (else the project's): `min_engine_version`.
     pub target_version: &'a str,
-    /// Dev build: dev UUIDs derived from this worktree root; versions unchanged.
+    /// Dev build: dev UUIDs derived from this worktree root; versions = last release.
     pub dev_worktree: Option<&'a Path>,
     /// BP-relative path of the script bundle entry (e.g. `scripts/main.js`), if any: adds the
     /// script module and `beacon.scriptModules` dependencies.
@@ -22,9 +22,6 @@ pub struct ManifestInput<'a> {
     pub has_bp: bool,
     pub has_rp: bool,
 }
-
-// versionPolicy (auto bump from content hashes) is phase 2: every pack is 1.0.0 for now.
-const VERSION: [u32; 3] = [1, 0, 0];
 
 fn min_engine(m: &ManifestInput) -> Vec<u32> {
     let mut v: Vec<u32> = m
@@ -62,6 +59,8 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
         .and_then(|i| RelPath::parse(i.trim_start_matches("./")).ok());
     let origin = RelPath::parse("config.json").expect("static path");
     let min = min_engine(m);
+    // versions: the last release (`beacon pack` puts this run's release in `m.lock` first)
+    let version = |p: Pack| m.lock.version_of(out, p, ed);
 
     let mut items = Vec::new();
     for (pack, present) in [(Pack::Behavior, m.has_bp), (Pack::Resource, m.has_rp)] {
@@ -73,14 +72,14 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
             let mut modules = vec![json!({
                 "type": if bp { "data" } else { "resources" },
                 "uuid": id(m.lock.module_uuid(out, pack, ed))?,
-                "version": VERSION,
+                "version": version(pack),
             })];
             let mut deps = Vec::new();
             if bp {
                 if m.has_rp {
                     deps.push(json!({
                         "uuid": id(m.lock.pack_uuid(out, Pack::Resource, ed))?,
-                        "version": VERSION,
+                        "version": version(Pack::Resource),
                     }));
                 }
                 if let Some(entry) = m.script_entry {
@@ -89,7 +88,7 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
                         "language": "javascript",
                         "entry": entry,
                         "uuid": id(m.lock.script_module_uuid(out))?,
-                        "version": VERSION,
+                        "version": version(pack),
                     }));
                     deps.extend(
                         m.cfg
@@ -106,7 +105,7 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
                     "name": "pack.name",
                     "description": "pack.description",
                     "uuid": id(m.lock.pack_uuid(out, pack, ed))?,
-                    "version": VERSION,
+                    "version": version(pack),
                     "min_engine_version": min,
                 },
                 "modules": modules,

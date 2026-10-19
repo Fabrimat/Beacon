@@ -33,7 +33,7 @@ fn id_ok(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn ns_ok(s: &str) -> bool {
+pub(crate) fn ns_ok(s: &str) -> bool {
     s != "minecraft"
         && !s.is_empty()
         && s.bytes()

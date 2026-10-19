@@ -120,7 +120,12 @@ fn help_json_lists_every_command() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["build", "watch", "check", "explain", "trust"]);
+    assert_eq!(
+        names,
+        [
+            "build", "watch", "check", "explain", "trust", "pack", "init", "fix", "mcp"
+        ]
+    );
     let build = &v["command"]["commands"][0];
     assert!(
         build["args"]
