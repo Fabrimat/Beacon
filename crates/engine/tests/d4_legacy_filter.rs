@@ -73,7 +73,11 @@ fn env_is_scrubbed() {
         serde_json::from_str(&out(p.path(), "BP/env.json").unwrap()).unwrap();
     let allow = beacon_engine::legacy_filter::ENV_ALLOW;
     for k in v["env"].as_array().unwrap() {
-        // Windows adds nothing else to a cleared env; accept only the allowlist
+        // Windows adds nothing else to a cleared env; accept only the allowlist (plus LC_CTYPE,
+        // which Python itself sets on Unix when it coerces the C locale, PEP 538)
+        if k == "LC_CTYPE" {
+            continue;
+        }
         assert!(
             allow
                 .iter()
