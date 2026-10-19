@@ -31,6 +31,7 @@ pub mod migrate;
 pub mod model;
 pub mod path;
 pub mod plugin;
+pub mod settings;
 pub mod setup;
 pub mod suffix;
 pub mod symbols;

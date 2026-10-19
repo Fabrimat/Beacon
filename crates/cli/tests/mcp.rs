@@ -143,7 +143,7 @@ fn initialize_and_list() {
     // every tool is listed, whatever the grants
     let r = m.req("tools/list", json!({}));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
     for t in tools {
         let a = &t["annotations"];
         assert_eq!(a["openWorldHint"], false);
@@ -319,6 +319,10 @@ fn calls() -> Vec<(&'static str, Value)> {
         ),
         ("fix", json!({})),
         ("add_content", json!({ "kind": "item", "name": "gem" })),
+        (
+            "write_settings",
+            json!({ "path": "src/demo/module.json", "base": "x", "value": {} }),
+        ),
         ("build", json!({})),
         ("deploy", json!({})),
         ("pack", json!({})),
@@ -326,7 +330,7 @@ fn calls() -> Vec<(&'static str, Value)> {
 }
 
 #[test]
-fn all_fifteen_tools_respond() {
+fn all_sixteen_tools_respond() {
     let mut m = Mcp::start(&[]);
     let list = m.req("tools/list", json!({}));
     let names: Vec<&str> = list["result"]["tools"]
@@ -355,6 +359,7 @@ fn writes_need_their_grant_and_dry_runs_write_nothing() {
             "rename_symbol",
             "fix",
             "add_content",
+            "write_settings",
             "build",
             "deploy",
             "pack",
@@ -374,6 +379,7 @@ fn writes_need_their_grant_and_dry_runs_write_nothing() {
         ("rename_symbol", "edit"),
         ("fix", "edit"),
         ("add_content", "edit"),
+        ("write_settings", "edit"),
         ("build", "build"),
         ("deploy", "deploy"),
         ("pack", "release"),
@@ -436,6 +442,24 @@ fn rename_and_add_with_the_edit_grant() {
     ));
     assert_eq!(r["dryRun"], false);
     assert!(gem.exists());
+    // write_settings: a stale base is BCN0164, the right one (blake3 of the absent file) writes
+    let mj = m.root.join("src/demo/module.json");
+    let args = |base: &str| {
+        json!({ "path": "src/demo/module.json", "base": base,
+        "value": { "autoTextures": false }, "dryRun": false })
+    };
+    let r = m.tool("write_settings", args("stale"));
+    assert!(first_text(&r).contains("BCN0164"), "{r}");
+    assert!(!mj.exists());
+    let empty = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    json_text(&m.tool("write_settings", args(empty)));
+    assert_eq!(
+        std::fs::read_to_string(&mj).unwrap(),
+        "{
+  \"autoTextures\": false
+}
+"
+    );
     // fix has nothing to apply on a fresh project
     let r = json_text(&m.tool("fix", json!({ "dryRun": false })));
     assert_eq!(r["applied"], 0);

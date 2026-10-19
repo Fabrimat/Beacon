@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Beacon module.json",
+  "description": "Exceptions to convention for one module folder.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": ["string", "null"], "description": "Schema URL for editors." },
+    "output": { "type": ["string", "null"], "description": "Output this module belongs to (overrides include globs)." },
+    "onConflict": {
+      "enum": ["error", "skip", "merge", null],
+      "description": "Merge policy for items that collide with other modules."
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Module-relative glob -> pack folder; the file name is kept."
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Script hooks: module-relative function path (no extension) -> priority, lower first.",
+      "properties": {
+        "tick": { "type": "object", "additionalProperties": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 } },
+        "init": { "type": "object", "additionalProperties": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 } }
+      }
+    },
+    "itemTextures": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "item_texture.json entries: short name -> module-relative texture path."
+    },
+    "terrainTextures": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "terrain_texture.json entries: short name -> module-relative texture path."
+    },
+    "packRoots": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "BP": { "type": "string" }, "RP": { "type": "string" } },
+      "description": "Module-relative folders whose contents are pack-relative paths."
+    },
+    "conflicts": {
+      "type": "object",
+      "additionalProperties": { "enum": ["error", "skip", "merge"] },
+      "description": "Module-relative glob -> merge policy; overrides onConflict."
+    },
+    "autoTextures": { "type": "boolean", "default": true, "description": "Derive texture entries from sibling pngs." }
+  }
+}

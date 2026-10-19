@@ -1,14 +1,17 @@
-//! `beacon-bds` library (8.5): the pinned BDS download, the EULA gate and member-confined
-//! extraction, shared by `cargo bds smoke` / `debug-listen` and `beacon setup`.
+//! `beacon-bds` library (8.5): the pinned BDS download, the EULA gate, member-confined
+//! extraction, `server.properties` and the server process ([`install`], [`run`]), shared by
+//! `cargo bds smoke` / `debug-listen`, `beacon setup` and `beacon test`.
 //!
 //! Trust: the BDS zip is downloaded only from minecraft.net, only after explicit EULA acceptance
 //! (logged), only with the pinned size + blake3 (`beacon-fetch`), is never redistributed, and is
 //! extracted per run into a temp dir (member-confined) that is deleted afterwards.
 
 pub use beacon_fetch::{Confirm, FetchError, Pinned};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = "1.26.52.3";
 pub const EULA_URL: &str = "https://minecraft.net/eula";
@@ -134,6 +137,136 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
         io::copy(&mut (&mut e).take(n), &mut f).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The game's script debugger port (what `beacon debug-config` prints).
+pub const DEBUG_PORT: u16 = 19144;
+
+/// `server.properties` for a Beacon run of world `level` (BDS ignores unknown keys, so extras are
+/// harmless). `debug`: the script debugger listens on [`DEBUG_PORT`].
+pub fn server_properties(level: &str, port: u16, debug: bool) -> String {
+    let dbg = if debug {
+        // wait long at world load: the probe must reach the listener before the game moves on
+        format!(
+            "allow-inbound-script-debugging=true\nforce-inbound-debug-port={DEBUG_PORT}\nscript-debugger-auto-attach=listen\nscript-debugger-auto-attach-timeout=120\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{dbg}level-name={level}\nallow-list=true\nmax-players=1\nonline-mode=true\n\
+         server-port={port}\nserver-portv6={}\nenable-lan-visibility=false\n\
+         transport=nethernet\ncontent-log-file-enabled=true\n",
+        port.wrapping_add(1)
+    )
+}
+
+pub fn free_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .map_or(41_234, |a| a.port())
+}
+
+/// Extracts the BDS `zip` into `srv` and configures it for world `level` (a free port, an empty
+/// allow list). Returns the world folder `srv/worlds/<level>` (created, empty): the caller puts
+/// the world and its packs there.
+pub fn install(zip: &Path, srv: &Path, level: &str, debug: bool) -> Result<PathBuf, String> {
+    extract_zip(zip, srv).map_err(|e| format!("BDS zip: {e}"))?;
+    let w = srv.join("worlds").join(level);
+    std::fs::create_dir_all(&w).map_err(|e| e.to_string())?;
+    std::fs::write(
+        srv.join("server.properties"),
+        server_properties(level, free_port(), debug),
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(srv.join("allowlist.json"), "[]").map_err(|e| e.to_string())?;
+    Ok(w)
+}
+
+/// Kills the server on drop (timeout, early return, panic).
+pub struct Server(pub Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// What [`run`] saw.
+pub struct Run {
+    /// Every console line (stdout and stderr).
+    pub lines: Vec<String>,
+    /// `limit` ran out before the server exited (it was killed).
+    pub timed_out: bool,
+}
+
+/// Starts the BDS installed in `srv` and calls `step` with each console line (`Some`), and at
+/// least every 250 ms without one (`None`), until the server exits or `limit` runs out; `step`
+/// talks to the console through the writer (`stop` ends the server). The server is killed when
+/// this returns.
+pub fn run(
+    srv: &Path,
+    limit: Duration,
+    mut step: impl FnMut(Option<&str>, &mut dyn Write),
+) -> Result<Run, String> {
+    let exe = srv.join(if cfg!(windows) {
+        "bedrock_server.exe"
+    } else {
+        "bedrock_server"
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.current_dir(srv)
+        .env("LD_LIBRARY_PATH", ".")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Server(cmd.spawn().map_err(|e| format!("cannot start BDS: {e}"))?);
+    let (tx, rx) = mpsc::channel();
+    let pipes: [Box<dyn Read + Send>; 2] = [
+        Box::new(child.0.stdout.take().expect("piped")),
+        Box::new(child.0.stderr.take().expect("piped")),
+    ];
+    for r in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for l in io::BufReader::new(r).lines().map_while(Result::ok) {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut stdin = child.0.stdin.take().expect("piped");
+    let start = Instant::now();
+    let mut lines = Vec::new();
+    loop {
+        if start.elapsed() > limit {
+            return Ok(Run {
+                lines,
+                timed_out: true,
+            });
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(l) => {
+                step(Some(&l), &mut stdin);
+                lines.push(l);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // server exited
+            Err(mpsc::RecvTimeoutError::Timeout) => step(None, &mut stdin),
+        }
+    }
+    Ok(Run {
+        lines,
+        timed_out: false,
+    })
 }
 
 #[cfg(test)]

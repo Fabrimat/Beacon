@@ -1,21 +1,33 @@
 //! Updater commands (`crate::update` decides). The alpha ships the fail-closed policy only:
-//! no feed, no key, no `tauri-plugin-updater` registration (phase5-plan decision 7).
+//! no feed, no key, no `tauri-plugin-updater` registration (phase5-plan decision 7). Nothing
+//! here touches the network.
 
-use super::{AppCore, AppResult};
+use super::{AppCore, AppError, AppResult};
+use crate::update::{self, Decision};
+use beacon_engine::diag::Code;
+
+fn disabled() -> AppError {
+    AppError::new(
+        Code::UpdateDisabled,
+        "updates are off in this build (unsigned alpha, no update feed)",
+    )
+}
 
 impl AppCore {
-    /// Never downloads: fetches the feed and evaluates it (`crate::update::evaluate`).
-    pub fn update_check(&self) -> AppResult<crate::update::Decision> {
-        todo!("wave 3")
+    /// This build's policy decision. Never fetches: with no key or feed compiled in it is
+    /// `Disabled`; a build that has both has no fetch code yet, so it is also refused.
+    pub fn update_check(&self) -> AppResult<Decision> {
+        match update::BUILD.feed_url(update::Channel::Stable) {
+            None => Ok(Decision::Disabled),
+            Some(_) => Err(disabled()),
+        }
     }
 
-    /// Only from the user's click on an `Available` decision for `version`.
     pub fn update_install(&self, _version: String) -> AppResult<()> {
-        todo!("wave 3")
+        Err(disabled())
     }
 
-    /// Reinstalls the previous version's kept installer after re-verifying it.
     pub fn update_rollback(&self) -> AppResult<()> {
-        todo!("wave 3")
+        Err(disabled())
     }
 }

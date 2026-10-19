@@ -197,6 +197,15 @@ fn schema(name: &str) -> (Value, &'static [&'static str]) {
             }),
             &["kind", "name"],
         ),
+        "write_settings" => (
+            json!({
+                "path": s("project-relative module.json, e.g. src/main/module.json"),
+                "base": s("hash returned by the read; refused (BCN0164) when the file changed since"),
+                "value": { "type": "object", "description": "the whole new module.json value" },
+                "dryRun": dry,
+            }),
+            &["path", "base", "value"],
+        ),
         "build" => (
             json!({ "target": s("a non-dev target (default: the packs projection)"), "dryRun": dry }),
             &[],
@@ -280,6 +289,7 @@ fn call(c: &mut Client, p: &Value) -> Result<Value, (i64, String)> {
         "rename_symbol" => write::rename_symbol(&c.h, a),
         "fix" => write::fix(&c.h, a),
         "add_content" => write::add_content(&c.h, a),
+        "write_settings" => write::write_settings(&c.h, a),
         "build" => write::build(&c.h, a, write::Flavor::Build),
         "deploy" => write::build(&c.h, a, write::Flavor::Deploy),
         _ => write::build(&c.h, a, write::Flavor::Pack),
@@ -479,6 +489,13 @@ pub const TOOLS: &[ToolSpec] = &[
         "Add an entity, item, block or module like `beacon add` (dryRun: the files).",
     ),
     write(
+        "write_settings",
+        Grant::Edit,
+        false,
+        true,
+        "Replace a module's module.json value, keeping key order and indentation (dryRun: validate).",
+    ),
+    write(
         "build",
         Grant::Build,
         false,
@@ -511,7 +528,7 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), TOOLS.len());
-        assert!((15..=20).contains(&TOOLS.len()));
+        assert!((16..=20).contains(&TOOLS.len()));
         for t in TOOLS {
             assert_eq!(t.read_only, t.grant.is_none(), "{}", t.name);
             assert!(!(t.read_only && t.destructive), "{}", t.name);

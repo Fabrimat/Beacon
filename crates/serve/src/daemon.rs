@@ -95,6 +95,10 @@ pub struct EngineState {
     conns: Vec<Conn>,
     /// The watcher's latest check (of [`EngineState::watch_trusted`]'s session).
     pub last_check: Option<BuildOutcome>,
+    /// Paths open in an LSP client, tracked apart from the symbol table: files outside it
+    /// (`module.json`) have no overlay there. A path open in two clients is forgotten when
+    /// either closes it (ponytail: a count if that ever matters).
+    open_docs: std::collections::BTreeSet<RelPath>,
 }
 
 impl EngineState {
@@ -143,10 +147,21 @@ impl EngineState {
     /// `path` is open with unsaved changes in an LSP client (an overlay in either session's
     /// symbol table; MCP write tools refuse such files with `DocumentDirty`).
     pub fn has_overlay(&self, path: &RelPath) -> bool {
-        self.sessions
-            .iter()
-            .flatten()
-            .any(|s| s.symbols().is_some_and(|t| t.has_overlay(path)))
+        self.open_docs.contains(path)
+            || self
+                .sessions
+                .iter()
+                .flatten()
+                .any(|s| s.symbols().is_some_and(|t| t.has_overlay(path)))
+    }
+
+    /// An LSP client opened or changed `path` / closed it.
+    pub fn set_open(&mut self, path: &RelPath, open: bool) {
+        if open {
+            self.open_docs.insert(path.clone());
+        } else {
+            self.open_docs.remove(path);
+        }
     }
 
     /// Attached clients whose connection is trusted (`beacon serve --status`).
@@ -262,6 +277,7 @@ fn engine(root: PathBuf, factory: SessionFactory) -> Sender<Job> {
             sessions: [None, None],
             conns: vec![],
             last_check: None,
+            open_docs: Default::default(),
         };
         for job in rx {
             // a config write may have outrun the watcher: never run a job on stale trust

@@ -1419,21 +1419,26 @@ rendered by the app and the VS Code extension from `engine::setup::SetupReport`
 
 **`beacon test` on BDS (8.5).** Contract `engine::gametest`:
 
-- `beacon test [--target t] [--filter glob] [--timeout s] [--accept-eula] [--yes] [--json |
-  --sarif]`: builds the target as an `.mcworld` with dev UUIDs and the Beta APIs experiment on,
-  adds a Beacon runner behavior pack, runs it on the pinned BDS (`crates/bds`, extracted into a
-  library: pin, EULA gate + log, member-confined extraction, `server.properties`, process
-  guard), sends `gametest runall`, and parses the console.
-- The runner protocol is Beacon's own: one console line per event, `BEACON_TEST {"event":
-  "start"|"pass"|"fail"|"done", ...}`, so results never depend on BDS or GameTest wording.
-  Console text is untrusted: malformed lines are ignored. A test that started and never
-  reported is `timedOut`; no `done` = the run timed out.
+- `beacon test [--target t] [--filter glob] [--timeout s] [--test-timeout s] [--accept-eula]
+  [--trust] [--json | --sarif]` (as built): needs trust like `build` (exit 3 otherwise), checks
+  the EULA before any download (`BCN0193`, exit 2), dev-builds the target with
+  `@minecraft/server-gametest` aliased to a Beacon runner shim (the shim imports the real module
+  under a placeholder specifier that is externalized and renamed back after bundling), installs
+  the world on the pinned BDS (`crates/bds` library: pin, EULA gate + log, member-confined
+  extraction, `server.properties`, process killed on drop) with Beta APIs on, and sends
+  `gametest runset beacon:run` (BDS 1.26.52.3 has no `runall`; the shim tags every selected
+  test). The console log goes to `<project>/.beacon/test-bds.log`.
+- Spike result (BDS 1.26.52.3): the script API never exposes a verdict, only
+  `Test.isCompleted()`. The shim emits `BEACON_TEST {"event":"registered"|"start"|"done", ...}`;
+  pass/fail/timeout come from the game's own `onTestPassed` / `onTestFailed` lines (a
+  `maxTicks` overrun maps to `timedOut`). Console text is untrusted: malformed lines are
+  ignored, and a verdict is never overwritten. A test with no verdict after `--test-timeout` is
+  `timedOut`; no `done` before `--timeout` = the run timed out.
 - Output: `TestReport` (`schema: 1`: `bdsVersion`, `results[{name, status, message}]`,
   `complete`) with `--json`; SARIF with `--sarif` (`GameTestFailed` `BCN0190`,
   `GameTestTimeout` `BCN0191`, `GameTestNone` `BCN0192`); `BdsEulaRequired` `BCN0193`,
-  `BdsFailed` `BCN0194`. Exit 0 all passed, 1 otherwise.
-- How the runner observes results through `@minecraft/server-gametest` on BDS 1.26.52.3 is
-  **unverified**; wave 1 starts with a spike against real BDS (as the debugger was in 14.4).
+  `BdsFailed` `BCN0194`. Exit 0 all passed, 1 failed/timed out/none/BDS failed, 2 usage or
+  EULA/download consent missing, 3 untrusted. CI: `gametest.yml` (windows, non-gating).
 
 **Distribution (9, 9.2).**
 
@@ -1496,9 +1501,12 @@ unchanged; the app binary is covered by the installer row.
 **Status.**
 
 - Waves 1-2 built: desktop shell, setup/doctor, Play, setup wizard.
-- Wave 3 (install smoke, app budgets, human test kit `docs/alpha-test.md`): in progress.
-- Wave 4 pending: `beacon test` on BDS, `module.json` forms, updater UI.
-- Both exit criteria are **OPEN** and need a human.
+- Wave 3 built: install smoke on `windows-latest` (install 9.6 s, smoke 1.2 s, budgets
+  enforced), app budgets, default dev world, human test kit `docs/alpha-test.md`.
+- Wave 4 built: `beacon test` on BDS (verified on BDS 1.26.52.3: pass, fail, timeout),
+  `module.json` settings form + MCP `write_settings`, updater policy (About screen).
+- Both exit criteria are **OPEN** and need a human (`docs/alpha-test.md`); the in-game step
+  (project world listed, chat line) is not yet verified by a person.
 
 **Deviations, summarized**: no TCP endpoint (Tauri IPC); the app shell is outside the root
 workspace; editor-extension and MCP offers leave the first-run wizard; WebView2 bootstrapper

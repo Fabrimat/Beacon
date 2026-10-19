@@ -48,6 +48,7 @@ pub const COMMANDS: &[&str] = &[
     "init_create",
     "check",
     "play",
+    "settings_list",
     "settings_read",
     "settings_write",
     "test_run",

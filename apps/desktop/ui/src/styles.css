@@ -32,3 +32,8 @@ button.link { background: none; color: var(--accent); padding: 2px 0; font-weigh
 [role="alert"] { color: #ff8f7a; overflow-wrap: anywhere; }
 pre { background: var(--bg); padding: 10px; border-radius: 6px; overflow: auto; max-height: 220px; }
 .recent { list-style: none; padding: 0; margin: 12px 0 0; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 12px; padding: 8px 12px; }
+legend { color: var(--muted); font-size: 13px; padding: 0 6px; }
+select { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+label.check { display: flex; align-items: center; gap: 8px; }
+label.check input { width: auto; margin: 0; }

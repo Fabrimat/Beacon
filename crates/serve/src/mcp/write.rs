@@ -13,7 +13,7 @@ use beacon_engine::diag::{Code, Diagnostic, Fix, Severity};
 use beacon_engine::lock::Lockfile;
 use beacon_engine::path::RelPath;
 use beacon_engine::scaffold::{self, Edit, Kind, generated_file};
-use beacon_engine::{agents, route, symbols};
+use beacon_engine::{agents, route, settings, symbols};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -244,6 +244,47 @@ pub(super) fn add_content(h: &EngineHandle, a: &Value) -> Value {
             refresh(st, t, files.collect::<Vec<_>>());
         }
         ok(json!({ "dryRun": dry, "module": added.module, "files": added.files, "note": added.note }))
+    })
+}
+
+/// `write_settings`: replace one module's `module.json` with `value`, keeping its key order and
+/// indentation, against the `base` hash the caller read (`DocumentStale` when the file moved on).
+pub(super) fn write_settings(h: &EngineHandle, a: &Value) -> Value {
+    let rel = match arg(a, "path").map(RelPath::parse) {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return bad_args(&e.0),
+        Err(e) => return e,
+    };
+    let base = match arg(a, "base") {
+        Ok(b) => b.to_owned(),
+        Err(e) => return e,
+    };
+    let value = a["value"].clone();
+    let dry = dry_run(a);
+    if let Err(e) = need(h, "write_settings", Grant::Edit, dry) {
+        return e;
+    }
+    let h2 = h.clone();
+    h.call(move |st| {
+        let t = h2.trusted();
+        let root = st.root().to_path_buf();
+        if let Some(d) = refuse(&|p| st.has_overlay(p), &root, &rel) {
+            return failure(&[d]);
+        }
+        let done = if dry {
+            settings::plan(&root, &rel, &base, &value).map(|(_, d)| d)
+        } else {
+            settings::write(&root, &rel, &base, &value)
+        };
+        match done {
+            Ok(d) => {
+                if !dry {
+                    refresh(st, t, [PathBuf::from(rel.as_str())]);
+                }
+                ok(json!({ "dryRun": dry, "path": rel.as_str(), "base": d.base, "value": d.value }))
+            }
+            Err(d) => failure(&[d]),
+        }
     })
 }
 

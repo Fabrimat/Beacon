@@ -1,0 +1,33 @@
+{
+  "type": "minecraftBedrock",
+  "name": "beacon-gametest",
+  "authors": [
+    "Beacon"
+  ],
+  "targetVersion": "1.26.50",
+  "namespace": "gt",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP"
+  },
+  "beacon": {
+    "sources": [
+      "./src"
+    ],
+    "packMeta": {
+      "name": "Beacon GameTest",
+      "description": "Beacon `beacon test` fixture: one passing, one failing, one hanging GameTest",
+      "icon": "./pack_icon.png"
+    },
+    "targets": {
+      "dev": {
+        "edition": "bedrock",
+        "artifact": "dev"
+      }
+    },
+    "scriptModules": {
+      "@minecraft/server": "2.11.0-beta",
+      "@minecraft/server-gametest": "1.0.0-beta"
+    }
+  }
+}

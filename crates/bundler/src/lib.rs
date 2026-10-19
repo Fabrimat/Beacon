@@ -26,6 +26,8 @@ pub struct Esbuild {
     version: Option<String>,
     /// `BundlerUnpinned` notes, delivered with the first bundle.
     notes: Mutex<Vec<Diagnostic>>,
+    /// `--alias:<module>=<file>` (`beacon test`'s runner shim).
+    aliases: Vec<(String, PathBuf)>,
 }
 
 enum Source {
@@ -92,6 +94,7 @@ impl Esbuild {
             exe,
             version: raw.map(|v| format!("esbuild {v}")),
             notes: Mutex::new(notes),
+            aliases: Vec::new(),
         })
     }
 
@@ -149,6 +152,7 @@ impl Esbuild {
 pub struct LazyEsbuild {
     root: PathBuf,
     confirm: Confirm,
+    aliases: Vec<(String, PathBuf)>,
     found: OnceLock<Result<Esbuild, Diagnostic>>,
 }
 
@@ -157,17 +161,27 @@ impl LazyEsbuild {
         LazyEsbuild {
             root: root.to_path_buf(),
             confirm,
+            aliases: Vec::new(),
             found: OnceLock::new(),
         }
+    }
+
+    /// Bundles `file` wherever the scripts import `module` (esbuild `--alias`; it also applies
+    /// to `file`'s own imports and takes precedence over `--external`).
+    pub fn with_alias(mut self, module: &str, file: &Path) -> Self {
+        self.aliases.push((module.to_owned(), file.to_path_buf()));
+        self
     }
 }
 
 impl Bundler for LazyEsbuild {
     fn bundle(&self, req: &BundleRequest) -> BundleResult {
-        match self
-            .found
-            .get_or_init(|| Esbuild::find(&self.root, self.confirm))
-        {
+        match self.found.get_or_init(|| {
+            Esbuild::find(&self.root, self.confirm).map(|mut e| {
+                e.aliases = self.aliases.clone();
+                e
+            })
+        }) {
             Ok(e) => e.bundle(req),
             Err(d) => BundleResult {
                 code: None,
@@ -260,6 +274,11 @@ impl Esbuild {
                 req.externals
                     .iter()
                     .flat_map(|n| [format!("--external:{n}"), format!("--external:{n}/*")]),
+            )
+            .args(
+                self.aliases
+                    .iter()
+                    .map(|(m, f)| format!("--alias:{m}={}", f.display())),
             )
             .arg(format!("--metafile={}", meta.display()))
             .arg(format!("--outfile={}", out.display()));

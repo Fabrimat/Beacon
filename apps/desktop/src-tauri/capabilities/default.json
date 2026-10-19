@@ -16,6 +16,7 @@
     "allow-init-create",
     "allow-check",
     "allow-play",
+    "allow-settings-list",
     "allow-settings-read",
     "allow-settings-write",
     "allow-test-run",

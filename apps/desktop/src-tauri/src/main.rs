@@ -129,6 +129,11 @@ fn play(
 }
 
 #[tauri::command(async)]
+fn settings_list(core: State<AppCore>, root: PathBuf) -> AppResult<Vec<String>> {
+    guard(|| core.settings_list(root))
+}
+
+#[tauri::command(async)]
 fn settings_read(
     core: State<AppCore>,
     root: PathBuf,
@@ -207,6 +212,7 @@ fn main() {
             init_create,
             check,
             play,
+            settings_list,
             settings_read,
             settings_write,
             test_run,

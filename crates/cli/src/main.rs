@@ -150,8 +150,8 @@ enum Cmd {
     Setup(setup::SetupArgs),
     /// Re-check Minecraft detection and every pinned tool; exits 1 when a pin check fails.
     Doctor,
-    /// Run the project's GameTests on the pinned BDS (not implemented yet).
-    Test,
+    /// Run the project's GameTests on the pinned BDS (needs the Minecraft EULA accepted).
+    Test(test::TestArgs),
 }
 
 /// `beacon --help --json`: the clap command tree, versioned.
@@ -415,7 +415,7 @@ fn main() {
         Cmd::Hook { event } => hook::run(event),
         Cmd::Setup(a) => setup::run(&o, &a),
         Cmd::Doctor => setup::doctor(&o),
-        Cmd::Test => test::run(&o),
+        Cmd::Test(a) => test::run(&o, &a),
     };
     process::exit(code);
 }

@@ -111,12 +111,23 @@ fn parse_version(v: &str) -> Option<Version<'_>> {
     n.next().is_none().then_some((t, pre))
 }
 
+/// Semver pre-release order: dot-parts compared numerically when numeric (`alpha.10 > alpha.2`),
+/// numeric before text (`false < true`), fewer parts first (Vec order).
+fn pre_key(pre: &str) -> Vec<(bool, u64, &str)> {
+    pre.split('.')
+        .map(|p| match p.parse::<u64>() {
+            Ok(n) => (false, n, ""),
+            Err(_) => (true, 0, p),
+        })
+        .collect()
+}
+
 fn newer(candidate: &str, current: &str) -> Option<bool> {
     let ((a, ap), (b, bp)) = (parse_version(candidate)?, parse_version(current)?);
     Some(match a.cmp(&b) {
         std::cmp::Ordering::Equal => match (ap, bp) {
             (None, Some(_)) => true,
-            (Some(x), Some(y)) => x > y,
+            (Some(x), Some(y)) => pre_key(x) > pre_key(y),
             _ => false,
         },
         o => o.is_gt(),
@@ -147,8 +158,14 @@ pub fn evaluate(
             m.version
         ))
     })?;
-    let Some(asset) = m.platforms.get(platform).filter(|_| is_newer) else {
+    if !is_newer {
         return Ok(Decision::UpToDate);
+    }
+    let Some(asset) = m.platforms.get(platform) else {
+        return Err(rejected(format!(
+            "update {} has no installer for {platform}",
+            m.version
+        )));
     };
     if !asset.url.starts_with("https://") || asset.signature.trim().is_empty() {
         return Err(rejected(format!(
@@ -214,19 +231,32 @@ mod tests {
                 Code::UpdateRejected
             );
         }
-        // no downgrade, no re-install, no asset for this platform
-        for (v, cur, p) in [
-            ("0.1.0", "0.2.0", w),
-            ("0.2.0", "0.2.0", w),
-            ("0.2.0", "0.1.0", "darwin-aarch64"),
-        ] {
+        // no downgrade, no re-install
+        for (v, cur, p) in [("0.1.0", "0.2.0", w), ("0.2.0", "0.2.0", w)] {
             assert_eq!(
                 evaluate(&ON, cur, &feed(v, "https://h/i.exe", "s"), p).unwrap(),
                 Decision::UpToDate
             );
         }
         assert_eq!(newer("0.2.0", "0.2.0-alpha.1"), Some(true));
+        assert_eq!(newer("0.2.0-alpha.10", "0.2.0-alpha.2"), Some(true));
+        assert_eq!(newer("0.2.0-alpha.2", "0.2.0-alpha.10"), Some(false));
+        assert_eq!(newer("0.2.0-alpha.1.1", "0.2.0-alpha.1"), Some(true));
         assert_eq!(newer("0.2.0-alpha.2", "0.2.0-alpha.1"), Some(true));
         assert_eq!(newer("0.2.0-alpha.1", "0.2.0"), Some(false));
+    }
+
+    #[test]
+    fn no_asset_for_platform_is_rejected_not_up_to_date() {
+        let f = feed("0.2.0", "https://h/i.exe", "s");
+        let e = evaluate(&ON, "0.1.0", &f, "darwin-aarch64").unwrap_err();
+        assert_eq!(e.code, Code::UpdateRejected);
+        assert!(e.message.contains("darwin-aarch64"));
+        // an older feed is still just up to date, whatever the platform
+        let old = feed("0.0.1", "https://h/i.exe", "s");
+        assert_eq!(
+            evaluate(&ON, "0.1.0", &old, "darwin-aarch64").unwrap(),
+            Decision::UpToDate
+        );
     }
 }

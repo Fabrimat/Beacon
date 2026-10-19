@@ -1,0 +1,48 @@
+name: gametest
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # `beacon test` (8.5): fixtures/gametest's GameTests on a real Bedrock Dedicated Server. The repo
+  # owner accepted the Minecraft EULA (https://minecraft.net/eula) for automated BDS use on
+  # 2026-10-16; BEACON_BDS_EULA=accept below records that acceptance in <tools>/bds-eula.log on
+  # every run. The BDS zip is downloaded only from minecraft.net, blake3-pinned in crates/bds,
+  # cached here by hash, never redistributed.
+  gametest:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # ponytail: not gating until it has been green on CI; then drop this line
+    continue-on-error: true
+    env:
+      BEACON_HOME: ${{ github.workspace }}/.beacon-home
+      BEACON_BDS_EULA: accept
+      BEACON_DOWNLOAD: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/cache@v4
+        with:
+          path: .beacon-home/tools/03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+          key: bds-win-03d640d7268fca93be29a1f27c5094f76188e9df68a0bb70f62184c9841840d9
+
+      - name: Install esbuild
+        shell: bash
+        run: |
+          npm i --prefix .ci-esbuild esbuild@0.28.2
+          echo "BEACON_ESBUILD=$(pwd -W)/.ci-esbuild/node_modules/@esbuild/win32-x64/esbuild.exe" >> "$GITHUB_ENV"
+
+      # pass + failed (with message) + timedOut, SARIF BCN0190/BCN0191, a passing --filter run
+      - name: beacon test on BDS
+        run: cargo test -p beacon-cli --test test_cmd -- --nocapture
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gametest-log
+          path: .beacon-home/tools/bds-eula.log

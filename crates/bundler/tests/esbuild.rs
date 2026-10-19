@@ -273,3 +273,38 @@ fn map_sources_are_project_relative() {
     assert_eq!(got, ["src/lib/h.ts", "src/main.ts"]);
     assert!(got.iter().all(|s| r.join(s).is_file()));
 }
+
+#[test]
+fn alias_replaces_a_module() {
+    let Some(inst) = install() else { return };
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    std::fs::write(
+        r.join("main.js"),
+        "import { register } from '@minecraft/server-gametest';\nregister('a', 'b', () => {});\n",
+    )
+    .unwrap();
+    let shim = r.join("shim.js");
+    std::fs::write(
+        &shim,
+        "import * as real from 'real-gt';\nexport * from 'real-gt';\nexport const register = (...a) => (console.warn('SHIMMED'), real.register(...a));\n",
+    )
+    .unwrap();
+    let b = beacon_bundler::LazyEsbuild::new(inst, beacon_bundler::Confirm::No)
+        .with_alias("@minecraft/server-gametest", &shim);
+    let res = b.bundle(&BundleRequest {
+        root: r,
+        entries: &[rp("main.js")],
+        sourcemap: false,
+        minify: false,
+        define: &Default::default(),
+        // the alias wins over the external
+        externals: &["@minecraft/server-gametest".into(), "real-gt".into()],
+    });
+    let code = res.code.unwrap_or_else(|| panic!("{:?}", res.diagnostics));
+    assert!(
+        code.contains("SHIMMED") && code.contains("\"real-gt\""),
+        "{code}"
+    );
+    assert!(!code.contains("\"@minecraft/server-gametest\""), "{code}");
+}

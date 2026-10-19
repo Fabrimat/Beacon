@@ -3,7 +3,7 @@ import type { ProjectSummary } from "./api";
 import { About } from "./screens/About";
 import { Home } from "./screens/Home";
 import { Play } from "./screens/Play";
-import { Placeholder } from "./screens/Placeholder";
+import { Settings } from "./screens/Settings";
 import { SETUP_DONE, Setup } from "./screens/Setup";
 
 const ROUTES = ["home", "play", "settings", "setup", "about"] as const;
@@ -40,9 +40,7 @@ export function App() {
       <main>
         {route === "home" && <Home project={project} onProject={setProject} />}
         {route === "play" && <Play project={project} onProject={setProject} />}
-        {route === "settings" && (
-          <Placeholder title="Settings">Visual settings and module forms. Coming next.</Placeholder>
-        )}
+        {route === "settings" && <Settings project={project} />}
         {route === "setup" && <Setup onDone={() => (location.hash = "#home")} />}
         {route === "about" && <About />}
       </main>

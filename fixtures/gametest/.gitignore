@@ -1,0 +1,5 @@
+# build outputs (beacon.lock.json is committed)
+/packs/
+/dist/
+/.beacon/
+/node_modules/

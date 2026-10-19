@@ -6,12 +6,13 @@
 //! (logged), only with the pinned size + blake3 (`beacon-fetch`), is never redistributed, and is
 //! extracted per run into a temp dir (member-confined) that is deleted afterwards.
 
-use beacon_bds::{Confirm, EULA_URL, FetchError, VERSION, eula_method, extract_zip, log_eula, pin};
+use beacon_bds::{
+    Confirm, DEBUG_PORT, EULA_URL, FetchError, VERSION, eula_method, extract_zip, log_eula, pin,
+};
 use clap::{Parser, Subcommand};
-use std::io::{self, BufRead, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::mpsc;
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 /// Console lines that are expected on a healthy run; each entry says why.
@@ -22,8 +23,6 @@ const BENIGN: &[(&str, &str)] = &[(
 
 /// Time to let behavior-pack scripts log after `Server started.` before sending `stop`.
 const SETTLE: Duration = Duration::from_secs(5);
-/// The game's script debugger port (what `beacon debug-config` prints).
-const DEBUG_PORT: u16 = 19144;
 
 #[derive(Parser)]
 #[command(
@@ -102,40 +101,6 @@ fn main() -> ExitCode {
         }
     };
     ExitCode::from(code)
-}
-
-/// `server.properties` for a smoke run (BDS ignores unknown keys, so extras are harmless).
-fn server_properties(port: u16, debug: bool) -> String {
-    let dbg = if debug {
-        // wait long at world load: the probe must reach the listener before the game moves on
-        format!(
-            "allow-inbound-script-debugging=true\nforce-inbound-debug-port={DEBUG_PORT}\nscript-debugger-auto-attach=listen\nscript-debugger-auto-attach-timeout=120\n"
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "{dbg}level-name=smoke\nallow-list=true\nmax-players=1\nonline-mode=true\n\
-         server-port={port}\nserver-portv6={}\nenable-lan-visibility=false\n\
-         transport=nethernet\ncontent-log-file-enabled=true\n",
-        port.wrapping_add(1)
-    )
-}
-
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .map_or(41_234, |a| a.port())
-}
-
-/// Kills the server on drop (timeout, early return, panic).
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// Failures found in the console `lines` (empty = pass).
@@ -241,75 +206,20 @@ fn smoke(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let srv = dir.path();
-    extract_zip(&zip, srv).map_err(|e| format!("BDS zip: {e}"))?;
-    let w = srv.join("worlds").join("smoke");
-    std::fs::create_dir_all(&w).map_err(|e| e.to_string())?;
+    let w = beacon_bds::install(&zip, srv, "smoke", debug)?;
     // the packs ride inside the world (behavior_packs/, world_behavior_packs.json)
     extract_zip(world, &w).map_err(|e| format!("{}: {e}", world.display()))?;
-    std::fs::write(
-        srv.join("server.properties"),
-        server_properties(free_port(), debug),
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::write(srv.join("allowlist.json"), "[]").map_err(|e| e.to_string())?;
 
-    let exe = srv.join(if cfg!(windows) {
-        "bedrock_server.exe"
-    } else {
-        "bedrock_server"
-    });
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())?;
-    }
-    let mut cmd = Command::new(&exe);
-    cmd.current_dir(srv)
-        .env("LD_LIBRARY_PATH", ".")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = Server(cmd.spawn().map_err(|e| format!("cannot start BDS: {e}"))?);
-    let (tx, rx) = mpsc::channel();
-    let pipes: [Box<dyn Read + Send>; 2] = [
-        Box::new(child.0.stdout.take().unwrap()),
-        Box::new(child.0.stderr.take().unwrap()),
-    ];
-    for r in pipes {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for l in io::BufReader::new(r).lines().map_while(Result::ok) {
-                if tx.send(l).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(tx);
-    let mut stdin = child.0.stdin.take();
     // debug mode: connect to the listener as soon as it is up; its first bytes are the proof
     let mut probe: Option<Result<Vec<u8>, String>> = None;
     let mut last_try = Instant::now() - Duration::from_secs(1);
-
-    let (start, limit) = (Instant::now(), Duration::from_secs(timeout));
-    let mut lines = Vec::new();
-    let (mut started, mut stopped, mut timed_out) = (None::<Instant>, false, false);
-    loop {
-        if start.elapsed() > limit {
-            timed_out = true;
-            break;
-        }
-        match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(l) => {
-                println!("{l}");
-                if l.contains("Server started.") {
-                    started = Some(Instant::now());
-                }
-                lines.push(l);
+    let (mut started, mut stopped) = (None::<Instant>, false);
+    let run = beacon_bds::run(srv, Duration::from_secs(timeout), |l, stdin| {
+        if let Some(l) = l {
+            println!("{l}");
+            if l.contains("Server started.") {
+                started = Some(Instant::now());
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break, // server exited
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if debug && probe.is_none() && last_try.elapsed() >= Duration::from_millis(500) {
             last_try = Instant::now();
@@ -320,12 +230,10 @@ fn smoke(
         }
         if !stopped && (started.is_some_and(|t| t.elapsed() >= SETTLE) || probe.is_some()) {
             stopped = true;
-            if let Some(mut s) = stdin.take() {
-                let _ = writeln!(s, "stop");
-            }
+            let _ = writeln!(stdin, "stop");
         }
-    }
-    drop(child); // kill + reap if still running
+    })?;
+    let (lines, timed_out) = (run.lines, run.timed_out);
     let mut bad = scan(&lines, &expect);
     if timed_out {
         bad.push(format!(
@@ -391,9 +299,10 @@ mod tests {
 
     #[test]
     fn properties_as_specified() {
-        let s = server_properties(40000, false);
+        use beacon_bds::server_properties;
+        let s = server_properties("smoke", 40000, false);
         assert!(!s.contains("debug"));
-        let d = server_properties(40000, true);
+        let d = server_properties("smoke", 40000, true);
         for k in [
             "allow-inbound-script-debugging=true",
             "force-inbound-debug-port=19144",
@@ -436,6 +345,9 @@ mod tests {
 
     #[test]
     fn server_is_killed_on_drop() {
+        use beacon_bds::Server;
+        use std::io;
+        use std::process::{Command, Stdio};
         let mut c = if cfg!(windows) {
             let mut c = Command::new("ping");
             c.args(["-n", "60", "127.0.0.1"]);
