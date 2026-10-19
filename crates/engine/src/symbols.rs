@@ -214,7 +214,13 @@ pub struct SymbolTable {
     files: BTreeMap<RelPath, FileSyms>,
     /// Definitions from generator output, by generator file (ranges point into that file).
     generated: BTreeMap<RelPath, Vec<Occurrence>>,
+    /// The wanted-files map of the last `update`, by `Routed::key` (rebuilding it allocates a
+    /// path per project file).
+    want_memo: Option<([u8; 32], std::sync::Arc<Want>)>,
 }
+
+/// path -> (dest, output)
+type Want = BTreeMap<RelPath, (Option<RelPath>, Option<OutputId>)>;
 
 // ---------------------------------------------------------------- lexical helpers
 
@@ -745,32 +751,9 @@ impl SymbolTable {
         (t, d)
     }
 
-    /// Brings the table in line with the index: files whose hash or routing changed are
-    /// rescanned, removed ones drop out, generator definitions are replaced by those of
-    /// `items`. Unchanged files cost a hash compare (no read).
-    pub fn update(
-        &mut self,
-        cfg: &ProjectConfig,
-        routed: &Routed,
-        items: &[ContentItem],
-        vfs: &dyn Vfs,
-    ) {
-        let is_static = |o: &str| {
-            cfg.beacon
-                .outputs
-                .iter()
-                .any(|x| x.id == o && x.static_packs.is_some())
-        };
-        let ns_of = |o: Option<&str>| {
-            cfg.beacon
-                .outputs
-                .iter()
-                .find(|x| Some(x.id.as_str()) == o)
-                .and_then(|x| x.namespace.clone())
-                .unwrap_or_else(|| cfg.namespace.clone())
-        };
-        // path -> (dest, output); routed files first
-        let mut want: BTreeMap<RelPath, (Option<RelPath>, Option<OutputId>)> = BTreeMap::new();
+    /// Every file to scan with its destination and output; routed files first.
+    fn wanted(routed: &Routed, vfs: &dyn Vfs) -> Want {
+        let mut want = Want::new();
         let mut module_out: HashMap<&RelPath, &OutputId> = HashMap::new();
         for i in &routed.items {
             module_out.entry(&i.module).or_insert(&i.dest.output);
@@ -814,8 +797,46 @@ impl SymbolTable {
             }
         }
 
+        want
+    }
+
+    /// Brings the table in line with the index: files whose hash or routing changed are
+    /// rescanned, removed ones drop out, generator definitions are replaced by those of
+    /// `items`. Unchanged files cost a hash compare (no read).
+    pub fn update(
+        &mut self,
+        cfg: &ProjectConfig,
+        routed: &Routed,
+        items: &[ContentItem],
+        vfs: &dyn Vfs,
+    ) {
+        let is_static = |o: &str| {
+            cfg.beacon
+                .outputs
+                .iter()
+                .any(|x| x.id == o && x.static_packs.is_some())
+        };
+        let ns_of = |o: Option<&str>| {
+            cfg.beacon
+                .outputs
+                .iter()
+                .find(|x| Some(x.id.as_str()) == o)
+                .and_then(|x| x.namespace.clone())
+                .unwrap_or_else(|| cfg.namespace.clone())
+        };
+        let memo = (routed.key != [0; 32])
+            .then_some(self.want_memo.as_ref())
+            .flatten()
+            .filter(|(k, _)| *k == routed.key)
+            .map(|(_, w)| w.clone());
+        let want = memo.unwrap_or_else(|| {
+            let w = std::sync::Arc::new(Self::wanted(routed, vfs));
+            self.want_memo = Some((routed.key, w.clone()));
+            w
+        });
         let mut old = std::mem::take(&mut self.files);
-        for (path, (dest, output)) in want {
+        for (path, (dest, output)) in want.iter() {
+            let (path, dest, output) = (path.clone(), dest.clone(), output.clone());
             // an open buffer wins over the disk until `close_overlay`
             if old.get(&path).is_some_and(|f| f.overlay) {
                 self.files.extend(old.remove_entry(&path));

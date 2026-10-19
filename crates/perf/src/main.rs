@@ -280,6 +280,57 @@ export const beaconPerf{i} = {i};
     Ok(lat)
 }
 
+/// Idle RSS of `beacon serve --stdio --mcp --trust`: a trusted MCP `check` populates the
+/// cached session, then `idle` passes. Daemon (detached, found by `serve --status` pid) tree
+/// plus the shim tree. `BEACON_HOME` isolates discovery; the daemon is stopped with `--force`.
+fn serve_idle_rss(ctx: &Ctx, idle: Duration) -> Result<f64, String> {
+    use std::io::Write;
+    let home = env::temp_dir().join(format!("beacon-perf-home-{}", process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let serve = |args: &[&str]| {
+        let mut c = Command::new(ctx.beacon);
+        c.arg("serve").args(args).arg("--project").arg(ctx.project);
+        c.env("BEACON_HOME", &home).env("BEACON_SERVE_IDLE", "3600");
+        c.stdin(Stdio::null()).stderr(Stdio::inherit());
+        c
+    };
+    let r = (|| {
+        let mut c = serve(&["--stdio", "--mcp", "--trust"]);
+        c.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut shim = Guard(c.spawn().map_err(|e| e.to_string())?);
+        let mut stdin = shim.0.stdin.take().unwrap();
+        let mut out = BufReader::new(shim.0.stdout.take().unwrap());
+        for req in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"perf","version":"0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check","arguments":{}}}"#,
+        ] {
+            writeln!(stdin, "{req}").map_err(|e| e.to_string())?;
+            let mut line = String::new();
+            out.read_line(&mut line).map_err(|e| e.to_string())?;
+            if line.trim().is_empty() {
+                return Err("serve shim closed without answering".into());
+            }
+            if line.contains("\"error\"") || line.contains("\"isError\":true") {
+                return Err(format!("serve request failed: {}", line.trim()));
+            }
+        }
+        thread::sleep(idle);
+        let st = serve(&["--status"])
+            .stdout(Stdio::piped())
+            .output()
+            .map_err(|e| e.to_string())?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&st.stdout).map_err(|e| format!("serve --status: {e}"))?;
+        let pid = v["pid"].as_u64().ok_or("serve --status: no pid")? as u32;
+        let mut sys = System::new();
+        Ok(tree_rss_mb(&mut sys, pid) + tree_rss_mb(&mut sys, shim.0.id()))
+    })();
+    let _ = serve(&["--stop", "--force"]).stdout(Stdio::null()).status();
+    let _ = fs::remove_dir_all(&home);
+    r
+}
+
 struct Opts {
     beacon: PathBuf,
     runs: usize,
@@ -328,6 +379,10 @@ fn measure(o: &Opts, project: &Path) -> Result<Vec<(&'static str, f64)>, String>
         tree_rss_mb(&mut System::new(), w.0.id()),
     ));
     drop(w);
+
+    if o.phase >= 4 {
+        m.push(("idle_rss_serve_mb", serve_idle_rss(&ctx, o.idle)?));
+    }
 
     let mut start = vec![];
     for _ in 0..o.runs.max(5) {

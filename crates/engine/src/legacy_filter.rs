@@ -27,6 +27,7 @@ pub const ENV_ALLOW: &[&str] = &[
     "USERPROFILE",
     "HOME",
     "PYTHONUTF8",
+    "PYTHONDONTWRITEBYTECODE",
     "FILTER_SETTINGS",
 ];
 
@@ -43,25 +44,43 @@ const MAX_FILE: u64 = 64 << 20;
 const MAX_TOTAL: u64 = 512 << 20;
 const LOG_TAIL: u64 = 64 << 10;
 
-fn parse(root: &Path, plugins: &[Value]) -> Result<Vec<Filter>, String> {
+type PErr = (Code, String);
+
+fn parse(root: &Path, plugins: &[Value]) -> Result<Vec<Filter>, PErr> {
+    let bad = |m: String| (Code::LegacyFilterFailed, m);
+    // read once, only when a plugin has a git source (pins are in the lockfile, never the config)
+    let mut lock = None;
     let mut v = vec![];
     for def in plugins.iter().filter_map(|p| p.get("legacyFilter")) {
         let run: Vec<String> = def
             .get("run")
             .and_then(|r| serde_json::from_value(r.clone()).ok())
             .filter(|r: &Vec<String>| !r.is_empty())
-            .ok_or("legacyFilter.run must be a non-empty array of strings")?;
+            .ok_or_else(|| bad("legacyFilter.run must be a non-empty array of strings".into()))?;
         match def.get("stage").and_then(Value::as_str) {
             None | Some("afterMerge") => {}
-            Some(s) => return Err(format!("legacyFilter.stage {s:?} is not supported")),
+            Some(s) => return Err(bad(format!("legacyFilter.stage {s:?} is not supported"))),
         }
+        // a git source replaces the project as the base of `cwd`: the pinned, re-hashed checkout
+        let base = match def.get("source") {
+            None => root.to_owned(),
+            Some(s) => {
+                let id = def.get("id").and_then(Value::as_str);
+                let git = s.get("git").and_then(Value::as_str);
+                let (Some(id), Some(git)) = (id, git) else {
+                    return Err(bad("legacyFilter.source needs `id` and `source.git`".into()));
+                };
+                let l = lock.get_or_insert_with(|| crate::plugin::read_lock(root));
+                crate::plugin::verified_checkout(id, git, l.as_ref())?
+            }
+        };
         let dir = match def.get("cwd").and_then(Value::as_str) {
-            Some(c) => root.join(
+            Some(c) => base.join(
                 RelPath::parse(c)
-                    .map_err(|e| format!("legacyFilter.cwd: {e}"))?
+                    .map_err(|e| bad(format!("legacyFilter.cwd: {e}")))?
                     .as_str(),
             ),
-            None => root.to_owned(),
+            None => base,
         };
         v.push(Filter {
             run,
@@ -109,7 +128,7 @@ pub(crate) fn apply(
         Ok(f) if !f.is_empty() => f,
         Ok(_) => return false,
         Err(e) => {
-            diags.push(fail(Code::LegacyFilterFailed, e));
+            diags.push(fail(e.0, e.1));
             return true;
         }
     };
@@ -259,7 +278,10 @@ fn run_one(
                 cmd.env(k, v);
             }
         }
-        cmd.env("PYTHONUTF8", "1").env("FILTER_SETTINGS", &settings);
+        // no `.pyc` next to a sibling module: a checkout must stay byte-identical to its pin
+        cmd.env("PYTHONUTF8", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("FILTER_SETTINGS", &settings);
         let tail = || {
             use std::io::{Read, Seek, SeekFrom};
             let mut buf = vec![];
@@ -301,7 +323,7 @@ fn run_one(
     })()
 }
 
-fn is_link(m: &fs::Metadata) -> bool {
+pub(crate) fn is_link(m: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;

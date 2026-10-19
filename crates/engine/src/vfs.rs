@@ -372,6 +372,9 @@ impl Index {
         changed: &[PathBuf],
     ) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
+        // the directory tree only changes when the set of file keys does: a content edit
+        // keeps `children` as is (rebuilding it allocates every path segment of the project)
+        let mut keys_changed = false;
         for p in changed {
             let Some(names) = names_below(root, p) else {
                 continue;
@@ -393,8 +396,8 @@ impl Index {
                 .filter(|k| names.is_empty() || at_or_below(k.as_str(), &rel))
                 .cloned()
                 .collect();
-            for k in gone {
-                self.files.remove(&k);
+            for k in &gone {
+                self.files.remove(k);
             }
             // every ancestor must be a real directory, the path itself may be anything
             let mut abs = root.to_owned();
@@ -412,7 +415,10 @@ impl Index {
                 }
                 md = std::fs::symlink_metadata(&abs).ok();
             }
-            let Some(md) = md else { continue };
+            let Some(md) = md else {
+                keys_changed |= !gone.is_empty();
+                continue;
+            };
             let mut w = Walk {
                 extra,
                 // never reuse a hash here: a rewrite can keep size and mtime
@@ -439,8 +445,15 @@ impl Index {
             }
             *self = w.index;
             diags.extend(w.diags);
+            keys_changed |= !self
+                .files
+                .keys()
+                .filter(|k| names.is_empty() || at_or_below(k.as_str(), &rel))
+                .eq(gone.iter());
         }
-        self.children = children_of(&self.files);
+        if keys_changed {
+            self.children = children_of(&self.files);
+        }
         diags
     }
 

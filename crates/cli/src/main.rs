@@ -3,12 +3,14 @@
 //! the esbuild bundler.
 
 mod add;
+mod api;
 mod debug;
 mod fix;
 mod hook;
 mod init;
 mod migrate;
 mod pack;
+mod plugin;
 mod rename;
 mod serve;
 mod symbols;
@@ -16,7 +18,6 @@ mod watch;
 
 use beacon_bundler::{Confirm, LazyEsbuild};
 use beacon_engine::build::{BuildOptions, BuildOutcome, ReleaseOptions, Session};
-use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, Severity, exit};
 use beacon_engine::event::BuildEvent;
 use beacon_engine::host::Bundler;
@@ -26,7 +27,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::{fs, process};
+use std::process;
 
 #[derive(Parser)]
 #[command(
@@ -134,6 +135,13 @@ enum Cmd {
         #[arg(long, value_name = "k", value_parser = symbols::parse_kind)]
         kind: Option<beacon_engine::symbols::SymbolKind>,
     },
+    /// Pin and update git-sourced plugins.
+    Plugin {
+        #[command(subcommand)]
+        cmd: plugin::PluginCmd,
+    },
+    /// The Minecraft API index: install, status, lookup; bare `api --json` is the schema-1 summary.
+    Api(api::ApiArgs),
     /// Claude Code hook: reads the event JSON on stdin, prints the decision JSON (8.2).
     Hook { event: migrate::HookEvent },
 }
@@ -170,17 +178,10 @@ struct Opts {
     download: bool,
 }
 
-/// `beacon.plugins` straight from `config.json` (the trust key; validation is the engine's job,
-/// a missing or broken config just means "no plugins" here).
+/// The trust key: `beacon.plugins` plus lockfile pins (validation is the engine's job, a missing
+/// or broken file just means "none").
 fn plugins(project: &Path) -> Vec<Value> {
-    let cfg: Value = fs::read(project.join(CONFIG_FILE))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    cfg["beacon"]["plugins"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    beacon_engine::plugin::project_trust_key(project)
 }
 
 fn session(o: &Opts, a: &BuildArgs) -> Session {
@@ -401,6 +402,8 @@ fn main() {
             dry_run,
         } => symbols::rename(&o, &from, &to, kind, dry_run),
         Cmd::Symbols { find, kind } => symbols::symbols(&o, find.as_deref(), kind),
+        Cmd::Plugin { cmd } => plugin::run(&o, &cmd),
+        Cmd::Api(a) => api::run(&o, &a),
         Cmd::Hook { event } => hook::run(event),
     };
     process::exit(code);

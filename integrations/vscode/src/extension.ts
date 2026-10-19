@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
 import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from "vscode-languageclient/node";
-import { Config, cliArgs, isBeaconManaged, merge, taskArgs } from "./debugConfig";
+import { Config, cliArgs, isBeaconManaged, isBeaconProject, merge, taskArgs } from "./debugConfig";
 
 const TRUST_KEY = "beacon.trusted"; // workspaceState: the user accepted the Beacon trust prompt for this workspace
+const DECLINED_KEY = "beacon.declined"; // workspaceState: "Not now" was picked; no automatic prompt on later reloads
 let client: LanguageClient | undefined;
 
 // `beacon.path` is machine-scoped and a restricted configuration: a repository cannot choose
@@ -22,6 +23,18 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // `--trust` only after the user said yes; `--allow` is never passed from here.
   const trust = () => trusted();
 
+  // `workspaceContains:config.json` also matches Angular, Firebase, ...: only a Beacon project proceeds.
+  const isProject = async (): Promise<boolean> => {
+    const folder = folderOf();
+    if (!folder) return false;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, "config.json"));
+      return isBeaconProject(Buffer.from(bytes).toString("utf8"));
+    } catch {
+      return false;
+    }
+  };
+
   const askTrust = async (): Promise<void> => {
     if (trusted() || !vscode.workspace.isTrusted) return;
     const yes = "Trust";
@@ -31,12 +44,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       "Not now",
     );
     if (pick === yes) await ctx.workspaceState.update(TRUST_KEY, true);
+    await ctx.workspaceState.update(DECLINED_KEY, pick !== yes);
   };
 
   const startClient = async () => {
     const folder = folderOf();
-    if (!folder || !vscode.workspace.isTrusted || client) return;
-    await askTrust();
+    if (!folder || !vscode.workspace.isTrusted || client || !(await isProject())) return;
+    if (!ctx.workspaceState.get<boolean>(DECLINED_KEY, false)) await askTrust(); // the beacon.trust command can still ask
     const run = {
       command: beaconPath(),
       args: ["serve", "--stdio", "--lsp", "--project", folder.uri.fsPath, ...(trust() ? ["--trust"] : [])],

@@ -51,8 +51,8 @@ jobs:
       - name: Spike
         run: cargo spike
 
-      # Enforces every phase-1 budget in perf/budgets.json.
-      - name: Perf (enforced, phase 1)
+      # Enforces every phase-1 and phase-4 (serve idle) budget in perf/budgets.json.
+      - name: Perf (enforced, phase 1 + serve idle)
         shell: bash
         run: >-
           cargo perf run
@@ -61,7 +61,7 @@ jobs:
           --runs 20
           --idle-secs 5
           --enforce
-          --phase 1
+          --phase 4
           --json perf-${{ runner.os }}.json
 
       - uses: actions/upload-artifact@v4

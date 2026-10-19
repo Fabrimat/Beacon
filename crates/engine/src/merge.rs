@@ -4,7 +4,8 @@ use crate::diag::{Code, Diagnostic};
 use crate::model::{Body, ContentItem, Dest, Merge};
 use crate::path::Vfs;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Returns one item per `Dest` (sorted by dest) plus diagnostics: `RouteCollision`,
 /// `CaseFoldCollision` (dest paths equal after case folding within one pack; only the dest
@@ -12,39 +13,56 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Windows/macOS),
 /// `LangDuplicateKey`, `MergeConflict`. Passthrough bodies taking part in a JSON or lang merge
 /// are read through `vfs` (JSON with `//` and `/* */` comments must parse).
-pub fn resolve(items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec<Diagnostic>) {
+pub fn resolve(mut items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec<Diagnostic>) {
     let mut diags = Vec::new();
-    let mut groups: BTreeMap<Dest, Vec<ContentItem>> = BTreeMap::new();
-    for i in items {
-        groups.entry(i.dest.clone()).or_default().push(i);
+    // One stable sort + runs instead of a map of vectors: the same groups in dest order,
+    // each in input order, without a `Dest` clone and a `Vec` per item.
+    items.sort_by(|a, b| a.dest.cmp(&b.dest));
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (n, i) in items.iter().enumerate() {
+        match ranges.last_mut() {
+            Some(r) if items[r.start].dest == i.dest => r.end = n + 1,
+            _ => ranges.push(n..n + 1),
+        }
     }
 
-    let mut folded: BTreeMap<(&str, crate::model::Pack, String), Vec<&Dest>> = BTreeMap::new();
-    for d in groups.keys() {
-        folded
-            .entry((&d.output, d.pack, d.path.fold_key()))
-            .or_default()
-            .push(d);
+    // groups whose dests differ only by case, in (output, pack, folded path) order
+    type Fold<'a> = (&'a str, crate::model::Pack, String);
+    let mut first_of: HashMap<Fold, usize> = HashMap::with_capacity(ranges.len());
+    let mut folded: BTreeMap<Fold, Vec<usize>> = BTreeMap::new();
+    for (g, r) in ranges.iter().enumerate() {
+        let d = &items[r.start].dest;
+        match first_of.entry((&d.output, d.pack, d.path.fold_key())) {
+            Entry::Occupied(e) => folded
+                .entry(e.key().clone())
+                .or_insert_with(|| vec![*e.get()])
+                .push(g),
+            Entry::Vacant(e) => {
+                e.insert(g);
+            }
+        }
     }
-    let first = |d: &Dest| groups[d].iter().map(|i| &i.origin).min();
-    let mut drop: Vec<Dest> = Vec::new();
-    for ds in folded.values().filter(|v| v.len() > 1) {
-        let keep = ds.iter().min_by_key(|d| first(d)).copied();
-        drop.extend(
-            ds.iter()
-                .filter(|d| Some(**d) != keep)
-                .map(|d| (*d).clone()),
-        );
+    let first = |g: usize| items[ranges[g].clone()].iter().map(|i| &i.origin).min();
+    let mut dropped = vec![false; ranges.len()];
+    for gs in folded.values() {
+        let keep = gs.iter().min_by_key(|g| first(**g)).copied();
+        for g in gs.iter().filter(|g| Some(**g) != keep) {
+            dropped[*g] = true;
+        }
+        let d0 = &items[ranges[gs[0]].start].dest;
         let mut d = Diagnostic::new(
             Code::CaseFoldCollision,
             format!(
                 "{} destinations differ only by case: {}",
-                ds[0].pack_name(),
-                join(ds.iter().map(|d| d.path.as_str()))
+                d0.pack_name(),
+                join(
+                    gs.iter()
+                        .map(|g| items[ranges[*g].start].dest.path.as_str())
+                )
             ),
         );
-        for d2 in ds {
-            let o = &groups[*d2][0].origin;
+        for g in gs {
+            let o = &items[ranges[*g].start].origin;
             d = if d.span.is_none() {
                 d.at(o.clone(), None, None)
             } else {
@@ -53,17 +71,23 @@ pub fn resolve(items: Vec<ContentItem>, vfs: &dyn Vfs) -> (Vec<ContentItem>, Vec
         }
         diags.push(d);
     }
-    for d in &drop {
-        groups.remove(d);
-    }
 
-    let out = groups
-        .into_values()
-        .map(|mut g| {
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut it = items.into_iter();
+    for (r, dropped) in ranges.iter().zip(dropped) {
+        if r.len() == 1 {
+            let i = it.next().expect("range item");
+            if !dropped {
+                out.push(i); // the common case: no clone
+            }
+            continue;
+        }
+        let mut g: Vec<ContentItem> = it.by_ref().take(r.len()).collect();
+        if !dropped {
             g.sort_by(|a, b| a.origin.cmp(&b.origin));
-            group(g, vfs, &mut diags)
-        })
-        .collect();
+            out.push(group(g, vfs, &mut diags));
+        }
+    }
     (out, diags)
 }
 

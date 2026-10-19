@@ -108,3 +108,61 @@ fn same_stat_rewrite_builds_cleanly() {
         assert_eq!(o, b"PNH");
     }
 }
+
+/// The routing memo (`route_key`) must not outlive what it was routed from: each edit below
+/// changes routing while the previous result would still look valid by path count or size.
+#[test]
+fn delta_builds_invalidate_the_route_memo() {
+    let p = project(&[("src/m/module.json", r#"{"paths":{"**/*.png":"RP/aaaa"}}"#)]);
+    let root = p.path();
+    let mut s = Session::new(
+        root,
+        opts(root, None),
+        Box::new(FakeHost(Arc::default())),
+        None,
+    );
+    let out = |rel: &str| root.join("out").join(rel).is_file();
+    let rebuild = |s: &mut Session, f: &std::path::Path| {
+        s.changed([f.to_path_buf()]);
+        let r = s.build();
+        assert!(b1_common::errors(&r).is_empty(), "{:?}", r.diagnostics);
+    };
+    s.build();
+    assert!(out("main/RP/aaaa/sword.png"));
+
+    // module.json: same path, same size, other `paths` target
+    let mj = root.join("src/m/module.json");
+    std::fs::write(&mj, r#"{"paths":{"**/*.png":"RP/bbbb"}}"#).unwrap();
+    rebuild(&mut s, &mj);
+    assert!(out("main/RP/bbbb/sword.png"));
+    assert!(!out("main/RP/aaaa/sword.png"));
+
+    // a file add
+    let shield = root.join("src/m/items/shield.png");
+    std::fs::write(&shield, "PNG").unwrap();
+    rebuild(&mut s, &shield);
+    assert!(out("main/RP/bbbb/shield.png"));
+
+    // a rename: same file count, different key
+    let (old, new) = (
+        root.join("src/m/items/sword.png"),
+        root.join("src/m/items/blade.png"),
+    );
+    std::fs::rename(&old, &new).unwrap();
+    s.changed([old, new]);
+    let r = s.build();
+    assert!(b1_common::errors(&r).is_empty(), "{:?}", r.diagnostics);
+    assert!(out("main/RP/bbbb/blade.png"));
+    assert!(!out("main/RP/bbbb/sword.png"));
+
+    // config.json: outputs (the module now routes to another output)
+    let cfg = root.join("config.json");
+    let body = std::fs::read_to_string(&cfg).unwrap().replacen(
+        r#""beacon": {"#,
+        r#""beacon": { "outputs": [{"id":"alt","include":["src/m/**"]}],"#,
+        1,
+    );
+    std::fs::write(&cfg, body).unwrap();
+    rebuild(&mut s, &cfg);
+    assert!(out("alt/RP/bbbb/blade.png"), "output set change not routed");
+}

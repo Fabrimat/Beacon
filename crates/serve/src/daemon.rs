@@ -30,7 +30,6 @@ use crate::{
 };
 use beacon_engine::api_index::ApiIndex;
 use beacon_engine::build::{BuildOptions, BuildOutcome, Session};
-use beacon_engine::config::CONFIG_FILE;
 use beacon_engine::diag::{Code, Diagnostic, exit};
 use beacon_engine::path::RelPath;
 use beacon_engine::{sarif, trust};
@@ -454,15 +453,9 @@ fn watcher(root: &Path, tx: Sender<Job>) {
     });
 }
 
+/// The trust key: `beacon.plugins` plus the lockfile's plugin pins (`plugin::trust_key`).
 fn plugins(root: &Path) -> Vec<serde_json::Value> {
-    let cfg: serde_json::Value = std::fs::read(root.join(CONFIG_FILE))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    cfg["beacon"]["plugins"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    beacon_engine::plugin::project_trust_key(root)
 }
 
 fn reply(ok: bool, error: Option<HelloError>) -> HelloReply {
@@ -649,6 +642,7 @@ fn control(mut s: Stream, shared: &Shared) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use beacon_engine::config::CONFIG_FILE;
     use beacon_engine::host::{GenResult, GeneratorHost};
 
     struct NoHost;

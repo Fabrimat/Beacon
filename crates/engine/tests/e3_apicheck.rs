@@ -110,35 +110,53 @@ fn codes(o: &BuildOutcome, c: Code) -> Vec<&beacon_engine::diag::Diagnostic> {
 
 const FN: &str = "summon minecraft:zomblie\ngive @s minecraft:diamond\nsetblock ~ ~ ~ minecraft:stone\n# summon minecraft:nope\nexecute as @e[type=minecraft:cow] run say hi\n";
 
+/// A target with no index of its own uses the nearest installed one (here 1.26.50 for 1.0.1):
+/// one Note says so and the checks run. "Missing" is `e3_apicheck_missing.rs`.
 #[test]
-fn missing_index_is_one_note() {
+fn other_version_index_is_used_with_one_note() {
     let p = project_with(
         "1.0.1",
         "2.6.0",
         &[
             ("src/m/functions/a.mcfunction", FN),
             ("src/m/functions/b.mcfunction", FN),
+        ],
+    );
+    assert!(shared("1.0.1").is_err()); // no exact index
+    let o = check(p.path());
+    let n = codes(&o, Code::ApiIndexMissing);
+    assert_eq!(n.len(), 1, "{:?}", o.diagnostics);
+    assert_eq!(n[0].severity, Severity::Note);
+    assert!(
+        n[0].message
+            .contains("using API index 1.26.50 for targetVersion 1.0.1"),
+        "{}",
+        n[0].message
+    );
+    assert!(!codes(&o, Code::ApiUnknownVanillaId).is_empty());
+}
+
+#[test]
+fn older_index_skips_the_error_checks() {
+    // target newer than every installed index: its APIs may postdate the index, so no Errors
+    let p = project_with(
+        "9.0.0",
+        "99.0.0",
+        &[
+            ("src/m/functions/a.mcfunction", FN),
             (
                 "src/m/scripts/main.ts",
                 "import { Bogus } from '@minecraft/server';",
             ),
         ],
     );
-    assert!(shared("1.0.1").is_err());
     let o = check(p.path());
     let n = codes(&o, Code::ApiIndexMissing);
     assert_eq!(n.len(), 1, "{:?}", o.diagnostics);
-    assert_eq!(n[0].severity, Severity::Note);
-    for c in [
-        Code::ApiUnknownVanillaId,
-        Code::ApiUnknownScriptMember,
-        Code::ApiScriptModuleVersion,
-        Code::ApiUnknownComponent,
-    ] {
-        assert!(codes(&o, c).is_empty(), "{c:?}");
-    }
-    // a miss is not cached: still missing, and nothing was created in the data dir
-    assert!(shared("1.0.1").is_err());
+    assert!(n[0].message.contains("older"), "{}", n[0].message);
+    assert!(codes(&o, Code::ApiUnknownScriptMember).is_empty());
+    assert!(codes(&o, Code::ApiScriptModuleVersion).is_empty());
+    assert!(!codes(&o, Code::ApiUnknownVanillaId).is_empty());
 }
 
 #[test]
@@ -240,6 +258,7 @@ fn module_version_too_new() {
     let d = codes(&o, Code::ApiScriptModuleVersion);
     assert_eq!(d.len(), 1, "{:?}", o.diagnostics);
     assert!(d[0].message.contains("installed"));
+    assert_eq!(d[0].severity, beacon_engine::diag::Severity::Warning);
 }
 
 #[test]

@@ -49,7 +49,7 @@ jobs:
       - name: Extension build and unit tests
         working-directory: integrations/vscode
         run: |
-          npm install
+          npm ci
           npm test
 
       - name: Build the official debug adapter (MIT source)
@@ -62,7 +62,7 @@ jobs:
         env:
           E2E_TIMEOUT: "240"
         run: |
-          (cd test/fixture && npm install)
+          (cd test/fixture && npm ci)
           BEACON="$GITHUB_WORKSPACE/target/release/beacon.exe" node test/e2e/run.mjs
 
       - uses: actions/upload-artifact@v4

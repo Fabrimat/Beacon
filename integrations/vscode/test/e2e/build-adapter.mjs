@@ -11,15 +11,23 @@ import { createRequire } from "node:module";
 const here = dirname(fileURLToPath(import.meta.url));
 const work = resolve(here, "../../.e2e");
 const src = join(work, "minecraft-debugger");
-// The brief named c69bc37, which does not exist in upstream; c54af36 (2026-10-13) is the HEAD the
-// architecture notes were verified against.
-const COMMIT = process.env.MC_DEBUGGER_COMMIT ?? "c54af36";
-const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: "inherit", shell: process.platform === "win32" });
+// Upstream HEAD the architecture notes were verified against (c54af36, 2026-10-13), pinned by its full
+// SHA: a branch or short ref could move or collide. An override must also be a full SHA.
+const COMMIT = process.env.MC_DEBUGGER_COMMIT ?? "c54af36ee21c21874091e194ecd3c89dfb109060";
+if (!/^[0-9a-f]{40}$/.test(COMMIT)) throw new Error("MC_DEBUGGER_COMMIT must be a full 40-character commit SHA");
+// argv arrays, no shell (paths with spaces). npm is a .cmd shim on Windows, which cannot be spawned
+// without a shell, so run its JS entry point with this node instead.
+const npm = process.platform === "win32"
+  ? [process.execPath, join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")]
+  : ["npm"];
+const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: "inherit" });
 
 mkdirSync(work, { recursive: true });
 if (!existsSync(src)) run("git", ["clone", "https://github.com/Mojang/minecraft-debugger", src], work);
 run("git", ["checkout", "-q", COMMIT], src);
-if (!existsSync(join(src, "node_modules"))) run("npm", ["ci", "--ignore-scripts"], src);
+const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: src }).toString().trim();
+if (head !== COMMIT) throw new Error(`minecraft-debugger is at ${head}, expected ${COMMIT}`);
+if (!existsSync(join(src, "node_modules"))) run(npm[0], [...npm.slice(1), "ci", "--ignore-scripts"], src);
 
 writeFileSync(join(work, "vscode-stub.js"), `
 const noop = () => {};

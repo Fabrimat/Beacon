@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cliArgs, isBeaconManaged, merge, taskArgs, validName } from "../src/debugConfig";
+import { cliArgs, isBeaconManaged, isBeaconProject, merge, taskArgs, validName } from "../src/debugConfig";
 
 const resolved = {
   type: "minecraft-js",
@@ -60,4 +60,14 @@ test("taskArgs builds argv, validates the target, adds --trust only when asked",
 test("cliArgs refuses flag-like target / output from launch.json", () => {
   assert.throws(() => cliArgs({ beaconTarget: "--trust" }, "/p"), /invalid beaconTarget/);
   assert.throws(() => cliArgs({ beaconOutput: "a/b" }, "/p"), /invalid beaconOutput/);
+});
+
+test("isBeaconProject: what beacon init writes is a project, other config.json files are not", () => {
+  assert.ok(isBeaconProject('{"type":"minecraftBedrock","name":"x"}'));
+  assert.ok(isBeaconProject('{ // jsonc\n "beacon": { "sources": ["./src"] } }'));
+  assert.ok(!isBeaconProject('{"projects":{"app":{}},"version":1}')); // Angular-like
+  assert.ok(!isBeaconProject('{"type":"module","beacon":"x"}'));
+  assert.ok(!isBeaconProject("[]"));
+  assert.ok(!isBeaconProject("not json"));
+  assert.ok(!isBeaconProject(""));
 });

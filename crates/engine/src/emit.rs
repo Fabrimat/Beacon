@@ -106,6 +106,36 @@ fn write_file(
     })
 }
 
+/// The ledger as canonical JSON. Written directly when no key or hash needs escaping (the
+/// common case: `to_value` would clone every entry); identical bytes either way.
+fn ledger_bytes(l: &Ledger) -> Vec<u8> {
+    let plain = |s: &str| !s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\');
+    if l.is_empty() || !l.iter().all(|(k, v)| plain(k) && plain(v)) {
+        return canonical::to_vec(&serde_json::to_value(l).expect("ledger json"));
+    }
+    let mut s = String::with_capacity(l.len() * 110);
+    s.push('{');
+    for (n, (k, v)) in l.iter().enumerate() {
+        s.push_str(if n == 0 {
+            "
+  \""
+        } else {
+            ",
+  \""
+        });
+        s.push_str(k);
+        s.push_str("\": \"");
+        s.push_str(v);
+        s.push('"');
+    }
+    s.push_str(
+        "
+}
+",
+    );
+    s.into_bytes()
+}
+
 fn read_ledger(dir: &Path) -> Option<Ledger> {
     serde_json::from_slice(&fs::read(dir.join(LEDGER_FILE)).ok()?).ok()
 }
@@ -342,13 +372,39 @@ pub fn emit_known(
     }
 
     if known != Some(&ledger) {
-        let bytes = canonical::to_vec(&serde_json::to_value(&ledger).expect("ledger json"));
+        let bytes = ledger_bytes(&ledger);
         let lp = root.join(LEDGER_FILE);
-        if fs::read(&lp).ok().as_deref() != Some(&bytes)
+        // with `known` the file was ours last time and differs now: no need to read it back
+        if (known.is_some() || fs::read(&lp).ok().as_deref() != Some(&bytes))
             && let Err(e) = write_file(&lp, &mut |w| w.write_all(&bytes))
         {
             diags.push(fail(LEDGER_FILE, &e));
         }
     }
     (rep, diags, ledger)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ledger_bytes_match_canonical_json() {
+        let mut l = Ledger::new();
+        assert_eq!(
+            ledger_bytes(&l),
+            b"{}
+"
+        );
+        for (k, v) in [("a/b.json", "00ff"), ("a b/c.json", "11"), ("z", "22")] {
+            l.insert(k.into(), v.into());
+        }
+        let want = canonical::to_vec(&serde_json::to_value(&l).unwrap());
+        assert_eq!(ledger_bytes(&l), want);
+        l.insert("q\"uote\\".into(), "33".into()); // falls back to the escaping writer
+        assert_eq!(
+            ledger_bytes(&l),
+            canonical::to_vec(&serde_json::to_value(&l).unwrap())
+        );
+    }
 }

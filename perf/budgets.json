@@ -5,6 +5,7 @@
   { "id": "build_cold_ms",       "label": "Build, cold / empty out dir (p50)",                  "budget": 5000,  "unit": "ms", "phase": 1, "tolerance_pct": 10 },
   { "id": "peak_rss_build_mb",   "label": "Peak RSS during build",                              "budget": 150,   "unit": "MB", "phase": 1, "tolerance_pct": 10 },
   { "id": "idle_rss_watch_mb",   "label": "Idle RSS, watch",                                    "budget": 40,    "unit": "MB", "phase": 1, "tolerance_pct": 10 },
+  { "id": "idle_rss_serve_mb",  "label": "Idle RSS, serve (daemon + shim, trusted session)",    "budget": 100,   "unit": "MB", "phase": 4, "tolerance_pct": 10 },
   { "id": "cli_start_p50_ms",    "label": "CLI start to first output (p50)",                    "budget": 50,    "unit": "ms", "phase": 1, "tolerance_pct": 20 },
   { "id": "binary_size_mb",      "label": "Binary size",                                        "budget": 30,    "unit": "MB", "phase": 1, "tolerance_pct": 5 }
 ]

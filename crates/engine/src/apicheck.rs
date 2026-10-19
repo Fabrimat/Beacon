@@ -11,8 +11,9 @@
 //!   (`scriptModules`) version does not export.
 //! - `BCN0155` (Warning): a named import whose export is `@deprecated` (exports only; member
 //!   deprecations need types, so they stay with `check --full`).
-//! - `BCN0154` (Error): a declared module version (or the installed
-//!   `node_modules/@minecraft/*/package.json`) newer than the pinned stable/beta of the index.
+//! - `BCN0154`: a declared module version newer than the pinned stable/beta of the index (Error:
+//!   the game does not ship it), or an installed `node_modules/@minecraft/*/package.json` newer
+//!   than the pin (Warning: typings only, the bundle keeps the module external).
 //! - `BCN0151` (Note, not a warning): a `minecraft:` name in the top-level `components` of a BP
 //!   entity / item / block that the schema does not list. A note because component availability
 //!   depends on `format_version`, and `component_groups` / permutations are not looked at.
@@ -39,11 +40,26 @@ pub(crate) fn check(
     let mut out = Vec::new();
     let mut noted = false;
     for v in versions {
-        match api_index::shared(v) {
-            Ok(ix) => {
-                module_versions(&ix, root, cfg, v, &mut out);
+        match api_index::resolve(v) {
+            Ok((used, ix)) => {
+                let older = used != *v && !version_newer(&used, v);
+                if used != *v {
+                    out.push(Diagnostic::new(
+                        Code::ApiIndexMissing,
+                        format!(
+                            "using API index {used} for targetVersion {v}{}; install a closer one with `beacon api install --game {v}` if available",
+                            if older { " (older: script API checks skipped)" } else { "" }
+                        ),
+                    ));
+                }
+                // an index older than the target predates its APIs: the Error checks (module
+                // versions, named imports) would flag what the game does ship, so only the
+                // Warning/Note content checks run
+                if !older {
+                    module_versions(&ix, root, cfg, v, &mut out);
+                    scripts(&ix, cfg, vfs, files, &mut out);
+                }
                 content(&ix, vfs, items, v, &mut out);
-                scripts(&ix, cfg, vfs, files, &mut out);
             }
             Err(d) if !noted => {
                 noted = true;
@@ -53,6 +69,11 @@ pub(crate) fn check(
         }
     }
     out
+}
+
+/// `a` is a newer dotted version than `b`.
+fn version_newer(a: &str, b: &str) -> bool {
+    api_index::version_key(a) > api_index::version_key(b)
 }
 
 // ---------------------------------------------------------------- positions

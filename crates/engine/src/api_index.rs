@@ -124,19 +124,85 @@ pub fn cache_path(game_version: &str) -> Option<PathBuf> {
     Some(base.join("api").join(game_version).join("index.json"))
 }
 
-static SHARED: std::sync::Mutex<BTreeMap<String, std::sync::Arc<ApiIndex>>> =
+/// The installed index to use for `target` (a `targetVersion`): the exact one, else the newest
+/// installed version at or below it, else the nearest above it (dotted versions compared
+/// numerically). Returns the game version actually used and the index (via [`shared`], so a
+/// rewritten file is reloaded). `ApiIndexMissing` when nothing is installed.
+pub fn resolve(target: &str) -> Result<(String, std::sync::Arc<ApiIndex>), Diagnostic> {
+    let root = cache_path(target)
+        .and_then(|p| p.parent()?.parent().map(PathBuf::from))
+        .ok_or_else(|| ApiIndex::missing(target, "no cache dir".into()))?;
+    resolve_in(&root, target)
+}
+
+fn resolve_in(
+    root: &std::path::Path,
+    target: &str,
+) -> Result<(String, std::sync::Arc<ApiIndex>), Diagnostic> {
+    let mut installed: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("index.json").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    installed.sort_by_key(|v| version_key(v));
+    let t = version_key(target);
+    // ascending: the last one <= target, else the first one above
+    let pick = installed
+        .iter()
+        .rfind(|v| version_key(v) <= t)
+        .or_else(|| installed.first())
+        .ok_or_else(|| {
+            ApiIndex::missing(target, format!("none installed in {}", root.display()))
+        })?;
+    let ix = shared_at(pick, &root.join(pick).join("index.json"))?;
+    Ok((pick.clone(), ix))
+}
+
+/// `1.26.50` -> [1, 26, 50]; a non-numeric tail (`-beta`) is ignored per component.
+pub(crate) fn version_key(v: &str) -> Vec<u64> {
+    v.split('.')
+        .map(|c| {
+            let d: String = c.chars().take_while(char::is_ascii_digit).collect();
+            d.parse().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Cached index plus the (mtime, size) of its file when it was read.
+type Stamp = (Option<std::time::SystemTime>, u64);
+static SHARED: std::sync::Mutex<BTreeMap<String, (Stamp, std::sync::Arc<ApiIndex>)>> =
     std::sync::Mutex::new(BTreeMap::new());
+
+fn stamp(path: &std::path::Path) -> Stamp {
+    std::fs::metadata(path).map_or((None, 0), |m| (m.modified().ok(), m.len()))
+}
 
 /// Process-wide cached index for `game_version` (shared by `check` and the daemon). Only hits
 /// are cached: a miss (`ApiIndexMissing`) is retried next call, so a later `beacon api`
-/// install is picked up. Never downloads.
+/// install is picked up. A hit costs one `stat`: if the cache file's mtime or size changed
+/// (`beacon api install` rewrote it) the index is reloaded. Never downloads.
 pub fn shared(game_version: &str) -> Result<std::sync::Arc<ApiIndex>, Diagnostic> {
+    let path = cache_path(game_version)
+        .ok_or_else(|| ApiIndex::missing(game_version, "no cache dir".into()))?;
+    shared_at(game_version, &path)
+}
+
+fn shared_at(
+    game_version: &str,
+    path: &std::path::Path,
+) -> Result<std::sync::Arc<ApiIndex>, Diagnostic> {
     let mut m = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ix) = m.get(game_version) {
+    // Stamp before the read: a write landing in between only causes one extra reload.
+    let now = stamp(path);
+    if let Some((st, ix)) = m.get(game_version)
+        && *st == now
+    {
         return Ok(ix.clone());
     }
-    let ix = std::sync::Arc::new(ApiIndex::load(game_version)?);
-    m.insert(game_version.to_owned(), ix.clone());
+    let ix = std::sync::Arc::new(ApiIndex::load_at(game_version, path)?);
+    m.insert(game_version.to_owned(), (now, ix.clone()));
     Ok(ix)
 }
 
@@ -147,17 +213,23 @@ impl ApiIndex {
     /// Loads the cached index for `game_version`: `Err(ApiIndexMissing)` when absent, of an
     /// older `schema`, or unreadable. Never downloads.
     pub fn load(game_version: &str) -> Result<ApiIndex, Diagnostic> {
-        let missing = |why: String| {
-            Diagnostic::new(
-                Code::ApiIndexMissing,
-                format!(
-                    "no API index for game version {game_version} ({why}); run `beacon api --update`"
-                ),
-            )
-        };
-        let path = cache_path(game_version).ok_or_else(|| missing("no cache dir".into()))?;
-        let bytes =
-            std::fs::read(&path).map_err(|e| missing(format!("{}: {e}", path.display())))?;
+        let path = cache_path(game_version)
+            .ok_or_else(|| Self::missing(game_version, "no cache dir".into()))?;
+        Self::load_at(game_version, &path)
+    }
+
+    fn missing(game_version: &str, why: String) -> Diagnostic {
+        Diagnostic::new(
+            Code::ApiIndexMissing,
+            format!(
+                "no API index for game version {game_version} ({why}); run `beacon api install --game {game_version}`"
+            ),
+        )
+    }
+
+    fn load_at(game_version: &str, path: &std::path::Path) -> Result<ApiIndex, Diagnostic> {
+        let missing = |why: String| Self::missing(game_version, why);
+        let bytes = std::fs::read(path).map_err(|e| missing(format!("{}: {e}", path.display())))?;
         let ix: ApiIndex = serde_json::from_slice(&bytes)
             .map_err(|e| missing(format!("{}: {e}", path.display())))?;
         if ix.schema != API_INDEX_SCHEMA || ix.game_version != game_version {
@@ -241,5 +313,71 @@ impl ApiIndex {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_picks_newest_at_or_below_else_nearest_above() {
+        let home = std::env::temp_dir().join(format!("beacon-apires-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for gv in ["1.21.100", "1.26.50"] {
+            let ix = ApiIndex {
+                schema: API_INDEX_SCHEMA,
+                game_version: gv.into(),
+                sources: vec![],
+                script_modules: BTreeMap::new(),
+                vanilla: BTreeMap::new(),
+                components: BTreeMap::new(),
+            };
+            std::fs::create_dir_all(home.join(gv)).unwrap();
+            std::fs::write(
+                home.join(gv).join("index.json"),
+                serde_json::to_vec(&ix).unwrap(),
+            )
+            .unwrap();
+        }
+        let used = |t: &str| resolve_in(&home, t).unwrap().0;
+        assert_eq!(used("1.26.50"), "1.26.50");
+        assert_eq!(used("1.26.30"), "1.21.100"); // between: the older one
+        assert_eq!(used("1.21.100"), "1.21.100");
+        assert_eq!(used("1.30.0"), "1.26.50"); // above all
+        assert_eq!(used("1.20.30"), "1.21.100"); // below all: nearest above
+        assert_eq!(used("1.9.0"), "1.21.100"); // numeric, not lexical
+        assert!(resolve_in(&home.join("none"), "1.0.0").is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn shared_reloads_when_the_cache_file_changes() {
+        let home = std::env::temp_dir().join(format!("beacon-apiidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let gv = "9.9.9-shared-test";
+        let path = home.join("index.json");
+        let write = |extra: &str| {
+            let ix = ApiIndex {
+                schema: API_INDEX_SCHEMA,
+                game_version: gv.into(),
+                sources: vec![],
+                script_modules: BTreeMap::new(),
+                vanilla: BTreeMap::from([("block".into(), BTreeSet::from([extra.to_owned()]))]),
+                components: BTreeMap::new(),
+            };
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&ix).unwrap()).unwrap();
+        };
+        write("a");
+        assert!(shared_at(gv, &path).unwrap().vanilla["block"].contains("a"));
+        write("bb"); // size changes even when the mtime tick is coarse
+        let ix = shared_at(gv, &path).unwrap();
+        assert!(ix.vanilla["block"].contains("bb"), "stale index served");
+        assert!(
+            std::sync::Arc::ptr_eq(&ix, &shared_at(gv, &path).unwrap()),
+            "unchanged file reloaded"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

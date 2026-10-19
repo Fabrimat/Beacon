@@ -46,3 +46,20 @@ export function merge(user: Config, resolved: Config): Config {
   delete out.beaconTarget;
   return out;
 }
+
+/**
+ * Is this `config.json` a Beacon/Bedrock project (what `beacon init` writes: `"type": "minecraftBedrock"`
+ * and a `beacon` object)? Angular, Firebase and friends also have a `config.json`; they must not
+ * trigger the trust prompt or spawn `beacon serve`. Plain JSON or JSONC; anything unparsable is no.
+ */
+export function isBeaconProject(text: string): boolean {
+  try {
+    // ponytail: strips // and /* */ outside strings only; no trailing-comma repair
+    const v: unknown = JSON.parse(text.replace(/"(?:[^"\\]|\\.)*"|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (m) => (m[0] === '"' ? m : "")));
+    if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+    const o = v as Record<string, unknown>;
+    return o.type === "minecraftBedrock" || (typeof o.beacon === "object" && o.beacon !== null && !Array.isArray(o.beacon));
+  } catch {
+    return false;
+  }
+}

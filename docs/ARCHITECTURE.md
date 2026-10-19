@@ -1121,7 +1121,7 @@ phase-3 row:
   "runs arbitrary code"; the plugin list is part of the trust hash). Per non-static output the
   merged items are written to a fresh temp dir as `BP/`, `RP/` and an empty `data/`; the command
   runs there (cwd = that dir) with a scrubbed env (`PATH`, `SystemRoot`, `TEMP`, `TMP`,
-  `USERPROFILE`, `HOME`, `PYTHONUTF8=1`, `FILTER_SETTINGS`) and the settings JSON as its last
+  `USERPROFILE`, `HOME`, `PYTHONUTF8=1`, `PYTHONDONTWRITEBYTECODE=1`, `FILTER_SETTINGS`) and the settings JSON as its last
   argument, like Regolith. Non-zero exit or timeout = `LegacyFilterFailed`: an Error diagnostic, and the plan writes no artifacts. The timeout kills only the child process, not grandchildren it spawned. Output caps: 64 MiB per file, 512 MiB total (`maxFileBytes`/`maxTotalBytes` override them), over a cap = `LegacyFilterFailed`; only the last 64 KiB of the filter's log is read. After the filter, each pack's generated `manifest.json` is restored (a Note if the filter changed it), so UUIDs and versions never change. Only
   `BP/` and `RP/` are read back (every path through `RelPath::parse`, no link followed, bytes
   read into `Body::Text`/`Bytes`, never passed through); other top-level entries are ignored
@@ -1168,7 +1168,7 @@ phase-3 row:
 - **Open**: The-Great-Adventure Education is the only Education project verified (5.9 risk
   stands); a legacy project with no BP/RP dependency gets Beacon's default BP->RP one.
 
-### 14.4 Phase 4 (in progress)
+### 14.4 Phase 4 as built (2026-10-19)
 
 Step 0 (2026-10-19) fixed the contract; code is the source of truth:
 `crates/engine/src/{symbols,api_index,debug,plugin}.rs`, `crates/serve/` (daemon, discovery,
@@ -1244,13 +1244,58 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
   byte-identical). Builds use pins only. Update resolves with the system `git`, shows the
   diff, and writes on confirmation. The trust key becomes the plugin array plus the pins (only
   when pins exist), so an update asks for trust again. JS transform plugins (5.10) are not in
-  phase 4.
-- **Exit verification**: rename by a fixture (`beacon rename` vs an expected tree, then a
-  clean `check`), and the same edit through the LSP. Breakpoints by a Windows e2e job
-  (`@vscode/test-electron`, pinned official VSIX, BDS with auto-attach `listen`, a TS-line
-  breakpoint observed as a DAP `stopped` event), plus one manual run on the Bedrock client.
-  The idle budget by `beacon-perf` (daemon + shim tree, 30 s after the last request, large
-  corpus).
+  phase 4. As built (`crates/engine/src/plugin.rs`, `crates/cli/src/plugin.rs`): `id` and
+  `source` sit inside the `legacyFilter` object; `source.git` is `https://` (`file://` is
+  accepted for local mirrors and tests); `cwd` is then relative to the checkout. Checkouts live
+  at `<data dir>/beacon/plugins/<id>/<commit>/` (`BEACON_HOME` replaces `<data dir>/beacon`),
+  without `.git`, files read-only; every build re-hashes the checkout (sorted paths + per-file
+  blake3, modes ignored, links refused) against the pin: no pin, a pin whose git URL differs
+  from `config.json`, or no checkout = `PluginUnpinned`; a different hash =
+  `PluginHashMismatch`, and nothing runs. Builds never touch the network, so a fresh clone of a
+  project runs `beacon plugin update <id>` once (it restores the checkout when `ref` still
+  resolves to the pinned commit). `update [<id>] [--yes] [--json]`: `git ls-remote`
+  (tag peeled, then branch; a full SHA is taken as is), then `init --template=` + `fetch
+  --depth 1 <sha>` + `checkout` in a scratch dir, always with `core.hooksPath` pointing at an
+  empty dir (no cloned or templated hook runs), `core.symlinks=false`, `autocrlf=false`, no
+  shell, no prompts. The diff (old to new commit, added / removed / changed files; against the
+  old checkout when it is still on disk) is printed; the lock is written after `--yes` or a
+  TTY `y`; without either the exit code is 2 and nothing is written. It runs in restricted
+  mode (it runs `git`, not project code). The trust key is `plugin::project_trust_key`
+  (`config.json` plugins, plus `{"pins": ...}` when the lock has pins) and is used by the CLI
+  and the serve daemon; a project without pins hashes exactly as before.
+- **`beacon api`**: `install [--game <ver>]` (consent as for esbuild: `--yes`,
+  `BEACON_DOWNLOAD=yes` or a TTY), `status`, `lookup <query>`, and bare `beacon api --json`,
+  the ctxtruth-bedrock input, `schema: 1`: `{"schema": 1, "gameVersion": "1.26.50" | null,
+  "installed": bool, "modules": {"@minecraft/server": ["2.10.0", "2.11.0-beta"], ...},
+  "vanilla": {"entity": 129, "item": 1623, ...}}` (`modules` / `vanilla` are empty when not
+  installed; exit 0). `--game` defaults to the newest pinned version not above the project's
+  highest `targetVersion`, else the nearest one above. `check` resolves the installed index the
+  same way (`api_index::resolve`) and says which one it used; an index older than the target
+  skips the Error checks (module versions, named imports), whose APIs it may predate. `status --json`: `{"schema": 1, "versions": [{"gameVersion",
+  "installed", "path"}]}`; `lookup --json`: `{"schema": 1, "gameVersion", "hits": [{"path",
+  "signature", "doc", "deprecated"}]}`.
+- **Exit verification (as built)**:
+  1. *Rename*: machine-verified. `fixtures/rename` -> `fixtures/rename.expected` byte-identical
+     through `beacon rename` and through the LSP (`crates/serve/tests/lsp.rs`), then a clean
+     `check`.
+  2. *Breakpoints in TS source*: the official adapter (`session.ts` of Mojang's
+     minecraft-debugger, MIT, full-SHA pin, built unmodified with a `vscode` stub, run out of
+     process) driven by a Node DAP client against BDS 1.26.52.3 in auto-attach `listen` mode
+     reached `verified` and `stopped` at the breakpoint's TS line, locally on Windows
+     (`integrations/vscode/test/e2e/run.mjs`; `.github/workflows/vscode-e2e.yml` runs it with
+     `continue-on-error` until green on CI). Not machine-verified, **pending one human run**:
+     F5 inside real VS Code with the Beacon and official extensions on a `beaconOutput` /
+     `beaconTarget` launch entry (the two debug-configuration providers' interaction).
+  3. *Serve idle budget*: machine-verified in CI (`idle_rss_serve_mb`, phase 4: daemon found
+     via `--status` + shim, after an MCP `check` on the large corpus; 27 MB measured against
+     100 MB).
+- **Production gate**: with the 1.26.50 index installed, `beacon check` on the migrated
+  Dimension-Clash and The-Great-Adventure (both editions) runs the API checks with no
+  BCN0151-0155 findings; it reports three genuine BCN0140 dangling `function` calls in
+  The-Great-Adventure.
+- **Watch latency**: route memo keyed on config + paths + `module.json` hashes, `children`
+  rebuilt only on key-set changes, merge by sorted runs, ledger written without read-back,
+  symbols memo; local JSON p95 60.6 -> 36 ms (macOS CI had reached 95.5 ms of 100).
 
 ---
 

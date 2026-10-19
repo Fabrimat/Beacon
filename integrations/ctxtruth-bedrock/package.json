@@ -1,0 +1,28 @@
+{
+  "name": "ctxtruth-bedrock",
+  "version": "0.1.0",
+  "description": "ctxtruth plugin: verifies Minecraft Bedrock claims in agent docs against the Beacon CLI.",
+  "license": "MIT",
+  "main": "./out/src/index.js",
+  "types": "./out/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./out/src/index.d.ts",
+      "default": "./out/src/index.js"
+    }
+  },
+  "files": [
+    "out/src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test \"out/test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

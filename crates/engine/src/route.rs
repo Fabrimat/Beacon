@@ -200,7 +200,7 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
     if d.is_empty() { Ok(c) } else { Err(d) }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Routed {
     /// Convention + `module.json` items, sorted by (dest, origin). Not conflict-resolved yet.
     pub items: Vec<ContentItem>,
@@ -212,6 +212,9 @@ pub struct Routed {
     /// `module.json` is invalid are missing.
     pub modules: BTreeMap<RelPath, ModuleJson>,
     pub diagnostics: Vec<Diagnostic>,
+    /// [`route_key`] of what this was routed from when it is still exactly that (the builder
+    /// zeroes it when it adds items); all zero = unknown, nothing derived from it may be reused.
+    pub key: [u8; 32],
 }
 
 /// Every file below `dir`, sorted, as (path, module-relative path).
@@ -229,6 +232,30 @@ fn files_under(vfs: &dyn Vfs, dir: &RelPath, rel: &str, out: &mut Vec<(RelPath, 
             files_under(vfs, &child, &r, out);
         }
     }
+}
+
+/// What [`route`] depends on, hashed: the routing config, every indexed path (the folder
+/// structure) and the content hash of every `module.json`. Equal keys give equal [`Routed`]
+/// (routing never reads anything else), so a watch rebuild after a content edit can reuse it.
+pub fn route_key(cfg: &ProjectConfig, files: &[&RelPath], vfs: &dyn Vfs) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(
+        format!(
+            "{:?}|{:?}|{:?}",
+            cfg.beacon.sources, cfg.beacon.outputs, cfg.namespace
+        )
+        .as_bytes(),
+    );
+    for f in files {
+        h.update(f.as_str().as_bytes());
+        h.update(&[0]);
+        if f.file_name() == MODULE_FILE
+            && let Ok(x) = vfs.hash(f)
+        {
+            h.update(&x);
+        }
+    }
+    *h.finalize().as_bytes()
 }
 
 /// Routes every indexed file under `beacon.sources`. Modules = first-level folders of each

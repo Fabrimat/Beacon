@@ -139,6 +139,8 @@ fn help_json_lists_every_command() {
             "rename-output",
             "rename",
             "symbols",
+            "plugin",
+            "api",
             "hook"
         ]
     );
@@ -635,4 +637,85 @@ fn download_env_does_not_confirm_trust() {
         .unwrap();
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(!h.path().join("trust.json").exists());
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn plugin_update_needs_confirmation_then_pins() {
+    let h = tempfile::tempdir().unwrap();
+    let up = tempfile::tempdir().unwrap();
+    write(up.path(), "work/filter.py", "pass\n");
+    let work = up.path().join("work");
+    if !(git_ok(&work, &["init", "-q", "-b", "main"])
+        && git_ok(&work, &["add", "."])
+        && git_ok(&work, &["commit", "-q", "-m", "one"])
+        && git_ok(up.path(), &["clone", "-q", "--bare", "work", "bare.git"]))
+    {
+        eprintln!("SKIP: git is not installed");
+        return;
+    }
+    let p = tempfile::tempdir().unwrap();
+    let bare = up
+        .path()
+        .join("bare.git")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let url = format!(
+        "file://{}{bare}",
+        if bare.starts_with('/') { "" } else { "/" }
+    );
+    let cfg = serde_json::json!({"type":"minecraftBedrock","name":"t","targetVersion":"1.21.100",
+        "namespace":"demo","beacon":{"plugins":[{"legacyFilter":{"id":"f","run":["python","filter.py"],
+        "source":{"git":url,"ref":"main"}}}]}});
+    write(p.path(), "config.json", &cfg.to_string());
+    let proj = p.path().to_str().unwrap();
+    // no TTY and no --yes: the diff is shown, nothing is written
+    let o = beacon(h.path(), &["plugin", "update", "--project", proj]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(!p.path().join("beacon.lock.json").exists());
+    let o = beacon(
+        h.path(),
+        &[
+            "plugin",
+            "update",
+            "f",
+            "--yes",
+            "--json",
+            "--project",
+            proj,
+        ],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["applied"], true);
+    assert_eq!(v["updates"][0]["added"][0], "filter.py");
+    assert!(
+        std::fs::read_to_string(p.path().join("beacon.lock.json"))
+            .unwrap()
+            .contains("\"plugins\"")
+    );
+    // a second run changes nothing
+    let o = beacon(
+        h.path(),
+        &["plugin", "update", "--yes", "--json", "--project", proj],
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["applied"],
+        false
+    );
 }

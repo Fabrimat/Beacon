@@ -110,6 +110,8 @@ pub struct Session {
     /// the routed items and the generator output of the first plan (the packs projection
     /// for `check`).
     symbols: Option<crate::symbols::SymbolTable>,
+    /// Last routing result by [`route::route_key`]: routing is O(files) allocations.
+    route_memo: Option<([u8; 32], route::Routed)>,
 }
 
 #[derive(Clone)]
@@ -391,6 +393,7 @@ impl Session {
             idx_diags: Vec::new(),
             ledgers: HashMap::new(),
             symbols: None,
+            route_memo: None,
         }
     }
 
@@ -581,9 +584,21 @@ impl Session {
             idx: &index,
             changed: AtomicBool::new(false),
         };
-        let mut routed = route::route(&cfg, &vfs);
+        let key = route::route_key(&cfg, &index.files(), &vfs);
+        let mut routed = match &self.route_memo {
+            Some((k, r)) if *k == key => r.clone(),
+            _ => {
+                let r = route::route(&cfg, &vfs);
+                // a read that found a file changed under us is not a result to keep
+                self.route_memo = (!vfs.changed.load(Ordering::Relaxed)).then(|| (key, r.clone()));
+                r
+            }
+        };
         a.diags.append(&mut routed.diagnostics);
         let (st, d) = statics::items(&cfg, &vfs);
+        if st.is_empty() {
+            routed.key = key;
+        }
         routed.items.extend(st);
         a.diags.extend(d);
         a.inputs = index.files().into_iter().cloned().collect();
