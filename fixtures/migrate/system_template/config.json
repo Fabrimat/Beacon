@@ -1,0 +1,38 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Bedrock-OSS/regolith-schemas/main/config/v1.4.json",
+	"author": "Beacon fixtures",
+	"name": "st-fixture",
+	"packs": {
+		"behaviorPack": "./packs/BP",
+		"resourcePack": "./packs/RP"
+	},
+	"regolith": {
+		"dataPath": "./data",
+		"filterDefinitions": {
+			"system_template": {
+				"url": "github.com/Nusiq/regolith-filters",
+				"version": "3.16.0"
+			}
+		},
+		"formatVersion": "1.4.0",
+		"profiles": {
+			"default": {
+				"export": {
+					"target": "development",
+					"readOnly": false
+				},
+				"filters": [
+					{
+						"filter": "system_template",
+						"settings": {
+							"log_path": "system_template_log.json",
+							"scope": {
+								"config_health": 30
+							}
+						}
+					}
+				]
+			}
+		}
+	}
+}

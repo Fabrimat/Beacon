@@ -1,0 +1,51 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Bedrock-OSS/regolith-schemas/main/config/v1.4.json",
+	"author": "Beacon fixtures",
+	"name": "sample-edu-world",
+	"packs": {
+		"behaviorPack": "./packs/BP",
+		"resourcePack": "./packs/RP"
+	},
+	"worlds": ["./worlds/*"],
+	"regolith": {
+		"dataPath": "./data",
+		"filterDefinitions": {
+			"system_template": {
+				"url": "github.com/Nusiq/regolith-filters",
+				"version": "3.16.0"
+			}
+		},
+		"formatVersion": "1.4.0",
+		"profiles": {
+			"default": {
+				"export": {
+					"target": "development",
+					"readOnly": false
+				},
+				"filters": [
+					{
+						"filter": "system_template"
+					}
+				]
+			},
+			"edu": {
+				"export": {
+					"target": "world",
+					"worldName": "Sample Lesson",
+					"build": "education",
+					"readOnly": false
+				},
+				"filters": [
+					{
+						"filter": "system_template",
+						"settings": {
+							"scope": {
+								"edu": true
+							}
+						}
+					}
+				]
+			}
+		}
+	}
+}

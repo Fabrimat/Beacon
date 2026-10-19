@@ -209,8 +209,10 @@ Rules:
     "sources": ["./src"],
     "packMeta": {                      // names and descriptions (versions: 4.2.1)
       "name": "pack.name",             // lang key or literal
-      "description": "pack.description"
-    },
+      "description": "pack.description",
+      "packDependencies": "bp-rp"      // bp-rp | rp-bp | mutual: which manifest depends on its
+    },                                 // sibling (uuid + released version, tracks releases);
+                                       // mutual releases both packs of an output together
     "versionPolicy": "auto",           // auto | manual (4.2.1)
     "outputs": [ /* 4.3 */ ],
     "targets": { /* 4.4 */ },
@@ -270,7 +272,9 @@ pair is the bug to prevent.
 - **Dependency chain**: a BP manifest pins its dependencies' versions, so the BP's hash
   includes its generated manifest. When an RP is bumped, the dependent BP changes and is
   bumped too. Bumps are computed in dependency order. The world template is bumped when the
-  world or any embedded pack changes.
+  world or any embedded pack changes. With `packDependencies: "mutual"` the sibling pins are
+  left out of both hashes and the pair is decided together (either changed -> both bump once);
+  switching an existing project to or from `mutual` bumps both packs once.
 - `min_engine_version` is derived per target from `targetVersion` (Education lags Bedrock).
   Script module dependency versions (`@minecraft/server` etc.) come from the target's API
   index, not from pack versioning.
@@ -1090,6 +1094,79 @@ truth (`crates/engine/src/{path,model,host,diag,event}.rs` are the contract modu
   still kept per edition (content differs by `min_engine_version` and edition transforms).
 - Not yet evidenced: the second half of the phase-2 exit ("the team builds a real release of
   a new project") is a process step for the team.
+
+### 14.3 Phase 3 as built (2026-10-19)
+
+Contract: `crates/engine/src/migrate/` (`detect` -> `LegacyEval` -> `plan` -> `apply`,
+`equiv::compare`), `crates/jshost/src/legacy.rs`; fixtures in `fixtures/migrate/` (expected
+trees generated once by the real filters, see its README). Deviations from 5.6 and the
+phase-3 row:
+
+- **No Regolith in the binary.** Beacon never runs or emulates Regolith; profiles are read from
+  `config.json` and mapped to targets once.
+- **`--oracle` is previously built output** (a legacy `BP/` + `RP/` the user built with the old
+  tools), not something `migrate` produces by running them.
+- **No Deno / uv pins in phase 3.** ModularMC maps are evaluated in Beacon's JS host;
+  system_template `_map.py` is not evaluated by Beacon: its real output is passed with
+  `--evaluated` (Regolith tmp layout plus `system_template_log.json`).
+- **No generator emission.** One-to-many loops are imported as their evaluated output and listed
+  as generator candidates in the report.
+- **`beacon plugin update`** moves to phase 4.
+- **`legacy_filter`** (`crates/engine/src/legacy_filter.rs`) is minimal and non-blocking: a
+  Regolith filter kept as an external-process plugin, reported as `MigrateToPort`, not required
+  for the phase-3 exit. Config: `beacon.plugins: [{"legacyFilter": {"run": ["python",
+  "filter.py"], "settings": {}, "stage": "afterMerge", "cwd": "<filter dir>", "timeoutSecs":
+  120}}]` (only `afterMerge`; a relative `run` argument naming a file of `cwd` is made absolute).
+  It is trusted code: it runs only in a trusted session (`beacon trust` shows plugins as
+  "runs arbitrary code"; the plugin list is part of the trust hash). Per non-static output the
+  merged items are written to a fresh temp dir as `BP/`, `RP/` and an empty `data/`; the command
+  runs there (cwd = that dir) with a scrubbed env (`PATH`, `SystemRoot`, `TEMP`, `TMP`,
+  `USERPROFILE`, `HOME`, `PYTHONUTF8=1`, `FILTER_SETTINGS`) and the settings JSON as its last
+  argument, like Regolith. Non-zero exit or timeout = `LegacyFilterFailed`: an Error diagnostic, and the plan writes no artifacts. The timeout kills only the child process, not grandchildren it spawned. Output caps: 64 MiB per file, 512 MiB total (`maxFileBytes`/`maxTotalBytes` override them), over a cap = `LegacyFilterFailed`; only the last 64 KiB of the filter's log is read. After the filter, each pack's generated `manifest.json` is restored (a Note if the filter changed it), so UUIDs and versions never change. Only
+  `BP/` and `RP/` are read back (every path through `RelPath::parse`, no link followed, bytes
+  read into `Body::Text`/`Bytes`, never passed through); other top-level entries are ignored
+  with a note, and any escape (bad path, link, a write outside the work dir) is
+  `LegacyFilterEscaped` and the whole output is discarded. The data dir is not synced back.
+- **Local production check** (`scripts/fixtures-local.ps1`, `.sh`; maintainer only, never in
+  CI, `-WhatIf`/`--dry-run` prints the steps). It copies a real Regolith project to
+  `%TEMP%\beacon-mig\<name>` (source untouched; nothing is written in the repo), appends a
+  `beacon_oracle` profile (the packaging filters, `exact`-exported to `./.beacon-oracle/{BP,RP}`)
+  and runs it with Regolith; for system_template projects it also runs `beacon_eval`
+  (`subfunctions`, `system_template`, `shapescape_custom_blocks_generator`,
+  `system_template_esbuild`, exported to `./.beacon-eval/` with the retained tmp `data/` and
+  `system_template_log.json`), then `beacon migrate <copy> --out <tmp>/migrated --oracle ...
+  [--evaluated ...] --trust --json` and prints the summary, `MIGRATION.md` and the JSON report
+  (the diff list).
+- **Oracle rules.** The oracle is output the legacy toolchain built from the same filters, never
+  Beacon's own; both it and the migrated build are compared per file (text by lines, JSON by
+  value, binaries by hash) and every difference is listed, none hidden. The migrated project
+  must build with Beacon alone. Production data stays in `%TEMP%`.
+  `--oracle-profile <profile>` builds the migrated target that profile maps to (a world-free
+  target with the same edition and `targetVersion` stands in when a world folder is missing;
+  BP/RP are extracted from archives by manifest module type). Ignored: identity fields of
+  manifests (`header`/`modules` uuid and version, sibling uuid), source maps, files at the
+  oracle root, `data/**`; bundles compare module order through the `// path` headers.
+- **Real-run results (exit check).** Dimension-Clash (ModularMC, Bedrock): 3134 files, 0 diffs.
+  The-Great-Adventure (system_template, `packaging` = Education and `bedrock_packaging` =
+  Bedrock): 2942 files, 1 diff each, the bundle's module-path comments (the legacy
+  `text_replacer` rewrote npm package paths inside the bundle; package code holds no runtime
+  strings it touches). Both after one `npm install` in the migrated project.
+- **What real projects needed** (all reported in `MIGRATION.md`): ModularMC entry order
+  (concurrent `stop` entries first, as `MapTs.apply`), case-insensitive source lookup with a
+  portability warning, `UNPACK:SUBFUNCTION` folders, the content-guide fields stripped like the
+  filter does, `text_replacer` on fragments and script sources (import specifiers kept),
+  subfunctions syntax left after ModularMC frozen from the oracle's expansion (Beacon does not
+  implement the subfunctions language), data-dir `package.json` moved to the root with `file:`
+  packages vendored under `vendor/`, `scriptModules` from the legacy manifest's `module_name`
+  dependencies, `packMeta.packDependencies` from the legacy BP/RP dependency directions.
+- **Build changes made for migration**: bundler externals are exactly `@minecraft/server` plus
+  the `scriptModules` keys (npm-only `@minecraft/*` packages are bundled);
+  `packMeta.packDependencies` (`bp-rp` default, `rp-bp`, `mutual`, 4.2.1).
+- **Perf**: `Index::read` caches file contents (1 MiB per file, 32 MiB total, valid while the
+  indexed hash matches; one-shot builds start with a fresh index) and watch no longer waits on
+  in-place edits; macOS watch-JSON p95 had crossed its 100 ms budget.
+- **Open**: The-Great-Adventure Education is the only Education project verified (5.9 risk
+  stands); a legacy project with no BP/RP dependency gets Beacon's default BP->RP one.
 
 ---
 

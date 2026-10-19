@@ -68,6 +68,7 @@ fn bundles_two_entries() {
         sourcemap: true,
         minify: false,
         define: &Default::default(),
+        externals: &["@minecraft/server".to_string()],
     };
     let t0 = Instant::now();
     let res = esbuild.bundle(&req);
@@ -109,6 +110,7 @@ fn syntax_error_has_span() {
         sourcemap: false,
         minify: false,
         define: &Default::default(),
+        externals: &[],
     });
     assert!(res.code.is_none());
     let d = &res.diagnostics[0];
@@ -145,6 +147,7 @@ console.log(x);
         sourcemap: false,
         minify: false,
         define: &Default::default(),
+        externals: &[],
     });
     assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
     assert!(res.code.unwrap().contains("SHARED"));
@@ -170,6 +173,7 @@ fn define_becomes_constant() {
         sourcemap: false,
         minify: false,
         define: &define,
+        externals: &[],
     });
     assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
     let code = res.code.unwrap();
@@ -179,4 +183,48 @@ fn define_becomes_constant() {
         code.contains(r#"a \"b\" c"#) || code.contains(r#"'a "b" c'"#),
         "{code}"
     );
+}
+
+#[test]
+fn only_declared_modules_are_external() {
+    let Some(inst) = install() else { return };
+    let esbuild = Esbuild::find(inst, beacon_bundler::Confirm::No).expect("find");
+    let t = tempfile::tempdir().unwrap();
+    let nm = t.path().join("node_modules/@minecraft/vanilla-data");
+    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::write(
+        nm.join("package.json"),
+        r#"{"name":"@minecraft/vanilla-data","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        nm.join("index.js"),
+        "export const VANILLA = 'INLINED_VD';
+",
+    )
+    .unwrap();
+    std::fs::write(
+        t.path().join("a.js"),
+        "import {VANILLA} from '@minecraft/vanilla-data';
+import {world} from '@minecraft/server';
+import {x} from '@minecraft/server/deep';
+console.log(VANILLA, world, x);
+",
+    )
+    .unwrap();
+    let entries = [rp("a.js")];
+    let res = esbuild.bundle(&BundleRequest {
+        root: t.path(),
+        entries: &entries,
+        sourcemap: false,
+        minify: false,
+        define: &Default::default(),
+        externals: &["@minecraft/server".to_string()],
+    });
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    let code = res.code.unwrap();
+    assert!(code.contains("INLINED_VD"), "{code}");
+    assert!(!code.contains("\"@minecraft/vanilla-data\""), "{code}");
+    assert!(code.contains("\"@minecraft/server\""), "{code}");
+    assert!(code.contains("\"@minecraft/server/deep\""), "{code}");
 }

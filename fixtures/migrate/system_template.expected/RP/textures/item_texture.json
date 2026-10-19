@@ -1,0 +1,15 @@
+{
+	"resource_pack_name": "stf",
+	"texture_name": "atlas.items",
+	"texture_data": {
+		"stf_paint": {
+			"textures": "textures/items/paint"
+		},
+		"stf_ruby": {
+			"textures": "textures/items/ruby"
+		},
+		"stf_sapphire": {
+			"textures": "textures/items/sapphire"
+		}
+	}
+}

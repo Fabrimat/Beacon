@@ -10,7 +10,7 @@ use crate::model::{Body, ContentItem, Dest, Merge, OutputId, Pack};
 use crate::path::{RelPath, Vfs};
 use crate::route::Routed;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// `RP/textures/<reg>.json` fragment registering `key` -> `path` (pack path, no extension).
 fn texture(i: &ContentItem, kind: &str, key: &str, path: &str, origin: &RelPath) -> ContentItem {
@@ -90,6 +90,13 @@ pub(crate) fn derive(
             let Some(stem) = origin.file_name().strip_suffix(suffix) else {
                 continue;
             };
+            if routed
+                .modules
+                .get(&it.module)
+                .is_some_and(|m| !m.auto_textures)
+            {
+                continue;
+            }
             let png = origin
                 .parent()
                 .and_then(|d| d.join(&format!("{stem}.png")).ok());
@@ -203,4 +210,234 @@ pub(crate) fn derive(
         }
     }
     (out, diags)
+}
+
+/// Python `str.title()`: the first letter of every run of letters upper, the rest lower.
+fn title(s: &str) -> String {
+    let mut prev = false;
+    let mut out = String::new();
+    for c in s.chars() {
+        let alpha = c.is_alphabetic();
+        if alpha && prev {
+            out.extend(c.to_lowercase());
+        } else if alpha {
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(c);
+        }
+        prev = alpha;
+    }
+    out
+}
+
+/// `name_ninja` `format_name`: `ns:some_thing` -> `Some Thing` (`name.split(":")[1]`).
+fn format_name(id: &str) -> String {
+    title(&id.split(':').nth(1).unwrap_or(id).replace('_', " "))
+}
+
+/// `json.dump(list, indent='\t')` (ensure_ascii: non-ASCII as `\uXXXX`), no trailing newline.
+fn json_list(items: &[String]) -> String {
+    let quote = |s: &String| {
+        let mut o = String::new();
+        for c in serde_json::to_string(s).expect("string json").chars() {
+            if c.is_ascii() {
+                o.push(c);
+            } else {
+                for u in c.encode_utf16(&mut [0u16; 2]) {
+                    o.push_str(&format!("\\u{u:04x}"));
+                }
+            }
+        }
+        o
+    };
+    let body: Vec<String> = items.iter().map(|s| format!("\t{}", quote(s))).collect();
+    format!("[\n{}\n]", body.join(",\n"))
+}
+
+/// `FormatVersion(v) < FormatVersion('1.16.100')`, missing parts 0.
+fn old_format(v: &str) -> bool {
+    let n: Vec<u32> = v.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    let at = |i: usize| n.get(i).copied().unwrap_or(0);
+    (at(0), at(1), at(2)) < (1, 16, 100)
+}
+
+/// Body of an item as text (BOM stripped).
+fn text_of(i: &ContentItem, vfs: &dyn Vfs) -> String {
+    let bytes = match &i.body {
+        Body::Text(t) => return t.clone(),
+        Body::Passthrough(p) => vfs.read(p).unwrap_or_default(),
+        Body::Bytes(b) => b.clone(),
+        Body::Json(v) => v.to_string().into_bytes(),
+    };
+    String::from_utf8_lossy(&bytes)
+        .trim_start_matches('\u{feff}')
+        .to_owned()
+}
+
+/// Registries that need the merged result (after `merge::resolve`): `autoNames` (the
+/// `name_ninja` filter) and `texturesList` (the `texture_list` filter). Static outputs are
+/// included as-is and never touched.
+pub(crate) fn after_merge(
+    cfg: &ProjectConfig,
+    merged: &mut Vec<ContentItem>,
+    vfs: &dyn Vfs,
+    is_static: &dyn Fn(&OutputId) -> bool,
+) {
+    let outputs: BTreeSet<OutputId> = merged
+        .iter()
+        .filter(|i| i.dest.pack == Pack::Resource && !is_static(&i.dest.output))
+        .map(|i| i.dest.output.clone())
+        .collect();
+    let origin = RelPath::parse(crate::config::CONFIG_FILE).expect("const");
+    let rp = |o: &OutputId, i: &ContentItem, path: &str| {
+        i.dest.output == *o && i.dest.pack == Pack::Resource && i.dest.path.as_str() == path
+    };
+    for o in &outputs {
+        let mut new = Vec::new();
+        if let Some(n) = &cfg.beacon.auto_names {
+            let path = format!("texts/{}.lang", n.language);
+            let at = merged.iter().position(|i| rp(o, i, &path));
+            let mut text = at.map(|k| text_of(&merged[k], vfs)).unwrap_or_default();
+            let mut known: BTreeSet<String> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_owned()))
+                .collect();
+            let mut added = false;
+            for (k, v) in auto_name_lines(n, merged, o, vfs) {
+                if known.insert(k.clone()) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("{k}={v}\t##\n"));
+                    added = true;
+                }
+            }
+            if added {
+                match at {
+                    Some(k) => merged[k].body = Body::Text(text),
+                    None => new.push((path, Body::Text(text), Merge::LangLines)),
+                }
+            }
+        }
+        if cfg.beacon.textures_list {
+            let tex = |ext: &str| {
+                let mut v: Vec<String> = merged
+                    .iter()
+                    .filter(|i| i.dest.output == *o && i.dest.pack == Pack::Resource)
+                    .map(|i| i.dest.path.as_str())
+                    .filter(|p| p.starts_with("textures/") && p.ends_with(ext))
+                    .map(|p| strip_ext(p).to_owned())
+                    .collect();
+                v.sort();
+                v
+            };
+            // texture_list.py: every png, then every tga (each sorted here; glob order there)
+            let list = [tex(".png"), tex(".tga")].concat();
+            if !list.is_empty() {
+                let path = "textures/textures_list.json";
+                merged.retain(|i| !rp(o, i, path));
+                new.push((path.into(), Body::Text(json_list(&list)), Merge::Error));
+            }
+        }
+        merged.extend(new.into_iter().map(|(path, body, merge)| ContentItem {
+            dest: Dest {
+                output: o.clone(),
+                pack: Pack::Resource,
+                path: RelPath::parse(&path).expect("static path"),
+            },
+            body,
+            merge,
+            origin: origin.clone(),
+            module: origin.clone(),
+        }));
+    }
+}
+
+/// (identifier, `format_version`, explicit `description.name`)
+/// (id, format_version, description.name, description.spawn_egg_name)
+type Def = (String, String, Option<String>, Option<String>);
+
+/// `name_ninja` translations for output `o`, in the filter's order: spawn eggs, items, blocks,
+/// entities (each in dest order). `minecraft:` ids are skipped. A definition's explicit
+/// `description/name` is the value (name_ninja pops it from the definition; we leave it).
+fn auto_name_lines(
+    n: &crate::config::AutoNames,
+    merged: &[ContentItem],
+    o: &OutputId,
+    vfs: &dyn Vfs,
+) -> Vec<(String, String)> {
+    // folder -> (identifier, format_version, explicit name)
+    let mut defs: BTreeMap<&str, Vec<Def>> = BTreeMap::new();
+    for i in merged
+        .iter()
+        .filter(|i| i.dest.output == *o && i.dest.pack == Pack::Behavior)
+    {
+        let p = i.dest.path.as_str();
+        let Some((dir, root)) = [
+            ("entities/", "minecraft:entity"),
+            ("items/", "minecraft:item"),
+            ("blocks/", "minecraft:block"),
+        ]
+        .into_iter()
+        .find(|(d, _)| p.starts_with(d) && p.ends_with(".json")) else {
+            continue;
+        };
+        let text = text_of(i, vfs);
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&crate::merge::strip_comments(
+            text.as_bytes(),
+        )) else {
+            continue;
+        };
+        let d = &v[root]["description"];
+        let Some(id) = d["identifier"]
+            .as_str()
+            .filter(|id| id.contains(':') && !id.starts_with("minecraft:"))
+        else {
+            continue;
+        };
+        defs.entry(dir).or_default().push((
+            id.to_owned(),
+            v["format_version"].as_str().unwrap_or("1.20.0").to_owned(),
+            d["name"].as_str().map(str::to_owned),
+            d["spawn_egg_name"].as_str().map(str::to_owned),
+        ));
+    }
+    let eggs = n.spawn_eggs.as_ref();
+    let (pre, post) = eggs.map_or(("", ""), |e| (&e.prefix[..], &e.postfix[..]));
+    // (folder, enabled, prefix, postfix, is spawn egg)
+    let kinds = [
+        ("entities/", eggs.is_some(), pre, post, true),
+        ("items/", n.items, "", "", false),
+        ("blocks/", n.blocks, "", "", false),
+        ("entities/", n.entities, "", "", false),
+    ];
+    let mut out = Vec::new();
+    for (dir, on, pre, post, egg) in kinds {
+        for (id, fv, name, egg_name) in defs.get(dir).into_iter().flatten() {
+            // name_ninja >= 1.3.1 tries `spawn_egg_name` first for eggs; older versions
+            // only `name`. Supporting both is a superset (absent field = old behaviour).
+            let name = match egg {
+                true => egg_name.as_ref().or(name.as_ref()),
+                false => name.as_ref(),
+            };
+            // gather_translations: an explicit name is always translated (any kind, no
+            // prefix/postfix); `auto_name` only decides the fallback
+            if name.is_none() && !on {
+                continue;
+            }
+            let key = match dir {
+                _ if egg => format!("item.spawn_egg.entity.{id}.name"),
+                "items/" if !old_format(fv) => format!("item.{id}"),
+                "items/" => format!("item.{id}.name"),
+                "blocks/" => format!("tile.{id}.name"),
+                _ => format!("entity.{id}.name"),
+            };
+            let value = name
+                .cloned()
+                .unwrap_or_else(|| format!("{pre}{}{post}", format_name(id)));
+            out.push((key, value));
+        }
+    }
+    out
 }

@@ -82,7 +82,6 @@ pub struct BuildOutcome {
 
 /// GenCtx target of the packs build (no `--target`).
 pub const PACKS_TARGET: &str = "packs";
-const SCRIPT_ENTRY: &str = "scripts/main.js";
 /// Re-index and retry when a file changes while the build reads it.
 const ATTEMPTS: usize = 3;
 
@@ -123,6 +122,7 @@ struct BundleMemo {
     entries: Vec<RelPath>,
     paths: Hash,
     inputs: Vec<(RelPath, Hash)>,
+    externals: Vec<String>,
     out: Bundled,
 }
 
@@ -602,6 +602,16 @@ impl Session {
                 }
                 *h.finalize().as_bytes()
             };
+            // the declared script modules (what manifest.rs writes as dependencies)
+            let externals: Vec<String> = cfg
+                .beacon
+                .script_modules
+                .keys()
+                .cloned()
+                .chain(["@minecraft/server".to_owned()])
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             for plan in &plans {
                 let (sourcemap, define) = (plan.sourcemap(), plan.define_hash());
                 for o in &plan.outputs {
@@ -628,6 +638,7 @@ impl Session {
                         &key,
                         entries,
                         &plan.define,
+                        &externals,
                     );
                     a.diags.extend(b.diagnostics.iter().cloned());
                     a.inputs.extend(b.inputs.iter().cloned());
@@ -773,6 +784,15 @@ impl Session {
                     .parent()
                     .and_then(|p| p.parent())
                     .unwrap_or(entry.clone());
+                let entry_path = cfg.script_entry(o);
+                // the bundler names its output `main.js`: keep the map comment in step
+                let code = &code.replace(
+                    "sourceMappingURL=main.js.map",
+                    &format!(
+                        "sourceMappingURL={}.map",
+                        entry_path.rsplit('/').next().unwrap_or(entry_path)
+                    ),
+                );
                 let mut add = |path: String, text: &String| {
                     items.push(ContentItem {
                         dest: Dest {
@@ -786,9 +806,9 @@ impl Session {
                         module: module.clone(),
                     })
                 };
-                add(SCRIPT_ENTRY.into(), code);
+                add(entry_path.into(), code);
                 if let Some(m) = &b.map {
-                    add(format!("{SCRIPT_ENTRY}.map"), m);
+                    add(format!("{entry_path}.map"), m);
                 }
                 scripted.insert(o.clone());
             }
@@ -812,7 +832,7 @@ impl Session {
                         target_version: &plan.target_version,
                         dev_worktree: (plan.artifact == Some(Artifact::Dev))
                             .then_some(self.root.as_path()),
-                        script_entry: scripted.contains(o).then_some(SCRIPT_ENTRY),
+                        script_entry: scripted.contains(o).then(|| cfg.script_entry(o)),
                         has_bp,
                         has_rp,
                     }));
@@ -820,7 +840,7 @@ impl Session {
                         output: o.clone(),
                         has_bp,
                         has_rp,
-                        script_entry: scripted.contains(o).then_some(SCRIPT_ENTRY),
+                        script_entry: scripted.contains(o).then(|| cfg.script_entry(o).to_owned()),
                     });
                 }
             }
@@ -829,7 +849,19 @@ impl Session {
             a.diags.extend(d);
             let (mut merged, d) = merge::resolve(items, &vfs);
             a.diags.extend(d);
+            registry::after_merge(&cfg, &mut merged, &vfs, &is_static);
             languages(&mut merged, &is_static);
+            let mut lf_failed = false;
+            if trusted {
+                lf_failed = crate::legacy_filter::apply(
+                    &self.root,
+                    &cfg.beacon.plugins,
+                    &mut merged,
+                    &vfs,
+                    &is_static,
+                    &mut a.diags,
+                );
+            }
             // release builds decide versions; archive builds only report a stale release
             let archive = plan.artifact.is_some_and(|x| x != Artifact::Dev);
             if let Some(lock) = &lock
@@ -861,7 +893,7 @@ impl Session {
                 &|o, p| present.contains(&(o, p)),
             );
             let dups = packlist::duplicates(&refs);
-            blocked.push(!dups.is_empty());
+            blocked.push(!dups.is_empty() || lf_failed);
             a.diags.extend(
                 dups.into_iter()
                     .map(|d| d.at(RelPath::parse(CONFIG_FILE).expect("const"), None, None)),
@@ -932,9 +964,11 @@ fn bundle(
     key: &BundleKey,
     entries: &[RelPath],
     define: &BTreeMap<String, Value>,
+    externals: &[String],
 ) -> Bundled {
     if let Some(m) = memo.get(key)
         && m.entries == entries
+        && m.externals == externals
         && m.paths == paths
         && m.inputs.iter().all(|(p, h)| index.hash(p).ok() == Some(*h))
     {
@@ -946,6 +980,7 @@ fn bundle(
         sourcemap: key.1,
         minify: false,
         define,
+        externals,
     });
     let external = r.external_inputs;
     let out = Bundled {
@@ -969,6 +1004,7 @@ fn bundle(
                     entries: entries.to_vec(),
                     paths,
                     inputs,
+                    externals: externals.to_vec(),
                     out: out.clone(),
                 },
             );

@@ -2,10 +2,14 @@
 //! The pipeline is `beacon_engine::build::Session`; this crate wires in the QuickJS host and
 //! the esbuild bundler.
 
+mod add;
 mod fix;
+mod hook;
 mod init;
 mod mcp;
+mod migrate;
 mod pack;
+mod rename;
 mod watch;
 
 use beacon_bundler::{Confirm, LazyEsbuild};
@@ -93,6 +97,23 @@ enum Cmd {
         #[arg(long)]
         trust: bool,
     },
+    /// Convert a Regolith project (ModularMC, system_template) into a Beacon project, once.
+    Migrate(migrate::MigrateArgs),
+    /// Add an entity, item, block, or module from the convention templates.
+    Add {
+        kind: migrate::AddKind,
+        name: String,
+        /// Module to add the content to.
+        #[arg(long, value_name = "m")]
+        module: Option<String>,
+        /// Add convention files even to a module that uses `packRoots`.
+        #[arg(long)]
+        force_convention: bool,
+    },
+    /// Rename an output, keeping its lockfile identities (UUIDs, releases).
+    RenameOutput { from: String, to: String },
+    /// Claude Code hook: reads the event JSON on stdin, prints the decision JSON (8.2).
+    Hook { event: migrate::HookEvent },
 }
 
 /// `beacon --help --json`: the clap command tree, versioned.
@@ -341,6 +362,15 @@ fn main() {
         Cmd::Init(a) => init::run(&o, a),
         Cmd::Fix => fix::run(&o),
         Cmd::Mcp { trust } => mcp::run(&o, trust),
+        Cmd::Migrate(a) => migrate::run(&o, &a),
+        Cmd::Add {
+            kind,
+            name,
+            module,
+            force_convention,
+        } => add::run(&o, kind, &name, module.as_deref(), force_convention),
+        Cmd::RenameOutput { from, to } => rename::run(&o, &from, &to),
+        Cmd::Hook { event } => hook::run(event),
     };
     process::exit(code);
 }

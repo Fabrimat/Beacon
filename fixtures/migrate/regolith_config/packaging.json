@@ -1,0 +1,69 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Bedrock-OSS/regolith-schemas/main/config/v1.4.json",
+	"author": "Beacon fixtures",
+	"name": "sample-packaging",
+	"packs": {
+		"behaviorPack": "./packs/BP",
+		"resourcePack": "./packs/RP"
+	},
+	"regolith": {
+		"dataPath": "./packs/data",
+		"filterDefinitions": {
+			"modular_mc": {
+				"url": "github.com/Nusiq/regolith-filters",
+				"version": "1f85bf56f383d0e20822aaacb982925f6bfcf84f"
+			},
+			"pack_anything": {
+				"url": "github.com/Nusiq/regolith-filters",
+				"version": "1.0.0"
+			},
+			"strip_debug": {
+				"runWith": "python",
+				"script": "./filters/strip_debug.py"
+			}
+		},
+		"formatVersion": "1.4.0",
+		"profiles": {
+			"default": {
+				"export": {
+					"target": "development",
+					"readOnly": false
+				},
+				"filters": [
+					{
+						"filter": "modular_mc",
+						"settings": {
+							"esbuild": {
+								"buildPath": ".modular_mc/main.js",
+								"settings": {
+									"minify": false
+								}
+							}
+						}
+					}
+				]
+			},
+			"package": {
+				"export": {
+					"target": "local",
+					"readOnly": true
+				},
+				"filters": [
+					{
+						"profile": "default"
+					},
+					{
+						"filter": "strip_debug",
+						"when": "true"
+					},
+					{
+						"filter": "pack_anything",
+						"settings": {
+							"output": "./dist/sample.mcaddon"
+						}
+					}
+				]
+			}
+		}
+	}
+}

@@ -1,0 +1,6 @@
+{
+  "name": "beacon",
+  "version": "0.1.0",
+  "description": "Guardrails for Beacon projects: blocks edits to generated files and runs `beacon check` before the agent stops.",
+  "keywords": ["beacon", "minecraft", "bedrock", "hooks"]
+}

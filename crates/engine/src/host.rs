@@ -33,6 +33,10 @@ pub struct BundleRequest<'a> {
     /// The target's `define`, exposed to scripts as `beacon.define.<K>` (compile-time
     /// constants: `--define:beacon.define.<K>=<json>`).
     pub define: &'a BTreeMap<String, Value>,
+    /// Modules the game provides at runtime (the manifest's script module dependencies):
+    /// left as imports, with their deep imports (`--external:<n>`, `--external:<n>/*`).
+    /// Everything else, including npm-only `@minecraft/*` packages, is bundled.
+    pub externals: &'a [String],
 }
 
 pub struct BundleResult {
@@ -49,7 +53,7 @@ pub struct BundleResult {
 }
 
 /// Game-script bundler (esbuild CLI: `--bundle --format=esm --platform=neutral
-/// --external:@minecraft/*`).
+/// --external:<each declared script module>`).
 pub trait Bundler: Send + Sync {
     fn bundle(&self, req: &BundleRequest) -> BundleResult;
     /// e.g. `esbuild 0.25.4`, recorded in the lockfile (4.2).

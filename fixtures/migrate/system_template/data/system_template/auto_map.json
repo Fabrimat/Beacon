@@ -1,0 +1,10 @@
+{
+	".behavior.json": "BP/entities",
+	".feature.json": {
+		"target": "BP/features",
+		"replace_extension": ".json"
+	},
+	".item.json": "BP/items",
+	".entity.json": "RP/entity",
+	".lang": "RP/texts"
+}

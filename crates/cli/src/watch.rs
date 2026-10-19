@@ -2,7 +2,7 @@
 //! changed paths.
 //!
 //! - Events are coalesced until 6 ms of quiet (editor atomic saves are bursts), no long
-//!   debounce. Files whose size changed between the first event and the end of the burst are
+//!   debounce. Files whose size changed between their last event and the end of the burst are
 //!   re-stat'ed (20 ms apart, at most 10 times) so half-written files are not read.
 //! - A watcher error or `Rescan` flag (Windows `ReadDirectoryChangesW` buffer overflow) makes
 //!   the next build a full one (`Session::rescan`).
@@ -69,7 +69,7 @@ fn size(p: &Path) -> Option<u64> {
     std::fs::symlink_metadata(p).ok().map(|m| m.len())
 }
 
-/// Changes seen since the last build: path -> size at first sight.
+/// Changes seen since the last build: path -> size at the latest event.
 #[derive(Default)]
 struct Batch {
     paths: BTreeMap<PathBuf, Option<u64>>,
@@ -135,7 +135,7 @@ pub fn run(o: &Opts, a: &BuildArgs) -> i32 {
                         // the parent of an ignored dir (`packs/`) only changes with its outputs
                         let skip = |i: &PathBuf| under(&p, i) || (p != root && under(i, &p));
                         if !ignored.iter().any(skip) && !own_lock(&p) {
-                            b.paths.entry(p.clone()).or_insert_with(|| size(&p));
+                            b.paths.insert(p.clone(), size(&p)); // latest sight: an in-place write is truncate then fill
                         }
                     }
                 }
@@ -177,6 +177,7 @@ pub fn run(o: &Opts, a: &BuildArgs) -> i32 {
         } else {
             s.changed(b.paths.into_keys());
         }
-        report(o, "built", &s.build());
+        let r = s.build();
+        report(o, "built", &r);
     }
 }

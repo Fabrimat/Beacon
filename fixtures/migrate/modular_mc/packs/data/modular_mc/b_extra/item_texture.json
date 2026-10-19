@@ -1,0 +1,6 @@
+{
+	"texture_data": {
+		"mmc_ruby": { "textures": "textures/items/ruby" },
+		"mmc_sapphire": { "textures": "textures/items/sapphire" }
+	}
+}

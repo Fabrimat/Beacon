@@ -1,0 +1,17 @@
+{
+	"format_version": 2,
+	"header": {
+		"name": "MMC Fixture RP",
+		"description": "Synthetic ModularMC fixture",
+		"uuid": "6f1d0a52-2c43-4b8e-9a4e-1b7f6c0d2b01",
+		"version": [1, 0, 0],
+		"min_engine_version": [1, 26, 50]
+	},
+	"modules": [
+		{
+			"type": "resources",
+			"uuid": "6f1d0a52-2c43-4b8e-9a4e-1b7f6c0d2b02",
+			"version": [1, 0, 0]
+		}
+	]
+}

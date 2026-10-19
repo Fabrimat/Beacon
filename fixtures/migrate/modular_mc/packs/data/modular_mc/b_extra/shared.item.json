@@ -1,0 +1,6 @@
+{
+	"format_version": "1.21.0",
+	"minecraft:item": {
+		"description": { "identifier": "mmc:shared_skipped", "menu_category": { "category": "items" } }
+	}
+}

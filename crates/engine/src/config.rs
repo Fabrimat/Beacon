@@ -1,7 +1,7 @@
 //! Contract: `config.json` (4.1) and `module.json` (5.3) shapes. Parsing/validation logic lives
 //! in workstream A1 (`load`); this module only fixes the data shapes.
 
-use crate::model::{Edition, Merge};
+use crate::model::{Edition, Merge, Pack};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -28,6 +28,22 @@ pub struct ProjectConfig {
     pub worlds: Vec<String>,
     #[serde(default)]
     pub beacon: BeaconConfig,
+}
+
+/// BP-relative path of an output's script bundle unless `scriptEntry` says otherwise.
+pub const DEFAULT_SCRIPT_ENTRY: &str = "scripts/main.js";
+
+impl ProjectConfig {
+    /// BP-relative bundle path of `output` (`scriptEntry`, else `scripts/main.js`); also the
+    /// manifest `entry`. The bundle's source map is `<path>.map`.
+    pub fn script_entry(&self, output: &str) -> &str {
+        self.beacon
+            .outputs
+            .iter()
+            .find(|o| o.id == output)
+            .and_then(|o| o.script_entry.as_deref())
+            .unwrap_or(DEFAULT_SCRIPT_ENTRY)
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -67,6 +83,42 @@ pub struct BeaconConfig {
     /// Pack versioning (4.2.1).
     #[serde(default)]
     pub version_policy: VersionPolicy,
+    /// Derived `.lang` names for content without an explicit one (phase 3, A2).
+    #[serde(default)]
+    pub auto_names: Option<AutoNames>,
+    /// Emit `RP/textures/textures_list.json` from the RP's textures (phase 3, A2).
+    #[serde(default)]
+    pub textures_list: bool,
+}
+
+/// `beacon.autoNames`: which content kinds get a derived display name in `language`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoNames {
+    #[serde(default)]
+    pub entities: bool,
+    #[serde(default)]
+    pub items: bool,
+    #[serde(default)]
+    pub blocks: bool,
+    /// Spawn egg names (`item.spawn_egg.entity.<id>.name`), built as `prefix + name + postfix`.
+    #[serde(default)]
+    pub spawn_eggs: Option<SpawnEggNames>,
+    /// `.lang` file stem the names go to.
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "en_US".into()
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SpawnEggNames {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub postfix: String,
 }
 
 /// 4.2.1: `auto` bumps from content hashes on release; `manual` takes `--set-version`.
@@ -94,6 +146,34 @@ pub struct PackMeta {
     pub description: Option<String>,
     /// Project-relative `pack_icon.png`, emitted into every pack.
     pub icon: Option<String>,
+    /// Extra manifest fields per pack, deep-merged into the generated manifest
+    /// (`pack_scope`, `metadata`, `capabilities`, ...). `header.uuid`, `header.version` and
+    /// `modules[].uuid` are never overridable (lockfile-owned).
+    #[serde(default)]
+    pub manifest: BTreeMap<Pack, Value>,
+    /// Which pack manifests depend on their sibling (uuid + released version).
+    #[serde(default, rename = "packDependencies")]
+    pub pack_dependencies: PackDependencies,
+}
+
+/// `packMeta.packDependencies`: `bp-rp` (the BP depends on the RP; default), `rp-bp` (the RP
+/// depends on the BP) or `mutual` (both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackDependencies {
+    #[default]
+    BpRp,
+    RpBp,
+    Mutual,
+}
+
+impl PackDependencies {
+    pub fn bp_on_rp(self) -> bool {
+        self != Self::RpBp
+    }
+    pub fn rp_on_bp(self) -> bool {
+        self != Self::BpRp
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -110,6 +190,10 @@ pub struct OutputDef {
     /// Static (prebuilt) packs, included as-is (4.3).
     #[serde(default, rename = "static")]
     pub static_packs: Option<StaticPacks>,
+    /// BP-relative path of this output's script bundle (a `.js` `RelPath`; default
+    /// `scripts/main.js`): the emitted file, its `.map` and the manifest `entry`.
+    #[serde(default)]
+    pub script_entry: Option<String>,
 }
 
 /// Project-relative folders of a static output's prebuilt packs.
@@ -202,7 +286,7 @@ pub struct TemplateOptions {
 }
 
 /// `module.json`: exceptions to convention only.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModuleJson {
     #[serde(default, rename = "$schema")]
@@ -226,6 +310,22 @@ pub struct ModuleJson {
     /// `terrain_texture.json` entries: short name -> module-relative texture path.
     #[serde(default)]
     pub terrain_textures: BTreeMap<String, String>,
+    /// Module-relative folders whose contents are pack-relative paths (`{"BP": "bp"}`):
+    /// routed verbatim (never via convention routing), and the scripts rule is off inside them.
+    #[serde(default)]
+    pub pack_roots: BTreeMap<Pack, String>,
+    /// Module-relative glob -> merge policy; overrides `onConflict` for matching files.
+    #[serde(default)]
+    pub conflicts: BTreeMap<String, OnConflict>,
+    /// Derive `item_texture.json` / `terrain_texture.json` entries from sibling pngs.
+    #[serde(default = "yes")]
+    pub auto_textures: bool,
+}
+
+impl Default for ModuleJson {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("defaults")
+    }
 }
 
 /// `module.json` `hooks`: module-relative function paths without extension -> priority
@@ -316,5 +416,36 @@ mod tests {
         .unwrap();
         assert_eq!(m.hooks.tick["functions/loop"], 0);
         assert_eq!(m.item_textures["ruby"], "items/ruby.png");
+    }
+
+    #[test]
+    fn phase3_shapes_parse() {
+        let m: ModuleJson = serde_json::from_str(
+            r#"{"packRoots":{"BP":"bp","RP":"rp"},"conflicts":{"texts/*.lang":"merge"},"autoTextures":false}"#,
+        )
+        .unwrap();
+        assert_eq!(m.pack_roots[&Pack::Behavior], "bp");
+        assert_eq!(m.conflicts["texts/*.lang"], OnConflict::Merge);
+        assert!(!m.auto_textures);
+        assert!(ModuleJson::default().auto_textures);
+        let c: BeaconConfig = serde_json::from_str(
+            r#"{"autoNames":{"entities":true,"spawnEggs":{"prefix":"Spawn "}},"texturesList":true,
+                "packMeta":{"manifest":{"BP":{"metadata":{"authors":["x"]}}}},
+                "outputs":[{"id":"main","scriptEntry":"src/main/scripts/main.ts"}]}"#,
+        )
+        .unwrap();
+        let n = c.auto_names.unwrap();
+        assert!(n.entities && !n.items);
+        assert_eq!(n.language, "en_US");
+        assert_eq!(n.spawn_eggs.unwrap().prefix, "Spawn ");
+        assert!(c.textures_list);
+        assert_eq!(
+            c.pack_meta.unwrap().manifest[&Pack::Behavior]["metadata"]["authors"][0],
+            "x"
+        );
+        assert_eq!(
+            c.outputs[0].script_entry.as_deref(),
+            Some("src/main/scripts/main.ts")
+        );
     }
 }

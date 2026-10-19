@@ -7,4 +7,32 @@ Planned vendored material (not yet included in this repository):
 
 - Mojang/bedrock-schemas: MIT License, Copyright (c) Microsoft Corporation.
 
+Included material:
+
+- ModularMC (Nusiq/regolith-filters, github.com/Nusiq/regolith-filters): crates/jshost/js/modular_mc.js is a port
+  of its map evaluation (map-ts, json-template, text-template, json-merge, auto-map-resolver),
+  used only by `beacon migrate`. MIT License:
+
+  MIT License
+
+  Copyright (c) 2021 Nusiq
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
 Beacon is not affiliated with, endorsed by, or sponsored by Mojang Studios or Microsoft.

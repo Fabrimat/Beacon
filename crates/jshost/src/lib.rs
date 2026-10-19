@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod host;
+pub mod legacy;
 pub mod mem;
 
 pub use host::Host;

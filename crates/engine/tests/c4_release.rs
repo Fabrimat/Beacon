@@ -525,3 +525,82 @@ fn dev_targets_are_not_part_of_a_release() {
         "{names:?}"
     );
 }
+
+fn with_deps(p: &Path, mode: &str) {
+    let c = std::fs::read_to_string(p.join("config.json")).unwrap();
+    let c = c.replace(
+        "\"packMeta\": {",
+        &format!("\"packMeta\": {{\"packDependencies\": \"{mode}\","),
+    );
+    assert!(c.contains("packDependencies"));
+    write(p, "config.json", &c);
+}
+
+fn game_manifest(z: &Zip, pk: &str) -> Value {
+    serde_json::from_slice(&z[&format!("beacon-multipack game-{pk}/manifest.json")]).unwrap()
+}
+
+#[test]
+fn rp_bp_release_keeps_rp_dependency_on_the_bp_version() {
+    let p = multipack();
+    with_deps(p.path(), "rp-bp");
+    ok(&pack(p.path(), "addon"));
+    let l = lock_bytes(p.path());
+
+    edit_bp(p.path());
+    let r = pack(p.path(), "addon");
+    ok(&r);
+    assert_eq!(
+        (v(&r, "game/BP"), ver(&r, "game/BP").bumped),
+        ([1, 0, 1], true)
+    );
+    // the RP manifest changed with the BP version, so the RP bumps too
+    assert_eq!(
+        (v(&r, "game/RP"), ver(&r, "game/RP").bumped),
+        ([1, 0, 1], true)
+    );
+    let (_, z) = artifact(&r);
+    let (bp, rp) = (game_manifest(&z, "BP"), game_manifest(&z, "RP"));
+    assert_eq!(bp["header"]["version"], json!([1, 0, 1]));
+    assert_eq!(rp["header"]["version"], json!([1, 0, 1]));
+    assert_eq!(rp["dependencies"][0]["uuid"], bp["header"]["uuid"]);
+    assert_eq!(rp["dependencies"][0]["version"], bp["header"]["version"]);
+    assert_ne!(lock_bytes(p.path()), l);
+
+    let l = lock_bytes(p.path());
+    let r = pack(p.path(), "addon");
+    ok(&r);
+    assert!(r.report.packs.iter().all(|x| !x.bumped));
+    assert_eq!(lock_bytes(p.path()), l);
+}
+
+#[test]
+fn mutual_release_bumps_both_packs_once_and_is_stable() {
+    let p = multipack();
+    with_deps(p.path(), "mutual");
+    ok(&pack(p.path(), "addon"));
+    let mut expect = [1, 0, 0];
+    for edit in [edit_bp, edit_rp] {
+        expect[2] += 1;
+        edit(p.path());
+        let r = pack(p.path(), "addon");
+        ok(&r);
+        for k in ["game/BP", "game/RP"] {
+            assert_eq!((v(&r, k), ver(&r, k).bumped), (expect, true), "{k}");
+        }
+        let (_, z) = artifact(&r);
+        let (bp, rp) = (game_manifest(&z, "BP"), game_manifest(&z, "RP"));
+        assert_eq!(rp["dependencies"][0]["uuid"], bp["header"]["uuid"]);
+        assert_eq!(rp["dependencies"][0]["version"], json!(expect));
+        assert_eq!(bp["dependencies"][0]["uuid"], rp["header"]["uuid"]);
+        assert_eq!(bp["dependencies"][0]["version"], json!(expect));
+        assert_eq!(bp["header"]["version"], json!(expect));
+        assert_eq!(rp["header"]["version"], json!(expect));
+        // no change: nothing bumps, the lock is byte-identical
+        let l = lock_bytes(p.path());
+        let r = pack(p.path(), "addon");
+        ok(&r);
+        assert!(r.report.packs.iter().all(|x| !x.bumped));
+        assert_eq!(lock_bytes(p.path()), l);
+    }
+}

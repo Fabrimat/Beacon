@@ -106,6 +106,19 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
         if let Some(n) = o.namespace.as_deref().filter(|n| !ns_ok(n)) {
             bad(ns_msg(n), line("\"namespace\"", n));
         }
+        if let Some(e) = o
+            .script_entry
+            .as_deref()
+            .filter(|e| !e.ends_with(".js") || RelPath::parse(e).is_err())
+        {
+            bad(
+                format!(
+                    "output {:?}: scriptEntry {e:?} must be a BP-relative path ending in .js",
+                    o.id
+                ),
+                line_of(text, &["\"scriptEntry\"", &format!("\"{e}\"")]),
+            );
+        }
         for g in &o.include {
             if let Err(e) = glob(g) {
                 bad(
@@ -113,6 +126,17 @@ pub fn load(root: &Path) -> Result<ProjectConfig, Vec<Diagnostic>> {
                     line_of(text, &[&format!("\"{g}\"")]),
                 );
             }
+        }
+    }
+    for (pack, extra) in c.beacon.pack_meta.iter().flat_map(|m| &m.manifest) {
+        if let Some(why) = crate::manifest::bad_extra(extra) {
+            bad(
+                format!(
+                    "packMeta.manifest.{}: {why}",
+                    if *pack == Pack::Behavior { "BP" } else { "RP" }
+                ),
+                line_of(text, &["\"manifest\""]),
+            );
         }
     }
     // ids and names end up in file and folder names: never let them steer a path
@@ -350,16 +374,51 @@ fn route_module(
         }
     }
 
+    // `conflicts`: module-relative glob -> policy, first match (glob order) wins
+    let mut conflicts = Vec::new();
+    for (g, c) in &mj.conflicts {
+        match glob(g) {
+            Ok(g) => conflicts.push((g.compile_matcher(), *c)),
+            Err(e) => mj_err(r, format!("bad conflicts glob {g:?}: {e}"), None, None),
+        }
+    }
+    // `packRoots`: folder (module-relative) whose contents are pack-relative paths
+    let mut roots = Vec::new();
+    for (pack, dir) in &mj.pack_roots {
+        match norm_source(dir) {
+            Ok(Some(d)) => roots.push((*pack, format!("{}/", d.as_str()))),
+            _ => mj_err(
+                r,
+                format!("bad packRoots entry {dir:?}: want a folder inside the module"),
+                None,
+                None,
+            ),
+        }
+    }
+
     for (file, rel) in files {
         let fname = file.file_name();
+        let on_conflict = conflicts
+            .iter()
+            .find(|(g, _)| g.is_match(rel))
+            .map(|(_, c)| *c)
+            .or(mj.on_conflict);
         // `merge` only makes sense for json and lang files; skip/error apply to any file
-        let policy = |default: Merge| match mj.on_conflict {
+        let policy = |default: Merge| match on_conflict {
             Some(OnConflict::Merge) if !(fname.ends_with(".json") || fname.ends_with(".lang")) => {
                 default
             }
             Some(c) => c.to_merge(fname),
             None => default,
         };
+        let in_root = roots
+            .iter()
+            .find_map(|(p, d)| rel.strip_prefix(d.as_str()).map(|rest| (*p, rest)));
+        if let Some((pack, rest)) = in_root {
+            // verbatim: no convention routing, no scripts rule, every file is pack content
+            push_item(r, file, module, output, pack, rest, policy(Merge::Error));
+            continue;
+        }
         let routed = match paths.iter().find(|(g, ..)| g.is_match(rel)) {
             Some((_, pack, dir)) => Some((*pack, format!("{dir}/{fname}"), policy(Merge::Error))),
             None => route_file(name, namespace, rel).map(|(p, d, m)| (p, d, policy(m))),
@@ -391,25 +450,38 @@ fn route_module(
             }
             continue;
         };
-        match RelPath::parse(&dest) {
-            Ok(path) => r.items.push(ContentItem {
-                dest: Dest {
-                    output: output.to_owned(),
-                    pack,
-                    path,
-                },
-                body: Body::Passthrough(file.clone()),
-                merge,
-                origin: file.clone(),
-                module: module.clone(),
-            }),
-            Err(e) => r.diagnostics.push(
-                Diagnostic::new(Code::NonPortablePath, format!("{file} routes to {e}")).at(
-                    file.clone(),
-                    None,
-                    None,
-                ),
+        push_item(r, file, module, output, pack, &dest, merge);
+    }
+}
+
+/// Routes `file` to `dest` (pack-relative, validated as a `RelPath`).
+fn push_item(
+    r: &mut Routed,
+    file: &RelPath,
+    module: &RelPath,
+    output: &str,
+    pack: Pack,
+    dest: &str,
+    merge: Merge,
+) {
+    match RelPath::parse(dest) {
+        Ok(path) => r.items.push(ContentItem {
+            dest: Dest {
+                output: output.to_owned(),
+                pack,
+                path,
+            },
+            body: Body::Passthrough(file.clone()),
+            merge,
+            origin: file.clone(),
+            module: module.clone(),
+        }),
+        Err(e) => r.diagnostics.push(
+            Diagnostic::new(Code::NonPortablePath, format!("{file} routes to {e}")).at(
+                file.clone(),
+                None,
+                None,
             ),
-        }
+        ),
     }
 }

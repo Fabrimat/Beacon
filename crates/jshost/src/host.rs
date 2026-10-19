@@ -115,11 +115,11 @@ pub(crate) fn json_module(text: &str) -> String {
 // ---------------------------------------------------------------- closure
 
 #[derive(Default)]
-struct Closure {
+pub(crate) struct Closure {
     /// Module name (project-relative path) -> (JS, line map).
-    mods: HashMap<String, (String, LineMap)>,
+    pub(crate) mods: HashMap<String, (String, LineMap)>,
     /// `(importer, specifier)` -> module name.
-    resolved: HashMap<(String, String), String>,
+    pub(crate) resolved: HashMap<(String, String), String>,
 }
 
 fn err(g: &Generator, msg: impl Into<String>) -> Diagnostic {
@@ -188,7 +188,7 @@ fn candidates(importer: &RelPath, spec: &str) -> Option<Vec<String>> {
     )
 }
 
-fn collect(g: &Generator, vfs: &dyn Vfs, r: &mut GenResult) -> Option<Closure> {
+pub(crate) fn collect(g: &Generator, vfs: &dyn Vfs, r: &mut GenResult) -> Option<Closure> {
     let mut c = Closure::default();
     let mut seen = HashSet::from([g.path.to_string()]);
     let read = |p: &RelPath, r: &mut GenResult| -> Option<String> {
@@ -264,7 +264,7 @@ fn collect(g: &Generator, vfs: &dyn Vfs, r: &mut GenResult) -> Option<Closure> {
     r.diagnostics.is_empty().then_some(c)
 }
 
-struct Fs(Rc<Closure>);
+pub(crate) struct Fs(pub(crate) Rc<Closure>);
 
 impl Resolver for Fs {
     fn resolve<'js>(

@@ -1,0 +1,23 @@
+{
+	"format_version": 2,
+	"header": {
+		"name": "ST Fixture BP",
+		"description": "Synthetic system_template fixture",
+		"uuid": "8a2e4c61-7d15-4f3a-b0c9-2e5d7f1a3c01",
+		"version": [1, 0, 0],
+		"min_engine_version": [1, 26, 50]
+	},
+	"modules": [
+		{
+			"type": "data",
+			"uuid": "8a2e4c61-7d15-4f3a-b0c9-2e5d7f1a3c02",
+			"version": [1, 0, 0]
+		}
+	],
+	"dependencies": [
+		{
+			"uuid": "8a2e4c61-7d15-4f3a-b0c9-2e5d7f1a3d01",
+			"version": [1, 0, 0]
+		}
+	]
+}

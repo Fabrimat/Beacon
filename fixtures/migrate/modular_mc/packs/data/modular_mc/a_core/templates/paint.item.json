@@ -1,0 +1,19 @@
+{
+	// JSONC comment: stripped by the template evaluator
+	"format_version": "1.21.0",
+	"minecraft:item": {
+		"description": {
+			"identifier": "::`${namespace}:paint`",
+			"menu_category": { "category": "items" }
+		},
+		"components": {
+			"minecraft:max_stack_size": "::health * 2",
+			"::K('minecraft:display_name', { label: 'Paint' })": { "value": "::label" },
+			"::variants.map((v) => K(`mmc:tag_${v.color}`, v))": "::color.toUpperCase()"
+		},
+		"variants": [
+			{ "__unpack__": "::variants", "name": "::`${namespace}:paint_${color}`" },
+			{ "__unpack__": [{ "n": 1 }, { "n": 2 }], "__value__": "::n * 10" }
+		]
+	}
+}

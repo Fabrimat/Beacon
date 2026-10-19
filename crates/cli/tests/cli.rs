@@ -123,7 +123,19 @@ fn help_json_lists_every_command() {
     assert_eq!(
         names,
         [
-            "build", "watch", "check", "explain", "trust", "pack", "init", "fix", "mcp"
+            "build",
+            "watch",
+            "check",
+            "explain",
+            "trust",
+            "pack",
+            "init",
+            "fix",
+            "mcp",
+            "migrate",
+            "add",
+            "rename-output",
+            "hook"
         ]
     );
     let build = &v["command"]["commands"][0];

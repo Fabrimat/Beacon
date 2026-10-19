@@ -164,3 +164,61 @@ fn bp_only_has_no_rp_dependency_or_script() {
     assert!(bp.get("dependencies").is_none());
     assert_eq!(bp["modules"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn pack_dependencies_rp_bp_points_rp_at_bp() {
+    let d = tempfile::tempdir().unwrap();
+    let c = cfg(
+        r#"{"scriptModules":{"@minecraft/server":"2.0.0"},"packMeta":{"packDependencies":"rp-bp"},
+  "targets":{"b":{"edition":"bedrock","artifact":"dev"}}}"#,
+    );
+    let l = Lockfile::ensure(d.path(), &c, &["main".to_string()], &[], &[], false).unwrap();
+    let out = "main".to_string();
+    let items = generate(&input(
+        &c,
+        &l,
+        &out,
+        Edition::Bedrock,
+        None,
+        Some("scripts/main.js"),
+        true,
+    ));
+    let (bp, rp) = (
+        manifest(&items, Pack::Behavior),
+        manifest(&items, Pack::Resource),
+    );
+    assert_eq!(rp["dependencies"][0]["uuid"], bp["header"]["uuid"]);
+    assert_eq!(rp["dependencies"][0]["version"], bp["header"]["version"]);
+    // never both ways: only the script module dependency stays on the BP
+    assert_eq!(bp["dependencies"].as_array().unwrap().len(), 1);
+    assert_eq!(bp["dependencies"][0]["module_name"], "@minecraft/server");
+}
+
+#[test]
+fn pack_dependencies_mutual_links_both_ways() {
+    let d = tempfile::tempdir().unwrap();
+    let c = cfg(
+        r#"{"scriptModules":{"@minecraft/server":"2.0.0"},"packMeta":{"packDependencies":"mutual"},
+  "targets":{"b":{"edition":"bedrock","artifact":"dev"}}}"#,
+    );
+    let l = Lockfile::ensure(d.path(), &c, &["main".to_string()], &[], &[], false).unwrap();
+    let out = "main".to_string();
+    let items = generate(&input(
+        &c,
+        &l,
+        &out,
+        Edition::Bedrock,
+        None,
+        Some("scripts/main.js"),
+        true,
+    ));
+    let (bp, rp) = (
+        manifest(&items, Pack::Behavior),
+        manifest(&items, Pack::Resource),
+    );
+    assert_eq!(rp["dependencies"][0]["uuid"], bp["header"]["uuid"]);
+    assert_eq!(rp["dependencies"][0]["version"], bp["header"]["version"]);
+    assert_eq!(bp["dependencies"][0]["uuid"], rp["header"]["uuid"]);
+    assert_eq!(bp["dependencies"][0]["version"], rp["header"]["version"]);
+    assert_eq!(bp["dependencies"][1]["module_name"], "@minecraft/server");
+}

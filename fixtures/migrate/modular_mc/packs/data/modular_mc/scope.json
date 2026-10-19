@@ -1,0 +1,5 @@
+{
+	"namespace": "mmc",
+	"colors": ["red", "blue"],
+	"health": 20
+}

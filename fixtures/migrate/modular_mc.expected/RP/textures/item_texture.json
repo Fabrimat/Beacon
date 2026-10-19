@@ -1,0 +1,15 @@
+{
+	"resource_pack_name": "mmc",
+	"texture_name": "atlas.items",
+	"texture_data": {
+		"mmc_paint": {
+			"textures": "textures/items/paint"
+		},
+		"mmc_ruby": {
+			"textures": "textures/items/ruby"
+		},
+		"mmc_sapphire": {
+			"textures": "textures/items/sapphire"
+		}
+	}
+}

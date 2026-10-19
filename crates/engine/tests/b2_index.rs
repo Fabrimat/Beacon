@@ -185,3 +185,17 @@ fn same_stat_rewrite_is_rehashed() {
     let (strict, _) = Index::build(d.path(), &[], None);
     assert_eq!(strict.read(&k).unwrap(), b"cccc");
 }
+
+/// The read cache is keyed by the indexed hash: a re-indexed (changed) file is read afresh.
+#[test]
+fn cached_read_is_dropped_when_the_hash_changes() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.txt");
+    fs::write(&f, "aaaa").unwrap();
+    let (mut idx, _) = Index::build(d.path(), &[], None);
+    let k = rp("a.txt");
+    assert_eq!(idx.read(&k).unwrap(), b"aaaa"); // cached
+    fs::write(&f, "bbbbb").unwrap();
+    idx.update(d.path(), &[], std::slice::from_ref(&f));
+    assert_eq!(idx.read(&k).unwrap(), b"bbbbb");
+}

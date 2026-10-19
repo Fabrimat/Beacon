@@ -4,10 +4,11 @@
 
 use crate::diag::{Code, Diagnostic};
 use crate::path::{Hash, RelPath, Vfs};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use unicode_normalization::UnicodeNormalization;
 
 const ALWAYS_EXCLUDED: [&str; 3] = [".git", ".beacon", "node_modules"];
@@ -28,12 +29,22 @@ struct Entry {
     hash: Hash,
 }
 
+type Cached = (Hash, Arc<[u8]>);
+
 #[derive(Default)]
 pub struct Index {
     files: BTreeMap<RelPath, Entry>,
     /// Directory (`""` = root) -> sorted child names.
     children: BTreeMap<String, BTreeSet<String>>,
+    /// Contents of small files already read and verified against `Entry::hash`: a watch
+    /// rebuild re-reads every module.json / lang / JSON of the project otherwise.
+    cache: Mutex<(usize, HashMap<RelPath, Cached>)>, // (bytes held, entries)
 }
+
+/// Larger files are never cached, and the cache stops growing at `CACHE_TOTAL` bytes.
+/// ponytail: no eviction (a project over 32 MiB of small files just re-reads the rest); LRU if needed.
+const CACHE_FILE: usize = 1 << 20;
+const CACHE_TOTAL: usize = 32 << 20;
 
 #[cfg(windows)]
 fn is_reparse(md: &std::fs::Metadata) -> bool {
@@ -460,10 +471,27 @@ impl Vfs for Index {
         self.files.contains_key(p) || self.children.contains_key(p.as_str())
     }
     fn read(&self, p: &RelPath) -> io::Result<Vec<u8>> {
+        let want = self.files.get(p).ok_or(ErrorKind::NotFound)?.hash;
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((h, b)) = cache.1.get(p)
+            && *h == want
+        {
+            return Ok(b.to_vec());
+        }
+        drop(cache);
         let mut buf = Vec::new();
         self.open(p)?.read_to_end(&mut buf)?;
-        if blake3::hash(&buf).as_bytes() != &self.files[p].hash {
+        if blake3::hash(&buf).as_bytes() != &want {
             return Err(changed());
+        }
+        if buf.len() <= CACHE_FILE {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.0 + buf.len() <= CACHE_TOTAL {
+                cache.0 += buf.len();
+                if let Some((_, old)) = cache.1.insert(p.clone(), (want, buf.as_slice().into())) {
+                    cache.0 -= old.len();
+                }
+            }
         }
         Ok(buf)
     }

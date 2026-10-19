@@ -242,13 +242,14 @@ impl Esbuild {
                 "--platform=neutral",
                 "--main-fields=module,main",
             ])
-            .args([
-                "--target=es2022",
-                "--external:@minecraft/*",
-                "--sourcefile=beacon-entry.js",
-            ])
+            .args(["--target=es2022", "--sourcefile=beacon-entry.js"])
             .args(["--log-level=warning", "--color=false"])
             .args(defines)
+            .args(
+                req.externals
+                    .iter()
+                    .flat_map(|n| [format!("--external:{n}"), format!("--external:{n}/*")]),
+            )
             .arg(format!("--metafile={}", meta.display()))
             .arg(format!("--outfile={}", out.display()));
         if req.sourcemap {

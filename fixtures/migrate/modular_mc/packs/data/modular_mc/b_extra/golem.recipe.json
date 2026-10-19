@@ -1,0 +1,9 @@
+{
+	"format_version": "1.20.10",
+	"minecraft:recipe_shapeless": {
+		"description": { "identifier": "mmc:golem_extra" },
+		"tags": ["crafting_table"],
+		"ingredients": [{ "item": "mmc:ruby" }],
+		"result": { "item": "mmc:shared", "count": 2 }
+	}
+}

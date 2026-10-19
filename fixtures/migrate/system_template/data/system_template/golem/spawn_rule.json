@@ -1,0 +1,10 @@
+{
+	"format_version": "1.8.0",
+	"minecraft:spawn_rules": {
+		"description": {
+			"identifier": "`f'{namespace}:golem_{color}'`",
+			"population_control": "animal"
+		},
+		"conditions": []
+	}
+}

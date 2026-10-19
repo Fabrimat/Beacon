@@ -200,6 +200,36 @@ codes! {
     /// Generated agent docs (`AGENTS.md`) are out of date with the project. Fix: regenerate
     /// them (`beacon fix`).
     AgentDocsStale = "BCN0090", Error;
+    /// `beacon migrate` found something it cannot convert (unknown legacy filter layout, a
+    /// map feature with no Beacon equivalent, an unreadable `config.json`). Nothing is written.
+    MigrateUnsupported = "BCN0100", Error;
+    /// Migration flattened a legacy construct into plain files (e.g. a one-to-many map loop
+    /// imported as its evaluated output). The result builds the same; the structure is lost.
+    MigrateFlattened = "BCN0101", Warning;
+    /// Migration dropped a legacy construct because Beacon derives it (e.g. conflict policies
+    /// on `item_texture.json`) or because it had no effect on the output.
+    MigrateDropped = "BCN0102", Warning;
+    /// A legacy piece the migrator kept as-is and lists for porting by hand (pre-build script,
+    /// generator candidate, env branch, Python plugin, Regolith filter).
+    MigrateToPort = "BCN0103", Note;
+    /// The migrated project does not build packs equal to the legacy output (`--oracle`).
+    /// Each difference is listed; none are hidden.
+    MigrateOracleDiff = "BCN0104", Error;
+    /// The `migrate --out` directory is invalid: inside, equal to, or linked to the legacy
+    /// project, or not empty without `--force`.
+    MigrateOutInvalid = "BCN0105", Error;
+    /// A legacy map read an environment variable; its value at migration time decided the
+    /// output. Port the branch to a target `define` or `ctx.edition`.
+    MigrateEnvRead = "BCN0106", Note;
+    /// A `legacy_filter` plugin (a Regolith filter run as an external process) failed or
+    /// exited non-zero.
+    LegacyFilterFailed = "BCN0120", Error;
+    /// A `legacy_filter` wrote outside its temp directory or produced a path that is not
+    /// portable; its output was discarded.
+    LegacyFilterEscaped = "BCN0121", Error;
+    /// The Claude Code `PreToolUse` hook denied a direct edit to a generated file (lockfile,
+    /// generated manifest, generated doc section); use the owning `beacon` command instead.
+    HookDenied = "BCN0130", Note;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

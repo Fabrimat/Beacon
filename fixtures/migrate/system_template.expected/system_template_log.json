@@ -1,0 +1,122 @@
+{
+	"BP/entities/golem.behavior.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/golem.behavior.json",
+				"status": "Created."
+			}
+		]
+	},
+	"RP/entity/golem.entity.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/sub/golem.entity.json",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/features/sub/tree.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/sub/tree.feature.json",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/items/paint.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/paint.item.json",
+				"status": "Created."
+			}
+		]
+	},
+	"RP/texts/en_US.lang": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/en_US.lang",
+				"status": "Created."
+			},
+			{
+				"path": "data/system_template/ruby/en_US.lang",
+				"status": "Appended content to the end."
+			}
+		]
+	},
+	"RP/textures/item_texture.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/item_texture.json",
+				"status": "Created."
+			},
+			{
+				"path": "data/system_template/ruby/item_texture.json",
+				"status": "Merged."
+			}
+		]
+	},
+	"BP/recipes/golem.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/golem.recipe.json",
+				"status": "Created."
+			},
+			{
+				"path": "data/system_template/ruby/golem.recipe.json",
+				"status": "Overwritten."
+			}
+		]
+	},
+	"BP/items/shared.item.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/shared.item.json",
+				"status": "Created."
+			},
+			{
+				"path": "data/system_template/ruby/shared.item.json",
+				"status": "Skipped."
+			}
+		]
+	},
+	"data/st_notes/golem.txt": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/notes.txt",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/spawn_rules/golem_red.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/spawn_rule.json",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/spawn_rules/golem_blue.json": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/spawn_rule.json",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/items/ruby.item.json": {
+		"sources": [
+			{
+				"path": "data/system_template/ruby/glob/ruby.item.json",
+				"status": "Created."
+			}
+		]
+	},
+	"BP/items/sapphire.item.json": {
+		"sources": [
+			{
+				"path": "data/system_template/ruby/glob/sapphire.item.json",
+				"status": "Created."
+			}
+		]
+	}
+}

@@ -1,0 +1,9 @@
+{
+	"format_version": "1.20.10",
+	"minecraft:recipe_shapeless": {
+		"description": { "identifier": "stf:golem_ruby" },
+		"tags": ["crafting_table"],
+		"ingredients": [{ "item": "stf:ruby" }],
+		"result": { "item": "stf:shared", "count": 2 }
+	}
+}

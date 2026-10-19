@@ -48,11 +48,28 @@ pub struct EditionMap {
     pub editions: BTreeMap<Edition, PackLock>,
 }
 
+/// `[1, 2, 3]` or `"1.2.3"` (what legacy manifests use).
+fn parse_version(v: &serde_json::Value) -> Option<Version> {
+    let n: Vec<u32> = match v {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok()))
+            .collect::<Option<_>>()?,
+        serde_json::Value::String(s) => s
+            .split('.')
+            .map(|p| p.parse().ok())
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    n.try_into().ok()
+}
+
 /// Last release of a pack (4.2.1).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Release {
     pub version: Version,
-    /// Content hash at that release, hex.
+    /// Content hash at that release, hex. Empty = imported from a legacy manifest (hash
+    /// unknown): the next release adopts the current content at this same version.
     pub hash: String,
 }
 
@@ -282,6 +299,98 @@ impl Lockfile {
         self.outputs.get(output).map(|o| o.script_module.clone())
     }
 
+    /// Migration (5.6): adopts the UUIDs of existing legacy manifests for `output` so the
+    /// migrated packs keep their identity in worlds. `bp` / `rp` are parsed `manifest.json`
+    /// values; header UUID -> `header`, the first data/resources module UUID -> `module`, a
+    /// script module UUID -> `script_module`; the header version becomes the pack's last
+    /// release as `Release { version, hash: "" }` (hash unknown: the next release adopts the content
+    /// at this version, no bump). A present but unusable `header.version` is `LockfileInvalid`. `edition` `None` = `shared`. Never overwrites an existing
+    /// entry: an output/edition already present is left as-is. A pack without a manifest (or a
+    /// manifest module) gets fresh UUIDs; an invalid manifest is `LockfileInvalid`.
+    pub fn import_manifests(
+        &mut self,
+        output: &str,
+        edition: Option<Edition>,
+        bp: Option<&serde_json::Value>,
+        rp: Option<&serde_json::Value>,
+    ) -> Result<(), Diagnostic> {
+        let slot_taken = self.outputs.get(output).is_some_and(|o| match edition {
+            None => o.shared.is_some(),
+            Some(e) => o.editions.contains_key(&e),
+        });
+        let pack = |name: &str, m: Option<&serde_json::Value>, kind: &str| {
+            let bad = |why: &str| {
+                Diagnostic::new(
+                    Code::LockfileInvalid,
+                    format!("{name} manifest.json: {why}"),
+                )
+            };
+            let Some(m) = m else {
+                return Ok((new_pack(), None));
+            };
+            let uuid = |v: &serde_json::Value| v["uuid"].as_str().map(str::to_owned);
+            let header = uuid(&m["header"]).ok_or_else(|| bad("missing header.uuid"))?;
+            let modules = m["modules"].as_array().map_or(&[][..], |a| &a[..]);
+            let of = |t: &str| modules.iter().find(|x| x["type"] == t).and_then(uuid);
+            let version = match &m["header"]["version"] {
+                serde_json::Value::Null => None,
+                v => Some(parse_version(v).ok_or_else(|| {
+                    bad(&format!(
+                        "header.version {v} is not [major, minor, patch] or \"x.y.z\""
+                    ))
+                })?),
+            };
+            let pack = PackLock {
+                header,
+                module: of(kind).unwrap_or_else(uuid4),
+                release: version.map(|version| Release {
+                    version,
+                    hash: String::new(),
+                }),
+                ..Default::default()
+            };
+            Ok::<_, Diagnostic>((pack, of("script")))
+        };
+        let ((bp, script), (rp, _)) = (pack("BP", bp, "data")?, pack("RP", rp, "resources")?);
+        if slot_taken {
+            return Ok(());
+        }
+        let o = self
+            .outputs
+            .entry(output.to_owned())
+            .or_insert_with(|| OutputLock {
+                script_module: script.unwrap_or_else(uuid4),
+                ..Default::default()
+            });
+        let e = EditionLock { bp, rp };
+        match edition {
+            None => o.shared = Some(e),
+            Some(ed) => {
+                o.editions.insert(ed, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// `beacon rename-output`: moves the identities of output `from` to `to` (UUIDs and
+    /// releases survive the rename). Errors if `from` is missing or `to` already exists.
+    pub fn rename_output(&mut self, from: &str, to: &str) -> Result<(), Diagnostic> {
+        if self.outputs.contains_key(to) {
+            return Err(Diagnostic::new(
+                Code::LockfileInvalid,
+                format!("{LOCK_FILE}: output `{to}` already exists"),
+            ));
+        }
+        let entry = self.outputs.remove(from).ok_or_else(|| {
+            Diagnostic::new(
+                Code::LockfileInvalid,
+                format!("{LOCK_FILE}: no output `{from}`"),
+            )
+        })?;
+        self.outputs.insert(to.to_owned(), entry);
+        Ok(())
+    }
+
     pub fn set_bundler(&mut self, version: Option<String>) {
         self.bundler = version;
     }
@@ -327,4 +436,27 @@ pub fn dev_uuid(release: &str, worktree_root: &Path) -> String {
     let mut b = [0u8; 16];
     b.copy_from_slice(&h.finalize().as_bytes()[..16]);
     fmt_uuid(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_output_moves_identity() {
+        let mut l = Lockfile::default();
+        l.outputs.insert(
+            "a".into(),
+            OutputLock {
+                script_module: "s".into(),
+                ..Default::default()
+            },
+        );
+        l.outputs.insert("c".into(), OutputLock::default());
+        l.rename_output("a", "b").unwrap();
+        assert_eq!(l.outputs["b"].script_module, "s");
+        assert!(!l.outputs.contains_key("a"));
+        assert!(l.rename_output("a", "x").is_err());
+        assert!(l.rename_output("b", "c").is_err());
+    }
 }

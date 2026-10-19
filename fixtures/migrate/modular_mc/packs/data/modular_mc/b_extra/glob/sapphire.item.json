@@ -1,0 +1,6 @@
+{
+	"format_version": "1.21.0",
+	"minecraft:item": {
+		"description": { "identifier": "mmc:sapphire", "menu_category": { "category": "items" } }
+	}
+}

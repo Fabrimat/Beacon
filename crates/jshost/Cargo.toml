@@ -10,6 +10,7 @@ publish.workspace = true
 rquickjs = { version = "0.14", features = ["loader"] }
 oxc = { version = "=0.146.0", features = ["transformer", "codegen", "semantic"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 globset = "0.4"
 blake3 = "1"
 beacon-engine = { path = "../engine" }

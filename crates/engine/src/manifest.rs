@@ -34,6 +34,47 @@ fn min_engine(m: &ManifestInput) -> Vec<u32> {
     v
 }
 
+/// Why `packMeta.manifest.<pack>` is invalid: it is not an object, or it sets a field the
+/// lockfile owns (`format_version`, `header.uuid|version`, `modules[].uuid|version`).
+pub fn bad_extra(extra: &Value) -> Option<String> {
+    let Some(o) = extra.as_object() else {
+        return Some("must be an object".into());
+    };
+    fn owned(v: &Value, keys: &[&'static str]) -> Option<&'static str> {
+        keys.iter().find(|k| v.get(**k).is_some()).copied()
+    }
+    if o.contains_key("format_version") {
+        return Some("format_version cannot be overridden".into());
+    }
+    if o.contains_key("modules") {
+        return Some("modules cannot be set (lockfile-owned uuids and versions)".into());
+    }
+    let h = o.get("header")?;
+    if !h.is_object() {
+        return Some("header must be an object".into());
+    }
+    let k = owned(h, &["uuid", "version"])?;
+    Some(format!("header.{k} cannot be overridden (lockfile-owned)"))
+}
+
+/// Deep merge: objects recurse, arrays concatenate, anything else is replaced.
+fn merge_extra(a: &mut Value, b: &Value) {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for (k, v) in y {
+                match x.get_mut(k) {
+                    Some(e) => merge_extra(e, v),
+                    None => {
+                        x.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => x.extend(y.iter().cloned()),
+        (a, b) => *a = b.clone(),
+    }
+}
+
 /// `manifest.json` for each pack of the output, base `texts/en_US.lang` (`pack.name`,
 /// `pack.description`, `Merge::LangLines` so module lang files merge into it) and
 /// `pack_icon.png` (passthrough) when `packMeta.icon` is set. `texts/languages.json` is NOT
@@ -59,6 +100,7 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
         .and_then(|i| RelPath::parse(i.trim_start_matches("./")).ok());
     let origin = RelPath::parse("config.json").expect("static path");
     let min = min_engine(m);
+    let deps_mode = meta.map(|p| p.pack_dependencies).unwrap_or_default();
     // versions: the last release (`beacon pack` puts this run's release in `m.lock` first)
     let version = |p: Pack| m.lock.version_of(out, p, ed);
 
@@ -76,7 +118,7 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
             })];
             let mut deps = Vec::new();
             if bp {
-                if m.has_rp {
+                if m.has_rp && deps_mode.bp_on_rp() {
                     deps.push(json!({
                         "uuid": id(m.lock.pack_uuid(out, Pack::Resource, ed))?,
                         "version": version(Pack::Resource),
@@ -99,6 +141,12 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
                     );
                 }
             }
+            if !bp && deps_mode.rp_on_bp() && m.has_bp {
+                deps.push(json!({
+                    "uuid": id(m.lock.pack_uuid(out, Pack::Behavior, ed))?,
+                    "version": version(Pack::Behavior),
+                }));
+            }
             let mut manifest = json!({
                 "format_version": 2,
                 "header": {
@@ -112,6 +160,9 @@ pub fn generate(m: &ManifestInput) -> Vec<ContentItem> {
             });
             if !deps.is_empty() {
                 manifest["dependencies"] = Value::Array(deps);
+            }
+            if let Some(extra) = meta.and_then(|p| p.manifest.get(&pack)) {
+                merge_extra(&mut manifest, extra);
             }
             Some(manifest)
         })() else {
