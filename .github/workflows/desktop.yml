@@ -1,0 +1,124 @@
+# Desktop app (apps/desktop, Tauri 2): unsigned installers as workflow artifacts ONLY.
+# Phase 5 decisions: nothing is published (no release step, no store, no update feed) and signing
+# is a hook that is off. The Windows NSIS installer is per-user (installMode currentUser, no UAC)
+# with the WebView2 bootstrapper embedded. The macOS dmg builds but never gates (continue-on-error).
+# No Linux job. The app shell has its own Cargo workspace/lockfile (not in the root workspace).
+#
+# Signing: set the repository variable BEACON_SIGN=1 and the secrets BEACON_SIGN_PFX_BASE64 and
+# BEACON_SIGN_PFX_PASSWORD; only then is src-tauri/tauri.sign.conf.json merged (Windows). Unset
+# = every artifact is unsigned (SmartScreen / Gatekeeper prompts are part of the human test).
+name: desktop
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: windows (NSIS, unsigned)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      # Toolchain pinned by rust-toolchain.toml. Two cargo workspaces: root (beacon) and the shell.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --locked --version "^2"
+
+      - name: Install UI dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: UI tests
+        working-directory: apps/desktop
+        run: pnpm test
+
+      # externalBins: sidecars.mjs builds `beacon` first (cargo build --locked), then the pinned esbuild is
+      # fetched by that beacon (blake3-verified against the pin in crates/bundler).
+      - name: Sidecars (beacon, esbuild)
+        working-directory: apps/desktop
+        run: node scripts/sidecars.mjs
+
+      - name: Build the installer (unsigned)
+        if: ${{ vars.BEACON_SIGN != '1' }}
+        working-directory: apps/desktop
+        run: cargo tauri build --ci -- --locked
+
+      - name: Build the installer (signed; only with BEACON_SIGN=1 and the secrets)
+        if: ${{ vars.BEACON_SIGN == '1' }}
+        working-directory: apps/desktop
+        run: cargo tauri build --ci --config src-tauri/tauri.sign.conf.json -- --locked
+        env:
+          BEACON_SIGN_PFX_BASE64: ${{ secrets.BEACON_SIGN_PFX_BASE64 }}
+          BEACON_SIGN_PFX_PASSWORD: ${{ secrets.BEACON_SIGN_PFX_PASSWORD }}
+
+      - name: Installer size (budget 25 MB)
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          "{0}: {1:N1} MB" -f $f.Name, ($f.Length / 1MB) | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($f.Length -gt 25MB * 1.1) { throw "installer over the 25 MB budget (+10%)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-windows-nsis
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+  macos:
+    name: macos (dmg, does not gate)
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+      - run: cargo install tauri-cli --locked --version "^2"
+      - working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+      - working-directory: apps/desktop
+        run: pnpm test
+      - name: Sidecars (beacon, esbuild)
+        working-directory: apps/desktop
+        run: node scripts/sidecars.mjs
+      # ad-hoc signature only (macOS.signingIdentity "-" in tauri.conf.json): Apple silicon
+      # launches it, Gatekeeper still blocks the first open. No APPLE_* secrets are used.
+      - name: Build the dmg (unsigned)
+        working-directory: apps/desktop
+        run: cargo tauri build --ci --bundles dmg -- --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-macos-dmg
+          path: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

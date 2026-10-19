@@ -1,0 +1,31 @@
+[package]
+name = "beacon-desktop"
+description = "Beacon desktop app shell (Tauri 2): glue only, the logic is beacon_serve::app::AppCore"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace and lockfile: NOT a member of the root workspace (Tauri adds ~400 crates
+# and WebView/WebKit system deps; the root `cargo test --workspace` and phase 1-4 CI stay as
+# they are). `docs/phase5-plan.md` 14.5.
+[workspace]
+
+[dependencies]
+beacon-engine = { path = "../../../crates/engine" }
+beacon-serve = { path = "../../../crates/serve" }
+tauri = { version = "2", features = [] }
+serde_json = "1"
+# No tauri-plugin-updater, shell, fs, http or dialog plugin: the webview gets only COMMANDS.
+
+[build-dependencies]
+# `COMMANDS` is the single source of the command set: build.rs generates the permissions
+# from it, capabilities/default.json allows exactly those (checked by crates/serve/tests/app.rs).
+beacon-serve = { path = "../../../crates/serve" }
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

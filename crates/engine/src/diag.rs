@@ -271,6 +271,9 @@ codes! {
     /// A file has unsaved changes in an editor; the edit was not written to disk. Save or
     /// revert the buffer, then retry.
     DocumentDirty = "BCN0163", Error;
+    /// An edit was made against an old version of a file (another client or the disk changed
+    /// it since it was read); nothing was written. Reload the file and retry.
+    DocumentStale = "BCN0164", Error;
     /// A git-sourced plugin has no pin in `beacon.lock.json`. Fix: `beacon plugin update <id>`.
     PluginUnpinned = "BCN0170", Error;
     /// A pinned plugin's fetched tree does not match the content hash in the lockfile; it was
@@ -282,6 +285,28 @@ codes! {
     /// A Beacon debug configuration in `.vscode/launch.json` names an output or target that
     /// does not exist, or an output without scripts.
     LaunchConfigStale = "BCN0180", Warning;
+    /// A GameTest failed on BDS (`beacon test`). The message is the test's failure text.
+    GameTestFailed = "BCN0190", Error;
+    /// A GameTest did not finish within its tick budget, or the whole run hit `--timeout`.
+    GameTestTimeout = "BCN0191", Error;
+    /// `beacon test` found no GameTests: no behavior pack registers one, the pack does not
+    /// depend on `@minecraft/server-gametest`, or the test filter matched nothing.
+    GameTestNone = "BCN0192", Warning;
+    /// BDS is needed and the Minecraft EULA was not accepted. Fix: `beacon test --accept-eula`
+    /// (or accept it in the app); the acceptance is logged, BDS is never redistributed.
+    BdsEulaRequired = "BCN0193", Error;
+    /// BDS did not start, rejected a pack, or exited before the tests finished; the console
+    /// tail is in the message.
+    BdsFailed = "BCN0194", Error;
+    /// No Minecraft install was found for this edition (GDK, UWP or Education layouts), so
+    /// Play cannot deploy or launch. Fix: Start Minecraft once, sign in and reach the main menu, then retry.
+    MinecraftNotFound = "BCN0200", Warning;
+    /// An update failed verification (signature, size or hash, or a version not newer than
+    /// the installed one) and was discarded. Updates fail closed: nothing was installed.
+    UpdateRejected = "BCN0210", Error;
+    /// This build has no update key or no update feed, so the updater is off. Updates are
+    /// never installed without a verified signature.
+    UpdateDisabled = "BCN0211", Note;
     /// Internal error; please report it.
     Internal = "BCN0999", Error;
 }

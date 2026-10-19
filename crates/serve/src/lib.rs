@@ -24,14 +24,18 @@
 //!   `beacon build --trust`.
 //! - **Grants (8.1)**: MCP write tools need the operator's `--allow` on the shim command line
 //!   ([`Grant`]); read tools need none.
-//! - TCP (+ bearer token, Host/Origin checks) is for the app's webview only: phase 5.
+//! - TCP (+ bearer token, Host/Origin checks) was planned for the app's webview; phase 5
+//!   replaces it with Tauri IPC into [`app::AppCore`], a pipe client like the shim. Not built.
+//! - Phase-5 contract: [`app`] (the desktop app's command set) and [`update`] (updater policy).
 
+pub mod app;
 pub mod daemon;
 pub mod discovery;
 pub mod lsp;
 pub mod mcp;
 pub mod shim;
 pub mod transport;
+pub mod update;
 pub mod watch;
 
 /// Handshake protocol version; bump on any incompatible change of a channel.

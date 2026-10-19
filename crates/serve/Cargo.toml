@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 beacon-engine = { path = "../engine" }
+beacon-bundler = { path = "../bundler" }
+beacon-fetch = { path = "../fetch" }
 # Sync LSP plumbing (rust-analyzer's): no async runtime, matches the std-thread daemon.
 lsp-server = "0.10"
 lsp-types = "0.97"
@@ -43,4 +45,19 @@ libc = "0.2.190"
 # its own `main`, so child processes get clean stdio.
 [[test]]
 name = "daemon"
+harness = false
+
+# The test binary is also the daemon the client helper starts (serve --project ROOT).
+[[test]]
+name = "app"
+harness = false
+
+# Also its own fake `beacon` sidecar (`setup ... --json`): canned reports, no network.
+[[test]]
+name = "app_setup"
+harness = false
+
+# Same pattern: the test binary is the daemon Play's deploy goes through.
+[[test]]
+name = "app_play"
 harness = false

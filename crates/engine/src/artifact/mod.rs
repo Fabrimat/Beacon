@@ -220,16 +220,7 @@ pub(crate) fn com_mojang(edition: Edition) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("BEACON_COM_MOJANG") {
         return Some(p.into());
     }
-    let roaming = dirs::data_dir()?;
-    let candidates = match edition {
-        Edition::Bedrock => vec![
-            roaming.join("Minecraft Bedrock/Users/Shared/games/com.mojang"),
-            dirs::data_local_dir()?
-                .join("Packages/Microsoft.MinecraftUWP_8wekyb3d8bbwe/LocalState/games/com.mojang"),
-        ],
-        Edition::Education => vec![roaming.join("Minecraft Education Edition/games/com.mojang")],
-    };
-    candidates.into_iter().find(|p| p.is_dir())
+    crate::setup::preferred(&crate::setup::detect(), edition).map(|i| i.com_mojang.clone())
 }
 
 /// First 8 hex chars of a hash of the worktree path (dev folder suffix, 4.2).

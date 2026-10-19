@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Exactly beacon_serve::app::COMMANDS; no shell, fs, http, dialog or updater permission.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-app-info",
+    "allow-setup-status",
+    "allow-setup-run",
+    "allow-project-open",
+    "allow-trust-prompt",
+    "allow-trust-grant",
+    "allow-init-questions",
+    "allow-init-create",
+    "allow-check",
+    "allow-play",
+    "allow-settings-read",
+    "allow-settings-write",
+    "allow-test-run",
+    "allow-update-check",
+    "allow-update-install",
+    "allow-update-rollback",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

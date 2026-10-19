@@ -17,6 +17,10 @@ use std::sync::{Mutex, OnceLock};
 mod download;
 mod pins;
 
+// The pinned esbuild install, for `beacon setup` / `beacon doctor`.
+pub use download::{install as install_pinned, installed_path, verified as verified_install};
+pub use pins::{VERSION as ESBUILD_VERSION, pin as esbuild_pin, platform};
+
 pub struct Esbuild {
     exe: PathBuf,
     version: Option<String>,

@@ -16,6 +16,9 @@ beacon-jshost = { path = "../jshost" }
 beacon-bundler = { path = "../bundler" }
 beacon-serve = { path = "../serve" }
 beacon-api = { path = "../api" }
+beacon-bds = { path = "../bds" }
+beacon-fetch = { path = "../fetch" }
+blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 ctrlc = "3"

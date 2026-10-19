@@ -23,7 +23,8 @@ fn key(root: &Path) -> io::Result<String> {
     Ok(if cfg!(windows) { s.to_lowercase() } else { s })
 }
 
-fn plugin_hash(plugins: &[serde_json::Value]) -> String {
+/// Hex blake3 of a trust key (what the store records).
+pub fn key_hash(plugins: &[serde_json::Value]) -> String {
     blake3::hash(&serde_json::to_vec(plugins).unwrap_or_default())
         .to_hex()
         .to_string()
@@ -41,13 +42,13 @@ pub fn is_trusted(root: &Path, plugins: &[serde_json::Value]) -> bool {
     let (Ok(p), Ok(k)) = (store_path(), key(root)) else {
         return false;
     };
-    load(&p).get(&k) == Some(&plugin_hash(plugins))
+    load(&p).get(&k) == Some(&key_hash(plugins))
 }
 
 pub fn trust(root: &Path, plugins: &[serde_json::Value]) -> io::Result<()> {
     let p = store_path()?;
     let mut map = load(&p);
-    map.insert(key(root)?, plugin_hash(plugins));
+    map.insert(key(root)?, key_hash(plugins));
     fs::create_dir_all(p.parent().unwrap())?;
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(io::Error::other)?;

@@ -141,7 +141,10 @@ fn help_json_lists_every_command() {
             "symbols",
             "plugin",
             "api",
-            "hook"
+            "hook",
+            "setup",
+            "doctor",
+            "test"
         ]
     );
     let build = &v["command"]["commands"][0];

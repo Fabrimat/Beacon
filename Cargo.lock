@@ -143,10 +143,13 @@ name = "beacon-cli"
 version = "0.0.0"
 dependencies = [
  "beacon-api",
+ "beacon-bds",
  "beacon-bundler",
  "beacon-engine",
+ "beacon-fetch",
  "beacon-jshost",
  "beacon-serve",
+ "blake3",
  "clap",
  "ctrlc",
  "serde_json",
@@ -222,7 +225,9 @@ dependencies = [
 name = "beacon-serve"
 version = "0.0.0"
 dependencies = [
+ "beacon-bundler",
  "beacon-engine",
+ "beacon-fetch",
  "blake3",
  "crossbeam-channel",
  "dirs",

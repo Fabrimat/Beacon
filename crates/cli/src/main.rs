@@ -13,7 +13,9 @@ mod pack;
 mod plugin;
 mod rename;
 mod serve;
+mod setup;
 mod symbols;
+mod test;
 mod watch;
 
 use beacon_bundler::{Confirm, LazyEsbuild};
@@ -144,6 +146,12 @@ enum Cmd {
     Api(api::ApiArgs),
     /// Claude Code hook: reads the event JSON on stdin, prints the decision JSON (8.2).
     Hook { event: migrate::HookEvent },
+    /// Detect Minecraft and install the pinned tools (esbuild, API index, BDS) you name, with consent.
+    Setup(setup::SetupArgs),
+    /// Re-check Minecraft detection and every pinned tool; exits 1 when a pin check fails.
+    Doctor,
+    /// Run the project's GameTests on the pinned BDS (not implemented yet).
+    Test,
 }
 
 /// `beacon --help --json`: the clap command tree, versioned.
@@ -405,6 +413,9 @@ fn main() {
         Cmd::Plugin { cmd } => plugin::run(&o, &cmd),
         Cmd::Api(a) => api::run(&o, &a),
         Cmd::Hook { event } => hook::run(event),
+        Cmd::Setup(a) => setup::run(&o, &a),
+        Cmd::Doctor => setup::doctor(&o),
+        Cmd::Test => test::run(&o),
     };
     process::exit(code);
 }

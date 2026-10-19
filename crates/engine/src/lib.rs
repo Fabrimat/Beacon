@@ -13,6 +13,8 @@
 //! Phase-4 contract: `symbols` (symbol table + rename), `api_index` (versioned API index),
 //! `debug` (minecraft-debugger interop), `plugin` (git plugin pins, `plugin update`).
 //!
+//! Phase-5 contract: `setup` (wizard report, Minecraft detection), `gametest` (`beacon test`).
+//!
 //! Phase-2 seams: `statics::items` after routing, `registry::derive` before merge, and one
 //! writer per artifact kind in `artifact/`.
 
@@ -23,11 +25,13 @@ pub mod config;
 pub mod debug;
 pub mod diag;
 pub mod event;
+pub mod gametest;
 pub mod host;
 pub mod migrate;
 pub mod model;
 pub mod path;
 pub mod plugin;
+pub mod setup;
 pub mod suffix;
 pub mod symbols;
 

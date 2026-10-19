@@ -159,8 +159,8 @@ Rules:
   VS Code, agents). Never one daemon per client.
   - **Transport**: a named pipe on Windows, a Unix domain socket elsewhere, owner-only ACL.
     LSP and MCP clients that expect stdio launch a thin `beacon serve --stdio` shim that
-    attaches to the running daemon (starting it if needed). TCP is used only where a pipe is
-    impossible (the app's webview), bound to 127.0.0.1, with a bearer token.
+    attaches to the running daemon (starting it if needed). There is no TCP endpoint: the
+    desktop app reaches the engine through Tauri IPC and per-call pipe connections (14.5).
   - **Discovery file** in the per-user runtime directory, never in the project:
     `%LOCALAPPDATA%\beacon\run\<project-hash>.json` (Windows),
     `$XDG_RUNTIME_DIR/beacon/` or `~/Library/Caches/beacon/run/` elsewhere, owner-only. It
@@ -1296,6 +1296,187 @@ shim, LSP, MCP tool table), `crates/api/` (API index builder), diagnostic codes
 - **Watch latency**: route memo keyed on config + paths + `module.json` hashes, `children`
   rebuilt only on key-set changes, merge by sorted runs, ledger written without read-back,
   symbols memo; local JSON p95 60.6 -> 36 ms (macOS CI had reached 95.5 ms of 100).
+
+### 14.5 Phase 5 (in progress)
+
+Roadmap row: desktop app (Play, visual settings and `module.json` forms, trust prompt) + setup
+wizard + `beacon test` on BDS + signing/distribution + updater. Exit criteria (both need a
+human, both **OPEN**): (1) clean Windows machine: install -> Play in under 5 minutes, no other
+installs; (2) a non-coder completes it unaided.
+
+Binding decisions for this phase: release artifacts are **unsigned** and **nothing is
+published** (no GitHub release, no store, no live update feed); signing is a hook that is off.
+The BDS EULA is accepted (download pinned, acceptance logged, never redistributed). Education
+is verified only on The-Great-Adventure.
+
+**Desktop app (6.1, 11.2).**
+
+- **Tauri 2** + React (Vite, pnpm), as 6.1 and 11.2 say. Against the 12 budgets: Tauri uses
+  the system WebView2, so the app binary is a few MB (Electron ships Chromium, ~150 MB on
+  disk and ~200 MB idle); the installer carries the app + the `beacon` CLI (7.5 MB measured,
+  14.1) + the WebView2 bootstrapper (~2 MB), and downloads nothing else at install. Idle RAM
+  is the risk: the WebView2 process tree is ~80-110 MB, plus the project daemon (27 MB
+  measured, 14.4) when a project is open, against **App idle RAM < 150 MB** (sum over the
+  process tree, 12). Measured in wave 3 (`app_idle_rss_mb`); Monaco and three.js previews are
+  not in the alpha (they are the largest idle-RAM items).
+- **Layout**: `apps/desktop/src-tauri` (Rust shell) and `apps/desktop/ui` (React), as 10.
+  The shell crate has its own `[workspace]` table and `Cargo.lock`: it is **not** a member of
+  the root workspace. Tauri adds ~400 crates and WebView/WebKit system deps; the root
+  `cargo test --workspace` and the phase 1-4 CI stay as they are. The logic is not in the
+  shell: every `#[tauri::command]` forwards to one method of `beacon_serve::app::AppCore`
+  (workspace member, tested without a webview), so the excluded crate is glue only. A
+  dedicated workflow builds it.
+- **Engine access: the app is a daemon client**, not an in-process engine. The tiebreaker is
+  the single-writer model (3): with VS Code or an agent attached to the project's daemon, an
+  app linking the engine would be a second writer of `config.json` / `module.json`. So
+  project operations (check, Play's build + deploy, settings writes) go to the project's
+  daemon over the owner-only pipe, through `shim::connect` (same discovery, version restart
+  and lifetime lock as every other client), on the MCP channel with grants
+  `edit,build,deploy` (never `release`). Things that are not per-project daemon state run in
+  process: the trust store (`engine::trust`), `init` (`engine::init`). `setup` and `test`
+  run the bundled `beacon` binary with `--json` (one implementation for CLI, VS Code and app;
+  long downloads and BDS runs are a cancellable child process).
+- **No TCP endpoint** (deviation from 3 and 14.4): the webview never talks to the daemon;
+  Tauri IPC into `AppCore` replaces the planned TCP + bearer-token + Host/Origin endpoint,
+  which is therefore not built. Smaller attack surface (no DNS rebinding, no token in the
+  webview).
+- **Trust (5.5)**: the app never sends `trust: true` in its `Hello`; connections are trusted
+  only by the stored decision. The prompt (`trust_prompt`) lists what will run (generators,
+  script bundling, each plugin, "runs arbitrary code" for external processes) and carries the
+  trust key it was built from; `trust_grant(root, key)` records trust only if the key still
+  matches, else `DocumentStale` and the prompt is shown again (no TOCTOU between what the
+  user read and what is trusted). Projects without code need no prompt (14.1).
+- **IPC command set** (`app::COMMANDS`): `app_info`, `setup_status`, `setup_run`,
+  `project_open`, `trust_prompt`, `trust_grant`, `init_questions`, `init_create`, `check`,
+  `play`, `settings_read`, `settings_write`, `test_run`, `update_check`, `update_install`,
+  `update_rollback`. Events: `beacon://diagnostics`, `beacon://content-log`,
+  `beacon://progress`. Errors cross IPC as `{code: "BCN....", message}`. Tauri 2 capabilities
+  allow exactly these commands; no shell, fs or http plugin is exposed to the webview.
+- **Untrusted text** (content log, project-derived diagnostics, plugin output) reaches the
+  webview only through `app::sanitize` (ANSI and control characters stripped, 16 KiB cap) and
+  is rendered as React text, never as HTML.
+- **Play** = `build` + `deploy` of the first `dev`-artifact target through the daemon, then the
+  game is launched by URI (`minecraft://` Bedrock, `minecraft-preview://`,
+  `minecraftedu://`; to verify per install). Diagnostics stream in; the content log is tailed
+  from the detected install. Play does not open a specific world (no verified URI for it); the
+  managed dev world (4.3) is in the game's world list.
+- **Visual settings and `module.json` forms**: rendered from Beacon's own JSON Schemas for
+  `module.json` and the `beacon` key of `config.json` (embedded in the engine, also usable as
+  `$schema` in editors). A small own form renderer (the field kinds are few: string, enum,
+  bool, string maps, priority maps, the ordered outputs list with drag-to-reorder), no form
+  framework. `settings_read` returns value + schema + `base` (blake3 of the bytes);
+  `settings_write` validates with the same parsers the build uses (`ModuleJson`,
+  `ProjectConfig`) and writes through a new daemon MCP write tool (`write_settings`, grant
+  `edit`): stale base = `DocumentStale` (new, `BCN0164`), dirty editor buffer =
+  `DocumentDirty`. The writer edits only the changed values in the existing text (key order,
+  comments and formatting of untouched parts kept); it never re-serializes the whole file.
+
+**Setup wizard (9).** `beacon setup [--json] [--dry-run] [--yes] [--accept-eula] [<tool>...]`,
+rendered by the app and the VS Code extension from `engine::setup::SetupReport`
+(`schema: 1`):
+
+- Downloads exactly three things, each on demand, each hash-pinned in the binary: **esbuild**
+  (`crates/bundler` pin, pre-selected), the **API index** (`crates/api` pins, pre-selected),
+  **BDS** (`crates/bds` pin, never pre-selected, only for `beacon test`, only after EULA
+  acceptance). Nothing else is installed: no Node, no Python, no VS Code. Defaults
+  pre-selected, one "Continue".
+- **Minecraft detection** (`setup::detect`): Bedrock GDK (`%APPDATA%\Minecraft
+  Bedrock\Users\Shared\games\com.mojang`) before UWP (`%LOCALAPPDATA%\Packages\
+  Microsoft.MinecraftUWP_8wekyb3d8bbwe\LocalState\games\com.mojang`; a machine that moved to
+  GDK keeps a stale UWP folder), Preview GDK / UWP (`Minecraft Bedrock Preview`,
+  `Microsoft.MinecraftWindowsBeta_8wekyb3d8bbwe`), Education (`%APPDATA%\Minecraft Education
+  Edition\games\com.mojang`). Dev deploy uses `setup::preferred`: the first stable install of
+  the edition, never Preview implicitly (`artifact::com_mojang` now delegates to it; behavior
+  unchanged). `BEACON_COM_MOJANG` still overrides. No install found = `MinecraftNotFound`
+  (`BCN0200`, a warning: build works, Play cannot deploy).
+- `beacon` on PATH is done by the installer (per-user PATH), not by the wizard.
+- **Deviation from 9 step 2**: the VS Code / Cursor / Windsurf extension and MCP registration
+  offers move out of the first-run wizard into Settings > Integrations (after the first Play),
+  to keep the 5-minute path to one screen.
+- `beacon doctor` re-runs detection and pin checks and reports drift with the same shape.
+
+**`beacon test` on BDS (8.5).** Contract `engine::gametest`:
+
+- `beacon test [--target t] [--filter glob] [--timeout s] [--accept-eula] [--yes] [--json |
+  --sarif]`: builds the target as an `.mcworld` with dev UUIDs and the Beta APIs experiment on,
+  adds a Beacon runner behavior pack, runs it on the pinned BDS (`crates/bds`, extracted into a
+  library: pin, EULA gate + log, member-confined extraction, `server.properties`, process
+  guard), sends `gametest runall`, and parses the console.
+- The runner protocol is Beacon's own: one console line per event, `BEACON_TEST {"event":
+  "start"|"pass"|"fail"|"done", ...}`, so results never depend on BDS or GameTest wording.
+  Console text is untrusted: malformed lines are ignored. A test that started and never
+  reported is `timedOut`; no `done` = the run timed out.
+- Output: `TestReport` (`schema: 1`: `bdsVersion`, `results[{name, status, message}]`,
+  `complete`) with `--json`; SARIF with `--sarif` (`GameTestFailed` `BCN0190`,
+  `GameTestTimeout` `BCN0191`, `GameTestNone` `BCN0192`); `BdsEulaRequired` `BCN0193`,
+  `BdsFailed` `BCN0194`. Exit 0 all passed, 1 otherwise.
+- How the runner observes results through `@minecraft/server-gametest` on BDS 1.26.52.3 is
+  **unverified**; wave 1 starts with a spike against real BDS (as the debugger was in 14.4).
+
+**Distribution (9, 9.2).**
+
+- **Windows**: Tauri bundler **NSIS**, `installMode: "currentUser"` (per-user, no admin, no
+  UAC prompt), WebView2 `embedBootstrapper` (Windows 11 ships WebView2; the bootstrapper
+  covers Windows 10 machines without it; the fully offline installer variant is later). The
+  `beacon` CLI is an `externalBin` sidecar; an NSIS installer hook adds the install folder to
+  the per-user PATH and removes it on uninstall. MSI is not used (per-machine, needs admin).
+- **macOS**: `.dmg`, unsigned with an ad-hoc signature (needed for Apple silicon to launch).
+  **Linux**: AppImage built, not tested, not release-gated (6.1).
+- **Unsigned pipeline**: `.github/workflows/desktop.yml` builds Windows and macOS on every push
+  and uploads the installers as **workflow artifacts only**: no GitHub release, no winget/brew
+  manifest, no store.
+- **Signing hook (off)**: the workflow merges `apps/desktop/src-tauri/tauri.sign.conf.json`
+  (Windows `signCommand`) only when the repository variable `BEACON_SIGN` is `1` and the
+  secrets exist; macOS signing/notarization switch on only when `APPLE_*` secrets exist.
+  Neither exists, so every artifact is unsigned. Consequence for the exit test: Windows
+  SmartScreen shows "Windows protected your PC" (More info -> Run anyway), macOS Gatekeeper
+  blocks the first open; both are steps in the human checklist and count toward the 5 minutes.
+- 9.2 "releases are signed" and "code signing ... prerequisites of the alpha" are deferred by
+  the user's decision; recorded as a deviation.
+
+**Updater (9).** Contract `serve::update`:
+
+- `tauri-plugin-updater` with Tauri's static feed JSON (`version`, `notes`, `pub_date`,
+  `platforms.<os-arch>.{url, signature}`); the plugin verifies the downloaded installer's
+  **minisign** signature against the public key compiled into the build before running it
+  (minisign as 9.2 names it). The key is generated by the maintainer later
+  (`tauri signer generate`); the private key never enters the repo.
+- **Fails closed**: `update::BUILD` takes the key and the feed from the release environment
+  (`BEACON_UPDATE_PUBKEY`, `BEACON_UPDATE_FEED`); both are unset, so every build is
+  `Decision::Disabled` (`UpdateDisabled`, `BCN0211`) and never fetches. A malformed feed, a
+  non-`https` URL, a missing signature, or an unparsable version is `UpdateRejected`
+  (`BCN0210`); the plugin rejects a bad signature.
+- **Consent**: `update_check` fetches and evaluates only (no identifiers in the request);
+  `update_install` runs only on the user's click. No background install. Check-on-launch is
+  off in the alpha (there is no feed).
+- **No downgrades** through the feed (not newer = up to date). **Rollback** is explicit: the
+  previous installer is kept with its blake3 and signature (`update::Rollback`) and both are
+  re-verified before it runs. **Channels** are separate feeds: `<feed>/{stable,beta}/latest.json`.
+- Not live: no key, no feed, nothing published.
+
+**Diagnostic codes reserved**: `DocumentStale` `BCN0164`, `GameTestFailed` `BCN0190`,
+`GameTestTimeout` `BCN0191`, `GameTestNone` `BCN0192`, `BdsEulaRequired` `BCN0193`,
+`BdsFailed` `BCN0194`, `MinecraftNotFound` `BCN0200`, `UpdateRejected` `BCN0210`,
+`UpdateDisabled` `BCN0211`.
+
+**Budgets (12)**: two rows to add to `perf/budgets.json` (staged now; Step 0b):
+`{"id": "app_idle_rss_mb", "label": "App idle RAM (app + WebView2 tree + daemon, project open)",
+"budget": 150, "unit": "MB", "phase": 5, "tolerance_pct": 10}` and `{"id":
+"installer_size_mb", "label": "Windows installer (app + beacon CLI + WebView2 bootstrapper)",
+"budget": 25, "unit": "MB", "phase": 5, "tolerance_pct": 10}`. The CLI's 30 MB binary row is
+unchanged; the app binary is covered by the installer row.
+
+**Deviations, summarized**: no TCP endpoint (Tauri IPC); the app shell is outside the root
+workspace; editor-extension and MCP offers leave the first-run wizard; WebView2 bootstrapper
+instead of the offline installer; releases unsigned and unpublished (9.2 signing deferred);
+updater present but disabled.
+
+---
+
+The wave plan, the machine assessment and the decisions taken after the plan review (they
+override parts of this section: per-call daemon connections, grants `edit,deploy`, esbuild in
+the installer, no PATH change, updater policy only, `module.json`-only forms) are in
+[phase5-plan.md](phase5-plan.md).
 
 ---
 

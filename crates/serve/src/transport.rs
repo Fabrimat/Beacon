@@ -18,6 +18,9 @@ use std::path::Path;
 pub struct Stream {
     #[cfg(windows)]
     h: std::os::windows::io::OwnedHandle,
+    /// Longest a `read` waits (`None` = forever).
+    #[cfg(windows)]
+    rt: Option<std::time::Duration>,
     #[cfg(unix)]
     s: std::os::unix::net::UnixStream,
 }
@@ -41,18 +44,30 @@ impl Stream {
         #[cfg(windows)]
         return Ok(Stream {
             h: self.h.try_clone()?,
+            rt: self.rt,
         });
         #[cfg(unix)]
         return Ok(Stream {
             s: self.s.try_clone()?,
         });
     }
+
+    /// Reads fail with `ErrorKind::TimedOut` (`WouldBlock` on unix) after this long.
+    pub fn set_read_timeout(&mut self, t: Option<std::time::Duration>) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            self.rt = t;
+            Ok(())
+        }
+        #[cfg(unix)]
+        self.s.set_read_timeout(t)
+    }
 }
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         #[cfg(windows)]
-        return win::read(&self.h, buf);
+        return win::read(&self.h, buf, self.rt);
         #[cfg(unix)]
         return self.s.read(buf);
     }
@@ -185,7 +200,7 @@ mod win {
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
         ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-        INVALID_HANDLE_VALUE, LocalFree,
+        INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -200,13 +215,13 @@ mod win {
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
         PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
     };
-    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcessToken,
+        CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
     };
 
     const BUF: u32 = 64 << 10;
@@ -239,6 +254,7 @@ mod win {
     /// reader and a writer on clones of the same handle never wait for each other).
     fn overlapped(
         h: &OwnedHandle,
+        timeout: Option<std::time::Duration>,
         op: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<u32> {
         // SAFETY: plain calls; `ov` outlives the operation because we wait for it below
@@ -255,6 +271,20 @@ mod win {
                 }
             }
             let mut n = 0;
+            if let Some(t) = timeout
+                && WaitForSingleObject(
+                    ev.as_raw_handle(),
+                    t.as_millis().min(u32::MAX as u128 - 1) as u32,
+                ) == WAIT_TIMEOUT
+            {
+                // cancel and reap, so `ov` and the buffer are free; a read that finished in
+                // the meantime still counts
+                CancelIoEx(raw, &ov);
+                if GetOverlappedResult(raw, &ov, &mut n, 1) != 0 {
+                    return Ok(n);
+                }
+                return Err(io::ErrorKind::TimedOut.into());
+            }
             if GetOverlappedResult(raw, &ov, &mut n, 1) == 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -262,10 +292,14 @@ mod win {
         }
     }
 
-    pub(super) fn read(h: &OwnedHandle, buf: &mut [u8]) -> io::Result<usize> {
+    pub(super) fn read(
+        h: &OwnedHandle,
+        buf: &mut [u8],
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<usize> {
         let len = buf.len().min(u32::MAX as usize) as u32;
         // SAFETY: `buf` is valid for `len` bytes until the operation completes.
-        match overlapped(h, |h, ov| unsafe {
+        match overlapped(h, timeout, |h, ov| unsafe {
             ReadFile(h, buf.as_mut_ptr(), len, null_mut(), ov)
         }) {
             Ok(n) => Ok(n as usize),
@@ -283,7 +317,7 @@ mod win {
     pub(super) fn write(h: &OwnedHandle, buf: &[u8]) -> io::Result<usize> {
         let len = buf.len().min(u32::MAX as usize) as u32;
         // SAFETY: as in `read`.
-        overlapped(h, |h, ov| unsafe {
+        overlapped(h, None, |h, ov| unsafe {
             WriteFile(h, buf.as_ptr(), len, null_mut(), ov)
         })
         .map(|n| n as usize)
@@ -400,7 +434,7 @@ mod win {
 
     pub(super) fn accept(l: &mut Listener) -> io::Result<Stream> {
         // SAFETY: the pending handle is a server instance we own.
-        let r = overlapped(&l.pending, |h, ov| unsafe { ConnectNamedPipe(h, ov) });
+        let r = overlapped(&l.pending, None, |h, ov| unsafe { ConnectNamedPipe(h, ov) });
         let err = match r {
             Err(e) if e.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) => Some(e),
             _ => None,
@@ -409,7 +443,7 @@ mod win {
         let next = instance(&l.name, &l.sd, false)?;
         let h = std::mem::replace(&mut l.pending, next);
         match err {
-            None => Ok(Stream { h }),
+            None => Ok(Stream { h, rt: None }),
             Some(e) => Err(e),
         }
     }
@@ -430,7 +464,7 @@ mod win {
                 )
             };
             match owned(h) {
-                Ok(h) => return Ok(Stream { h }),
+                Ok(h) => return Ok(Stream { h, rt: None }),
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                     // SAFETY: as above.
                     if unsafe { WaitNamedPipeW(w.as_ptr(), 2000) } == 0 {
