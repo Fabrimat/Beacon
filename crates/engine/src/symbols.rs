@@ -58,7 +58,7 @@ use crate::route::Routed;
 use crate::suffix::is_generator;
 use crate::template::{self, LineOrigin};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -482,6 +482,7 @@ fn scan_template(
             continue;
         };
         let out_starts = line_starts(&f.text);
+        let mut same_at: Option<(usize, usize)> = None;
         for mut o in scan_mcfunction(&f.text, Some(&dest)) {
             let mut anchor = None;
             if let Some(r) = o.range {
@@ -498,11 +499,19 @@ fn scan_template(
                     });
                     // only before the first byte where output and source part (an `eval`
                     // hole, a rewritten header): later offsets do not line up
-                    let same = src_cmd
-                        .bytes()
-                        .zip(f.text[out_starts[l - 1] as usize..].bytes())
-                        .take_while(|(a, b)| a == b)
-                        .count();
+                    // (once per output line: a line holds many occurrences)
+                    let same = match same_at {
+                        Some((line, n)) if line == l => n,
+                        _ => {
+                            let n = src_cmd
+                                .bytes()
+                                .zip(f.text[out_starts[l - 1] as usize..].bytes())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            same_at = Some((l, n));
+                            n
+                        }
+                    };
                     if end <= same && text.get(cmd + off..cmd + end) == f.text.get(r.start..r.end) {
                         o.range = Some(ByteRange {
                             start: cmd + off,
@@ -685,21 +694,63 @@ fn scan_lang(text: &str, routed: bool) -> Vec<Occurrence> {
 }
 
 /// The kind a command gives the id starting a word, from the words before it on the line.
-fn command_kind(before: &str) -> Option<SymbolKind> {
+fn kind_of_words<'a>(before: &str, back: impl Fn(usize) -> Option<&'a str>) -> Option<SymbolKind> {
     if before.ends_with("type=") || before.ends_with("type=!") {
         return Some(SymbolKind::Entity);
     }
     if !before.ends_with(char::is_whitespace) {
         return None;
     }
-    let w: Vec<&str> = before.split_whitespace().collect();
-    let back = |n: usize| w.len().checked_sub(n).map(|i| w[i]);
     match (back(1), back(2), back(4), back(7)) {
         (Some("summon"), ..) => Some(SymbolKind::Entity),
         (_, Some("give" | "clear"), ..) => Some(SymbolKind::Item),
         (_, _, Some("setblock"), _) | (.., Some("fill")) => Some(SymbolKind::Block),
         _ => None,
     }
+}
+
+/// `command_kind` over the ascending prefixes of one line: keeps the last seven words so each
+/// query reads only the text since the previous one (linear per line, not quadratic).
+struct LineKinds<'a> {
+    line: &'a str,
+    pos: usize,
+    words: VecDeque<&'a str>,
+}
+
+impl<'a> LineKinds<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            line,
+            pos: 0,
+            words: VecDeque::with_capacity(8),
+        }
+    }
+
+    /// The kind for an id starting at byte `end` of the line; `end` never decreases.
+    fn at(&mut self, end: usize) -> Option<SymbolKind> {
+        let line = self.line;
+        let before = &line[..end];
+        if before.ends_with(char::is_whitespace) {
+            // the previous consumed prefix ended on whitespace, so `pos` is a word boundary
+            for w in line[self.pos..end].split_whitespace() {
+                if self.words.len() == 7 {
+                    self.words.pop_front();
+                }
+                self.words.push_back(w);
+            }
+            self.pos = end;
+        }
+        kind_of_words(before, |n| {
+            self.words.len().checked_sub(n).map(|i| self.words[i])
+        })
+    }
+}
+
+/// The kind a command gives the id starting a word, from the words before it on the line.
+#[cfg(test)]
+fn command_kind(before: &str) -> Option<SymbolKind> {
+    let w: Vec<&str> = before.split_whitespace().collect();
+    kind_of_words(before, |n| w.len().checked_sub(n).map(|i| w[i]))
 }
 
 fn scan_mcfunction(text: &str, dest: Option<&RelPath>) -> Vec<Occurrence> {
@@ -731,9 +782,10 @@ fn scan_mcfunction(text: &str, dest: Option<&RelPath>) -> Vec<Occurrence> {
                 out.push(typed(p, SymbolKind::Function, s, s + p.len()));
             }
         }
+        let mut kinds = LineKinds::new(line);
         for (s, e) in tokens(line, start) {
             let id = &text[s..e];
-            match command_kind(&line[..s - start]) {
+            match kinds.at(s - start) {
                 Some(k) => out.push(typed(id, k, s, e)),
                 None => out.push(reference(id, s, e)),
             }
@@ -1705,6 +1757,42 @@ mod tests {
         let v =
             serde_json::to_value([SymbolKind::AnimationController, SymbolKind::LangKey]).unwrap();
         assert_eq!(v, serde_json::json!(["animation_controller", "lang_key"]));
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The incremental kinds equal the per-prefix oracle on every token of arbitrary lines.
+        #[test]
+        fn line_kinds_match_the_prefix_oracle(
+            parts in proptest::collection::vec(
+                prop::sample::select(vec![
+                    "summon", "give", "clear", "setblock", "fill", "execute", "as", "run", "/",
+                    "@e[type=", "@e[type=!", "type=", "demo:a", "minecraft:b", "~", "1", "'",
+                    "\"", "{", "}", "[", "]", ",", "=", " ", "  ", "	", " ", " ", " ", "x.y",
+                ]),
+                0..40,
+            )
+        ) {
+            let line: String = parts.concat();
+            let mut kinds = LineKinds::new(&line);
+            for (s, _) in tokens(&line, 0) {
+                prop_assert_eq!(kinds.at(s), command_kind(&line[..s]), "{:?} at {}", line, s);
+            }
+        }
+    }
+
+    #[test]
+    fn one_megabyte_line_scans_in_linear_time() {
+        let text = format!(
+            "say {}
+",
+            "a:b ".repeat(256 * 1024)
+        );
+        let t = std::time::Instant::now();
+        let got = scan_mcfunction(&text, None);
+        assert_eq!(got.len(), 256 * 1024);
+        assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
     }
 
     #[test]

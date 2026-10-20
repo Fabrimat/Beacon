@@ -191,3 +191,28 @@ fn occurrences_after_an_eval_hole_have_no_range() {
         assert_eq!(e.code, Code::RenameBlocked, "{from}: {e:?}");
     }
 }
+
+#[test]
+fn megabyte_lines_check_in_linear_time() {
+    // a plain function and a template (the `eval` hole makes it one), one 1 MB line each
+    let ids = "a:b ".repeat(256 * 1024);
+    let p = project(&[
+        (
+            "src/t/functions/plain.mcfunction",
+            &format!(
+                "say {ids}
+"
+            ),
+        ),
+        (
+            "src/t/functions/tpl.mcfunction",
+            &format!(
+                "say {ids}`eval:1`
+"
+            ),
+        ),
+    ]);
+    let t = std::time::Instant::now();
+    checked(p.path());
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+}
