@@ -1520,6 +1520,39 @@ workspace; editor-extension and MCP offers leave the first-run wizard; WebView2 
 instead of the offline installer; releases unsigned and unpublished (9.2 signing deferred);
 updater present but disabled.
 
+### 14.6 B10 slice 1 as built (post-alpha, 2026-10-20)
+
+Text generation for `.mcfunction` ([BACKLOG B10](BACKLOG.md)), built-in and data-only.
+
+- **Expander** (`engine::template`): fixed grammar, byte-compatible with
+  `regolith_subfunctions` 1.4.0 (`UNPACK:SUBFUNCTION`, `definefunction`, `function <n>:`,
+  `schedule ... <n>:`, `for a..b [s]` end-exclusive, `foreach` over arrays, `var`, `` `eval:` ``
+  holes). Expressions: identifiers, int/string literals, subscripts, `+ - *`. Everything else is
+  a coded diagnostic at its source line (`TemplateSyntax` BCN0220, `TemplateExpr` BCN0221,
+  `TemplateLimit` BCN0222). Scope is lexical and file-local, loaded from a module-level
+  `scope.json`.
+- **Untrusted by design**: no I/O, no code, so it runs in restricted mode and a project with
+  templates and no scripts needs no trust. Caps charge steps for loop iterations, scanned line
+  bytes (1 step per 64 B) and copied value bytes; limits on depth, output lines/bytes per
+  template and per project. Names go through `NAME_P` + `RelPath::parse`.
+- **Build**: a stage after statics replaces each template's passthrough item with its
+  expansions (`Body::Text`, origin = the source); the route key folds in a hash of the
+  expansions. A template that fails ships nothing.
+- **Symbols / LSP / rename**: the table scans the *expanded* text and maps each occurrence back
+  to the source through a line map. A range is kept only before the first divergence between
+  output and source; ids built through a hole resolve and are checked but are
+  `RenameBlocked`. N loop iterations of one literal are one source range. A `scope.json` edit
+  rescans the templates of its module. Functions emitted by generators as text now define
+  symbols too.
+- **Migrate**: translate-or-freeze, gated by the oracle (14.3). On the local production copies:
+  Dimension-Clash 0 diffs (`init.mcfunction` kept as a source); The-Great-Adventure 11 sources
+  translated (the two big story templates, 403 and 396 files, among them) and 12 frozen (scopes
+  computed in `_map.py`), still 1 cosmetic diff per edition.
+- **Not yet** (slice 2): `.lang`, `if`, comparisons and `in/and/or/not`, a method allowlist,
+  f-strings.
+- Found and fixed on the way: a quadratic command-kind scan in `symbols.rs` (one 640 KB
+  `.mcfunction` line took ~140 s from an untrusted project) is now linear.
+
 ---
 
 The wave plan, the machine assessment and the decisions taken after the plan review (they
