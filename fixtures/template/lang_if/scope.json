@@ -1,0 +1,9 @@
+{
+  "questions": [
+    {"id": "q1", "text": "Two plus two?", "hint": "Count fingers", "hint_alt": "Räkna fingrar"},
+    {"id": "q2", "text": "Three times three?"},
+    {"id": "q3", "text": "Half of ten?", "hint": "Split it", "hint_alt": "Dela"}
+  ],
+  "pages": ["Once upon a time", "skip", "The end"],
+  "show_debug": false
+}

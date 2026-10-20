@@ -1,0 +1,20 @@
+## Synthetic lang template: keys from loops
+menu.title=Crop Market
+# a comment keeps `eval:untouched`
+item.demo:wheat_seed=Wheat Seeds
+tag.demo.0=WHEAT (5 letters)
+item.demo:carrot_seed=Carrot Seeds
+tag.demo.1=CARROT (6 letters)
+item.demo:beetROOT_seed=Beetroot Seeds
+tag.demo.2=BEETROOT (8 letters)
+bar.demo.round1=Round 1 of 3
+bar.demo.round2=Round 2 of 3
+bar.demo.round3=Round 3 of 3
+bar.demo.farm.easy=Farm - Easy
+bar.demo.farm.hard=Farm - Hard
+bar.demo.mine.easy=Mine - Easy
+bar.demo.mine.hard=Mine - Hard
+function <not_a_header>:
+definefunction <neither>:
+key.with.lt=Press <E>:
+footer=Done	##

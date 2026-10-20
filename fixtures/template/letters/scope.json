@@ -1,0 +1,5 @@
+{
+  "blocks": ["demo:letter_sv_a", "demo:letter_en_b", "demo:stone_a", "demo:dirt"],
+  "names": ["Scarf", "Hat"],
+  "count": 2
+}

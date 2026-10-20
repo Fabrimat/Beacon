@@ -44,9 +44,15 @@ legacy filters, and are committed.
 - glob source; a `data/` target (`data/st_notes/golem.txt`);
 - two `.mcfunction` targets in subfunctions syntax: `golem/waves.mcfunction` (`for` + `eval` over
   `waves`/`label` of `golem/_scope.json`, plus a `function <boss>:`: translated) and
-  `golem/gated.mcfunction` (an `if`, which Beacon does not expand: frozen). Their expected files
+  `golem/gated.mcfunction` (an `if`: frozen until B10 slice 2, translated since). Their expected files
   (`BP/functions/golem/**`) and log entries were derived by hand from the filter's rules, not
   produced by the pinned tools; `d3_migrate` checks them through Beacon's own expander and the
+  equivalence check.
+- two `.lang` targets in subfunctions syntax (B10 slice 2): `golem/fr_FR.lang` (`for` + `eval` over
+  `waves`/`label`: translated) and `golem/de_DE.lang` (`foreach` over the `icons` dict of
+  `golem/_scope.json`: frozen, the expansion is kept). Same provenance: their expected files
+  (`RP/texts/{fr_FR,de_DE}.lang`) and log entries were hand-derived (the dict iteration order of
+  `de_DE` is the JSON order, as Python's), then cross-checked through Beacon's expander and the
   equivalence check.
 - Every system needs a `_scope.json`, even `{}`, or system_template ignores it.
 

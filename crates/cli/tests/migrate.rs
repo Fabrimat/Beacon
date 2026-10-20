@@ -168,7 +168,7 @@ fn system_template_round_trip_matches_the_real_output() {
     );
     let rep = &json(&o)["report"]["oracle"];
     assert_eq!(rep["diffs"], serde_json::json!([]), "{rep}");
-    assert_eq!(rep["compared"], 17, "{rep}");
+    assert_eq!(rep["compared"], 19, "{rep}");
 }
 
 #[test]
@@ -197,9 +197,10 @@ fn to_port_lists_every_item() {
                 "generatorCandidate".to_string(),
                 "data/system_template/golem/_map.py".to_string()
             ),
+            // the dict `foreach` lang stays frozen
             (
                 "subfunctionSource".to_string(),
-                "data/system_template/golem/gated.mcfunction".to_string()
+                "data/system_template/golem/de_DE.lang".to_string()
             )
         ]
     );
@@ -411,7 +412,7 @@ fn oracle_profile_builds_archive_targets() {
         let plan = json(&o);
         let rep = &plan["report"]["oracle"];
         assert_eq!(rep["diffs"], serde_json::json!([]), "{prof}: {rep}");
-        assert_eq!(rep["compared"], 17, "{prof}: {rep}");
+        assert_eq!(rep["compared"], 19, "{prof}: {rep}");
         let note = plan["changes"].as_array().unwrap().iter().any(|c| {
             c["note"]["message"]
                 .as_str()

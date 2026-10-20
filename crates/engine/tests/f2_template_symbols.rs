@@ -216,3 +216,145 @@ fn megabyte_lines_check_in_linear_time() {
     checked(p.path());
     assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
 }
+
+const LANG: &str = "src/t/texts/en_US.lang";
+
+fn ent(id: &str) -> String {
+    format!(r#"{{"minecraft:entity":{{"description":{{"identifier":"{id}"}}}}}}"#)
+}
+
+fn lang_keys(s: &Session, name: &str) -> usize {
+    s.symbols()
+        .unwrap()
+        .definitions(SymbolKind::LangKey, name)
+        .len()
+}
+
+#[test]
+fn lang_templates_define_keys_and_map_literals_to_the_source() {
+    // a literal key in a loop is a build error (LangDuplicateKey); only the editor buffer
+    // (overlay below) holds one, to show N iterations collapsing into one edit
+    let src = "for <i 0..3>:
+    entity.demo:c_`eval:i`.name=Gen
+entity.demo:car.name=Car
+";
+    let p = project(&[
+        (LANG, src),
+        ("src/t/entities/car.entity.json", &ent("demo:car")),
+        ("src/t/entities/c1.entity.json", &ent("demo:c_1")),
+        (
+            "src/t/items/i.item.json",
+            r#"{"minecraft:item":{"description":{"identifier":"demo:i"}},"x":"entity.demo:car.name"}"#,
+        ),
+    ]);
+    let (mut s, d) = checked(p.path());
+    assert!(unresolved(&d).is_empty(), "{d:?}");
+    // the literal key defines once; a generated key is defined without a range
+    assert_eq!(lang_keys(&s, "entity.demo:car.name"), 1);
+    assert_eq!(lang_keys(&s, "entity.demo:c_2.name"), 1);
+    let t = s.symbols().unwrap();
+    let k = &t.definitions(SymbolKind::LangKey, "entity.demo:car.name")[0];
+    let r = k.occ.range.unwrap();
+    assert_eq!(&src[r.start..r.end], "entity.demo:car.name");
+    assert!(
+        t.definitions(SymbolKind::LangKey, "entity.demo:c_2.name")[0]
+            .occ
+            .range
+            .is_none()
+    );
+    let looped = "for <i 0..3>:
+    entity.demo:car.name=Car `eval:i`
+";
+    s.symbols_mut().unwrap().overlay(&rp(LANG), looped);
+    let t = s.symbols().unwrap();
+    assert_eq!(lang_keys(&s, "entity.demo:car.name"), 1);
+    // rename: the loop's three iterations are one edit at the source, whose slice is the id
+    let fixes = symbols::rename(t, None, "demo:car", "demo:bus").unwrap();
+    let hits: Vec<_> = fixes.iter().filter(|f| f.path.as_str() == LANG).collect();
+    assert_eq!(hits.len(), 1, "{fixes:?}");
+    assert_eq!(&looped[hits[0].start..hits[0].end], "demo:car");
+    s.symbols_mut().unwrap().overlay(&rp(LANG), src);
+    let t = s.symbols().unwrap();
+    // the generated id cannot be renamed
+    let e = symbols::rename(t, None, "demo:c_1", "demo:z").unwrap_err();
+    assert_eq!(e.code, Code::RenameBlocked, "{e:?}");
+}
+
+#[test]
+fn lang_template_scope_edit_overlay_and_broken_buffer() {
+    let p = project(&[
+        (
+            LANG,
+            "for <i 0..1>:
+    k`eval:n`=v
+",
+        ),
+        ("src/t/scope.json", r#"{"n": "a"}"#),
+    ]);
+    let (mut s, _) = checked(p.path());
+    assert_eq!((lang_keys(&s, "ka"), lang_keys(&s, "kb")), (1, 0));
+    write(p.path(), "src/t/scope.json", r#"{"n": "b"}"#);
+    s.check();
+    assert_eq!((lang_keys(&s, "ka"), lang_keys(&s, "kb")), (0, 1));
+
+    let f = rp(LANG);
+    s.symbols_mut().unwrap().overlay(
+        &f,
+        "for <i 0..1>:
+    kc=v
+",
+    );
+    assert_eq!((lang_keys(&s, "kb"), lang_keys(&s, "kc")), (0, 1));
+    s.symbols_mut().unwrap().overlay(
+        &f,
+        "for <i 0..1>:
+    kc=v
+  x=y
+",
+    );
+    assert_eq!(lang_keys(&s, "kc"), 0);
+    let d = s.check().diagnostics;
+    let e: Vec<_> = d
+        .iter()
+        .filter(|d| d.code == Code::TemplateSyntax)
+        .collect();
+    assert_eq!(e.len(), 1, "{d:?}");
+    let sp = e[0].span.as_ref().unwrap();
+    assert_eq!((sp.path.as_str(), sp.line), (LANG, Some(3)));
+    s.symbols_mut().unwrap().overlay(
+        &f,
+        "for <i 0..1>:
+    kc=v
+",
+    );
+    assert_eq!(lang_keys(&s, "kc"), 1);
+    let d = s.check().diagnostics;
+    assert!(!d.iter().any(|d| d.code == Code::TemplateSyntax), "{d:?}");
+}
+
+#[test]
+fn plain_lang_files_are_scanned_as_before_and_big_lang_lines_are_linear() {
+    let plain = "entity.demo:car.name=Press <E>:
+k=v
+";
+    let big = format!(
+        "k=`eval:1` {}
+",
+        "a:b ".repeat(256 * 1024)
+    );
+    let p = project(&[
+        (LANG, plain),
+        ("src/t/texts/big.lang", &big),
+        ("src/t/entities/car.entity.json", &ent("demo:car")),
+    ]);
+    let t0 = std::time::Instant::now();
+    let (s, _) = checked(p.path());
+    assert!(t0.elapsed().as_secs() < 10, "{:?}", t0.elapsed());
+    assert_eq!(lang_keys(&s, "k"), 2);
+    let t = s.symbols().unwrap();
+    let r = t.definitions(SymbolKind::LangKey, "entity.demo:car.name")[0]
+        .occ
+        .range
+        .unwrap();
+    assert_eq!(&plain[r.start..r.end], "entity.demo:car.name");
+}

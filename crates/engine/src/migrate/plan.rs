@@ -593,7 +593,18 @@ impl Planner<'_> {
             && tail
                 .iter()
                 .all(|c| c.applied == Applied::Appended && c.policy == Policy::AppendEnd);
-        let plain = live.iter().all(|c| c.template == Template::None);
+        // a source in subfunctions syntax is not a plain fragment: copied live it would need a
+        // scope and expand alone, but the legacy output merges its expansion with the others
+        let templated = |c: &Contributor| {
+            self.read(&c.source)
+                .and_then(|b| String::from_utf8(b).ok())
+                .is_some_and(|t| match lang {
+                    true => template::has_lang_subfunctions(&t),
+                    false => has_subfunctions(&t),
+                })
+        };
+        let syntax = live.iter().any(|c| templated(c));
+        let plain = live.iter().all(|c| c.template == Template::None) && !syntax;
         if !(json || lang) || !plain {
             let what = live
                 .iter()
@@ -605,7 +616,12 @@ impl Planner<'_> {
                 o,
                 pack,
                 rest,
-                format!("combined by the legacy tool ({what}); written pre-merged"),
+                match syntax {
+                    true => format!(
+                        "a source uses subfunctions syntax and the legacy tool merged its expansion with the others ({what}); written pre-merged"
+                    ),
+                    false => format!("combined by the legacy tool ({what}); written pre-merged"),
+                },
             );
         }
         // (from, to, root)
@@ -839,22 +855,36 @@ impl Planner<'_> {
             .find(|s| s.filter.as_deref() == Some("system_template"))
             .and_then(|s| s.settings.as_ref()?.get("scope"));
         let mut by_source: BTreeMap<&RelPath, Vec<&EvalOutput>> = BTreeMap::new();
+        // merged outputs: no single source to hold the expansion against
+        let mut merged: Vec<&EvalOutput> = Vec::new();
         for o in eval.outputs.values() {
-            if let [c] = &o.contributors[..]
-                && o.path.starts_with("BP/functions/")
-                && o.path.ends_with(".mcfunction")
-                && !matches!(o.body, Body::Passthrough(_))
-                && c.template == Template::None
-            {
-                by_source.entry(&c.source).or_default().push(o);
+            let lang = o.path.ends_with(".lang") && pack_of(&o.path).is_some();
+            let func = o.path.starts_with("BP/functions/") && o.path.ends_with(".mcfunction");
+            if !(lang || func) || matches!(o.body, Body::Passthrough(_)) {
+                continue;
+            }
+            match &o.contributors[..] {
+                // a `.lang` is the whole oracle file: only one that was created (not appended
+                // to a base file or another source) can be held against one template
+                [c] if c.template == Template::None
+                    && (!lang || matches!(c.applied, Applied::Created | Applied::Overwrote)) =>
+                {
+                    by_source.entry(&c.source).or_default().push(o)
+                }
+                [] => {}
+                _ => merged.push(o),
             }
         }
         let (mut replaced, mut stand_ins) = (BTreeSet::new(), Vec::new());
         for (source, outs) in by_source {
+            let lang = outs[0].path.ends_with(".lang");
             let Some(text) = self
                 .read(source)
                 .and_then(|b| String::from_utf8(b).ok())
-                .filter(|t| has_subfunctions(t))
+                .filter(|t| match lang {
+                    true => template::has_lang_subfunctions(t),
+                    false => has_subfunctions(t),
+                })
             else {
                 continue;
             };
@@ -864,9 +894,7 @@ impl Planner<'_> {
             let Some(base) = outs
                 .iter()
                 .find_map(|o| {
-                    o.path
-                        .ends_with(&format!("/{name}"))
-                        .then(|| o.path.clone())
+                    (lang || o.path.ends_with(&format!("/{name}"))).then(|| o.path.clone())
                 })
                 .or_else(|| {
                     outs.iter().find_map(|o| {
@@ -885,8 +913,8 @@ impl Planner<'_> {
             });
             let module = self.module_of(c);
             let found = found.and_then(|r| {
-                let rest = base.strip_prefix("BP/").unwrap_or_default();
-                match self.candidate(&module, name, Pack::Behavior, rest, &BTreeSet::new()) {
+                let (pack, rest) = pack_of(&base).expect("checked by expands_like_oracle");
+                match self.candidate(&module, name, pack, rest, &BTreeSet::new()) {
                     Some(_) => Ok(r),
                     None => Err("module path taken".to_string()),
                 }
@@ -896,10 +924,11 @@ impl Planner<'_> {
             });
             match kept {
                 Ok(x) => {
+                    let pre = &base[..3]; // `BP/` or `RP/`
                     replaced.extend(
                         x.files
                             .iter()
-                            .map(|f| format!("BP/{}", f.dest))
+                            .map(|f| format!("{pre}{}", f.dest))
                             .chain(expected.iter().map(|e| e.to_string())),
                     );
                     self.translated.insert(source.clone());
@@ -918,6 +947,28 @@ impl Planner<'_> {
                 }
                 Err(why) => {
                     self.frozen.insert(source.clone(), why);
+                }
+            }
+        }
+        // a template whose output merges several sources (or a base file): the expansion of
+        // one cannot be told from the rest, so it keeps the legacy output
+        for o in merged {
+            for c in &o.contributors {
+                let lang = o.path.ends_with(".lang");
+                let templated = self
+                    .read(&c.source)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .is_some_and(|t| match lang {
+                        true => template::has_lang_subfunctions(&t),
+                        false => has_subfunctions(&t),
+                    });
+                if templated && !self.translated.contains(&c.source) {
+                    let why = format!(
+                        "{} merges {} source(s) or a base file, so this template's expansion cannot be told from the others",
+                        o.path,
+                        o.contributors.len()
+                    );
+                    self.frozen.entry(c.source.clone()).or_insert(why);
                 }
             }
         }
@@ -2276,7 +2327,8 @@ fn called_functions(text: &str) -> Vec<String> {
     out
 }
 
-/// Expands `text` (a template at the pack path `base`, `BP/...`) with Beacon's expander and
+/// Expands `text` (a template at the pack path `base`, `BP/...` or `RP/...`; the suffix picks
+/// `.mcfunction` or `.lang` mode) with Beacon's expander and
 /// checks every file it writes against the oracle's, as `equiv` compares text; `expected` are
 /// the oracle files the template has to account for. `Err`: why it cannot be translated.
 fn expands_like_oracle(
@@ -2287,15 +2339,42 @@ fn expands_like_oracle(
     expected: &[&str],
     oracle: &dyn Fn(&str) -> Option<String>,
 ) -> Result<template::Expansion, String> {
-    let dest = base
-        .strip_prefix("BP/")
-        .and_then(|d| RelPath::parse(d).ok())
-        .ok_or_else(|| format!("{base} is not a behavior pack path"))?;
-    let x = template::expand(text, scope, source, &dest)
-        .map_err(|d| format!("{}: {}", d.code.id(), d.message))?;
-    let made: BTreeSet<String> = x.files.iter().map(|f| format!("BP/{}", f.dest)).collect();
+    let (pre, dest) = pack_of(base)
+        .map(|(p, d)| (pack_name(p), d))
+        .and_then(|(p, d)| Some((p, RelPath::parse(d).ok()?)))
+        .ok_or_else(|| format!("{base} is not a pack path"))?;
+    // ponytail: keyed on template.rs's message text; pinned by `placement_decisions` (d3_migrate)
+    let x = template::expand(text, scope, source, &dest).map_err(|d| {
+        let m = format!("{}: {}", d.code.id(), d.message);
+        match d.message.contains("`foreach` needs a list") && d.message.contains(" is a dict") {
+            true => format!("{m}; iterating a dict (`foreach` over an object) is not supported"),
+            false => m,
+        }
+    })?;
+    // Beacon's build is stricter than the oracle's key-map comparison: a repeated key is an
+    // error there, and a single-`#` line is a comment (the map would read `#x=y` as a key)
+    if dest.as_str().ends_with(".lang") {
+        for f in &x.files {
+            if let Some(d) = template::duplicate_key(f, source) {
+                return Err(format!("{}: {}", d.code.id(), d.message));
+            }
+            if let Some(l) = f.text.lines().find(|l| {
+                let l = l.trim_start();
+                l.starts_with('#') && !l.starts_with("##") && l.contains('=')
+            }) {
+                return Err(format!(
+                    "the expansion has the line `{l}`: a single `#` starts a comment in Beacon's lang merge but the legacy tool kept it as a key"
+                ));
+            }
+        }
+    }
+    let made: BTreeSet<String> = x
+        .files
+        .iter()
+        .map(|f| format!("{pre}/{}", f.dest))
+        .collect();
     for f in &x.files {
-        let path = format!("BP/{}", f.dest);
+        let path = format!("{pre}/{}", f.dest);
         let Some(o) = oracle(&path) else {
             return Err(format!("the legacy output has no {path}"));
         };
@@ -2601,7 +2680,7 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
                 out.push(ToPort {
                     kind: ToPortKind::SubfunctionSource,
                     path: to.clone(),
-                    why: "still uses subfunctions syntax: Beacon expands the supported `.mcfunction` subset at build time; unsupported constructs, `.lang` files and computed scopes stay frozen from the oracle expansion or need porting by hand".into(),
+                    why: "still uses subfunctions syntax: Beacon expands the supported `.mcfunction` and `.lang` subset at build time; unsupported constructs (dict `foreach`, `functiontree`, `UNPACK:HERE`, `assert`, `>`) and scopes computed in `_map.py` stay frozen from the oracle expansion or need porting by hand".into(),
                 });
             }
         }
@@ -2615,8 +2694,9 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
         .eval
         .outputs
         .values()
-        .filter(|o| o.path.ends_with(".mcfunction"))
+        .filter(|o| o.path.ends_with(".mcfunction") || o.path.ends_with(".lang"))
     {
+        let lang = o.path.ends_with(".lang");
         for c in o
             .contributors
             .iter()
@@ -2625,14 +2705,28 @@ fn to_port(p: &mut Planner, steps: &[&FilterRun], tdiags: &[Diagnostic]) {
         {
             let reason = match p.frozen.get(&c.source) {
                 Some(r) => format!(" ({r})"),
-                None if filter_ran => String::new(),
+                // a `.lang` source only has a say when it is a template
+                None if lang => continue,
+                None if filter_ran => match read(&c.source).is_some_and(|t| has_subfunctions(&t)) {
+                    true => String::new(),
+                    // a plain source of a merged output, listed because the output was
+                    false => format!(
+                        " (this source has no subfunctions syntax of its own: {} merges it with other sources and was kept as the legacy output)",
+                        o.path
+                    ),
+                },
                 None => continue,
+            };
+            let what = if lang {
+                "lang expansion"
+            } else {
+                "expanded functions"
             };
             out.push(ToPort {
                 kind: ToPortKind::SubfunctionSource,
                 path: c.source.clone(),
                 why: format!(
-                    "subfunctions syntax Beacon did not translate{reason}; its expanded functions were kept as static files: port the subfunctions by hand"
+                    "subfunctions syntax Beacon did not translate{reason}; its {what}: port the subfunctions by hand"
                 ),
             });
         }

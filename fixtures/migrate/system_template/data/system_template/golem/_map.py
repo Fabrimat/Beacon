@@ -45,6 +45,14 @@
     {
         "source": "gated.mcfunction",
         "target": "BP/functions/golem/gated.mcfunction"
+    },
+    {
+        "source": "fr_FR.lang",
+        "target": "RP/texts/fr_FR.lang"
+    },
+    {
+        "source": "de_DE.lang",
+        "target": "RP/texts/de_DE.lang"
     }
 ] + [
     {

@@ -1,4 +1,4 @@
-//! `.mcfunction` templates ("subfunctions"): a fixed grammar, byte-compatible with
+//! `.mcfunction` and `.lang` templates ("subfunctions"): a fixed grammar, byte-compatible with
 //! `regolith_subfunctions` 1.4.0 for the subset evaluated here, so migrated files are plain
 //! copies. Data, not code: [`expand`] does no I/O and runs nothing, every limit is a
 //! diagnostic, so `build`/`check` run it untrusted. The build stage ([`apply`]) reads only the
@@ -9,7 +9,8 @@
 //! - `definefunction <n>:`, `[prefix ]function <n>:`, `[prefix ]schedule <args> <n>:`: the
 //!   block becomes `X/n.mcfunction` beside `X.mcfunction`; the last two emit
 //!   `{prefix}function X/n` / `{prefix}schedule {args} X/n` in its place.
-//! - `for <v a..b [step]>:` (Python `range`: `b` is exclusive), `foreach <i v expr>:` (lists).
+//! - `for <v a..b [step]>:` (Python `range`: `b` is exclusive), `foreach <i v expr>:` (lists),
+//!   `if <expr>:` (Python truthiness; 1.4.0 has no `else`/`elif`).
 //! - `var n = expr`; `` `eval:expr` `` anywhere on a non-`#` line, block headers included
 //!   (holes are filled before the header is matched).
 //! - `#` lines are kept as is, `##` and blank lines dropped; output lines are stripped and
@@ -17,15 +18,22 @@
 //! - A plain command ending in `>:` and containing `<` (`say Press <E>:`) followed by an
 //!   indented line is a malformed header (`TemplateSyntax`) and the file ships nothing; the
 //!   same line without an indented child is an ordinary command.
+//! - `.lang` (the destination decides, as the reference's `is_lang`): the function headers,
+//!   `UNPACK:*` and `functiontree` are plain text, `##` lines are kept; the template writes only
+//!   itself.
 //!
-//! Expressions: names, int/float/string literals, `x[i]`, `x['k']`, unary `-`, `+ - *`,
-//! parentheses; values print like Python's `str()`. Everything else the reference accepts
-//! (`if`, `functiontree`, `UNPACK:HERE`, `>`, `assert`, comparisons, calls, f-strings, `/`)
-//! is one coded diagnostic, never silently skipped. Scope is lexical and file-local: `var` and
-//! loop variables end with their block (the reference leaks them through one shared dict).
+//! Expressions: names, int/float/string literals, `f'..{expr}..'`, `x[i]`, `x['k']`, unary
+//! `-`, `+ - *`, comparisons (one per operand pair, no chains), `in`/`not in`, `and`/`or`
+//! (returning an operand, short-circuit), `not`, the methods `startswith`, `endswith`,
+//! `capitalize`, `upper`, `lower` and the builtins `len`, `str`, `int`, parentheses; values
+//! print like Python's `str()`. Everything else the reference accepts (`functiontree`,
+//! `UNPACK:HERE`, `>`, `assert`, other calls, `/`, f-string format specs) is one coded
+//! diagnostic, never silently skipped. Scope is lexical and file-local: `var` and loop
+//! variables end with their block, `if` included (the reference leaks them through one shared
+//! dict).
 
 use crate::diag::{Code, Diagnostic};
-use crate::merge::strip_comments;
+use crate::merge::{lang_key, strip_comments};
 use crate::model::{Body, ContentItem, Dest, Merge, Pack};
 use crate::path::{Hash, RelPath, Vfs};
 use serde_json::{Map, Number, Value};
@@ -99,22 +107,35 @@ pub struct Expansion {
 /// Template syntax in an `.mcfunction` (regolith_subfunctions would rewrite the file). A cheap
 /// superset sniff; [`expand`] decides ([`Expansion::modified`]).
 pub fn has_subfunctions(text: &str) -> bool {
+    sniff(text, false)
+}
+
+/// [`has_subfunctions`] for a `.lang`: only block headers (`for`/`foreach`/`if`) and
+/// `` `eval:` `` holes select a file. Narrower on purpose: the tree is parsed (and an odd
+/// indent is an error) before [`expand`] knows whether anything expands, and an ordinary
+/// `.lang` (`key=Press <E>:`, `var x=3`, `> note`) must stay untouched. A selected file is
+/// expanded with the full grammar (`var` included).
+pub fn has_lang_subfunctions(text: &str) -> bool {
+    sniff(text, true)
+}
+
+fn sniff(text: &str, lang: bool) -> bool {
+    const BOTH: &[&str] = &["for <", "foreach <", "if <"];
+    // in a `.lang` these are plausible text (`var x=3`, `> note`): they do not select the file
+    const MCFUNCTION: &[&str] = &[
+        "var ",
+        "> ",
+        "assert ",
+        "function <",
+        "definefunction <",
+        "UNPACK:",
+    ];
     text.lines().any(|l| {
         let t = l.trim();
-        [
-            "for <",
-            "if <",
-            "function <",
-            "definefunction <",
-            "var ",
-            "UNPACK:",
-            "> ",
-            "assert ",
-        ]
-        .iter()
-        .any(|p| t.starts_with(p))
-            // every block header (`... run function <n>:`, `foreach <..>:`, `schedule .. <n>:`)
-            || (t.ends_with(">:") && t.contains('<'))
+        let extra: &[&str] = if lang { &[] } else { MCFUNCTION };
+        BOTH.iter().chain(extra).any(|p| t.starts_with(p))
+            // every block header (`... run function <n>:`, `schedule .. <n>:`)
+            || (!lang && t.ends_with(">:") && t.contains('<'))
             || (!t.starts_with('#') && l.contains("`eval:"))
     })
 }
@@ -140,6 +161,7 @@ pub fn expand(
         },
         files: Vec::new(),
         dests: BTreeMap::from([(base_dest.clone(), 0)]),
+        lang: base_dest.as_str().ends_with(".lang"),
         modified: false,
         unpacked: false,
         lines: 0,
@@ -160,9 +182,12 @@ pub fn expand(
 /// Build stage, after routing and before static outputs join (prebuilt packs are copied as
 /// is): every routed BP `.mcfunction` passthrough that is a template is replaced by its
 /// expansions (`Body::Text`, origin = the template, `Merge::Error`, so a hand-written
-/// `X/n.mcfunction` is a `RouteCollision`). A template that fails ships nothing. Returns a
-/// hash of what changed, to fold into `Routed::key`; `None` when no template did. `templates`
-/// gets every template source (even one that failed) with where it routes.
+/// `X/n.mcfunction` is a `RouteCollision`). A `.lang` template (any pack) keeps its item's
+/// merge policy, so its text joins the other modules' lines (`Merge::LangLines`); a key it
+/// defines twice is a `LangDuplicateKey` at the source line. A template that fails ships
+/// nothing. Returns a hash of what changed, to fold into `Routed::key`; `None` when no
+/// template did. `templates` gets every `.mcfunction` template source (even one that failed)
+/// with where it routes (`.lang` templates are not listed there).
 // ponytail: no cache, every build re-reads and re-expands (39 files, microseconds).
 pub(crate) fn apply(
     items: &mut Vec<ContentItem>,
@@ -174,10 +199,12 @@ pub(crate) fn apply(
     let (mut h, mut any, mut total) = (blake3::Hasher::new(), false, 0usize);
     let mut out = Vec::with_capacity(items.len());
     for item in std::mem::take(items) {
+        let lang = item.dest.path.as_str().ends_with(".lang");
         let src = match &item.body {
             Body::Passthrough(s)
-                if item.dest.pack == Pack::Behavior
-                    && item.dest.path.as_str().ends_with(".mcfunction") =>
+                if lang
+                    || (item.dest.pack == Pack::Behavior
+                        && item.dest.path.as_str().ends_with(".mcfunction")) =>
             {
                 s.clone()
             }
@@ -186,11 +213,22 @@ pub(crate) fn apply(
                 continue;
             }
         };
-        let Some(text) = vfs
-            .read(&src)
+        // A `.lang` is streamed: verified against the index but not cached, so a plain one stays
+        // first read (and re-verified) by the lang merge, which retries if it changed mid-build.
+        let read = match lang {
+            true => {
+                let mut b = Vec::new();
+                vfs.stream(&src, &mut b).map(|_| b)
+            }
+            false => vfs.read(&src),
+        };
+        let Some(text) = read
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
-            .filter(|t| has_subfunctions(t))
+            .filter(|t| match lang {
+                true => has_lang_subfunctions(t),
+                false => has_subfunctions(t),
+            })
         else {
             out.push(item);
             continue;
@@ -199,7 +237,9 @@ pub(crate) fn apply(
             let s = load_scope(vfs, &item.module, diags);
             scopes.insert(item.module.clone(), s);
         }
-        templates.insert(src.clone(), item.dest.clone());
+        if !lang {
+            templates.insert(src.clone(), item.dest.clone());
+        }
         h.update(src.as_str().as_bytes());
         h.update(&[0]);
         let x = match expand(&text, &scopes[&item.module], &src, &item.dest.path) {
@@ -215,6 +255,12 @@ pub(crate) fn apply(
                 continue;
             }
         };
+        if lang && let Some(d) = x.files.iter().find_map(|f| duplicate_key(f, &src)) {
+            diags.push(d);
+            any = true;
+            h.update(&[1]);
+            continue;
+        }
         any = true;
         let size: usize = x.files.iter().map(|f| f.text.len()).sum();
         if total + size > MAX_PROJECT_BYTES {
@@ -242,7 +288,7 @@ pub(crate) fn apply(
                     ..item.dest.clone()
                 },
                 body: Body::Text(f.text),
-                merge: Merge::Error,
+                merge: if lang { item.merge } else { Merge::Error },
                 origin: src.clone(),
                 module: item.module.clone(),
             });
@@ -253,6 +299,29 @@ pub(crate) fn apply(
     }
     *items = out;
     any.then(|| *h.finalize().as_bytes())
+}
+
+/// The first key `f` (a `.lang` expansion) defines twice, at its source line (the merge only
+/// sees output lines, and only when other files share the destination).
+pub(crate) fn duplicate_key(f: &Expanded, src: &RelPath) -> Option<Diagnostic> {
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    f.text.split('\n').zip(&f.line_map).find_map(|(l, o)| {
+        let k = lang_key(l)?;
+        let first = match seen.get(k) {
+            Some(first) => *first,
+            None => {
+                seen.insert(k, o.src_line);
+                return None;
+            }
+        };
+        Some(
+            Diagnostic::new(
+                Code::LangDuplicateKey,
+                format!("lang key {k:?} defined twice (first by line {first})"),
+            )
+            .at(src.clone(), Some(o.src_line), Some(o.src_cols.start + 1)),
+        )
+    })
 }
 
 /// The module's `scope.json` (BOM and JSONC accepted); missing = empty, invalid = a
@@ -377,6 +446,8 @@ enum Stmt<'l> {
     For(&'l str, i64, i64, i64),
     /// index, value, expression, byte offset of the expression.
     Foreach(&'l str, &'l str, &'l str, usize),
+    /// condition, byte offset of the condition.
+    If(&'l str, usize),
     Unpack,
     Command,
 }
@@ -403,8 +474,9 @@ fn split_spaces(s: &str) -> Option<(&str, &str)> {
     Some((a, b.trim_start_matches(' ')))
 }
 
-/// The reference's matchers, in its order, on a stripped line with its holes filled.
-fn classify(l: &str) -> Stmt<'_> {
+/// The reference's matchers, in its order, on a stripped line with its holes filled. In a
+/// `.lang` the function headers, `functiontree` and `UNPACK:*` are text.
+fn classify(l: &str, lang: bool) -> Stmt<'_> {
     if let Some(r) = l.strip_prefix("var ") {
         let r = r.trim_start_matches(' ');
         let n = r
@@ -424,11 +496,14 @@ fn classify(l: &str) -> Stmt<'_> {
     if let Some(n) = l
         .strip_prefix("definefunction <")
         .and_then(|r| r.strip_suffix(">:"))
-        .filter(|n| is_fn_name(n))
+        .filter(|n| is_fn_name(n) && !lang)
     {
         return Stmt::Define(n);
     }
-    if let Some((head, lt)) = header.and_then(|h| Some((h, h.rfind('<')?))) {
+    if let Some((head, lt)) = header
+        .filter(|_| !lang)
+        .and_then(|h| Some((h, h.rfind('<')?)))
+    {
         let name = &head[lt + 1..];
         if is_fn_name(name) {
             let before = &head[..lt];
@@ -447,8 +522,12 @@ fn classify(l: &str) -> Stmt<'_> {
             }
         }
     }
-    if l.starts_with("if <") && header.is_some_and(|h| h.len() > 4) {
-        return Stmt::Unsupported("if");
+    if let Some(e) = l
+        .strip_prefix("if <")
+        .and_then(|r| r.strip_suffix(">:"))
+        .filter(|e| !e.is_empty() && !e.contains('`'))
+    {
+        return Stmt::If(e, "if <".len());
     }
     if let Some((v, rest)) = l
         .strip_prefix("for <")
@@ -478,15 +557,15 @@ fn classify(l: &str) -> Stmt<'_> {
     {
         return Stmt::Foreach(i, v, e, l.len() - 2 - e.len());
     }
-    if l.starts_with("functiontree <") && header.is_some() {
+    if l.starts_with("functiontree <") && header.is_some() && !lang {
         return Stmt::Unsupported("functiontree");
     }
     if l.starts_with("assert ") {
         return Stmt::Unsupported("assert");
     }
     match l {
-        "UNPACK:HERE" => Stmt::Unsupported("UNPACK:HERE"),
-        "UNPACK:SUBFUNCTION" => Stmt::Unpack,
+        "UNPACK:HERE" if !lang => Stmt::Unsupported("UNPACK:HERE"),
+        "UNPACK:SUBFUNCTION" if !lang => Stmt::Unpack,
         _ => Stmt::Command,
     }
 }
@@ -522,6 +601,8 @@ struct Walker<'a> {
     files: Vec<Expanded>,
     /// Every file written so far -> line that defined it.
     dests: BTreeMap<RelPath, u32>,
+    /// A `.lang` template (the reference's `is_lang`).
+    lang: bool,
     modified: bool,
     unpacked: bool,
     lines: usize,
@@ -610,7 +691,7 @@ impl<'a> Walker<'a> {
             let raw = &s[body..body + j];
             let pad = raw.len() - raw.trim_start_matches(' ').len();
             let v = self
-                .eval(&raw[pad..])
+                .eval(&raw[pad..], false)
                 .and_then(|v| {
                     py_str(&v).map_err(|m| ExprErr {
                         at: 0,
@@ -648,7 +729,8 @@ impl<'a> Walker<'a> {
     }
 
     /// Evaluates `e`; copying a scope or local value out costs steps by size ([`COPY_BYTES`]).
-    fn eval(&mut self, e: &str) -> Result<Value, ExprErr> {
+    /// `truth`: only its truthiness is wanted (`Value::Bool`, nothing copied).
+    fn eval(&mut self, e: &str, truth: bool) -> Result<Value, ExprErr> {
         let Env {
             root,
             locals,
@@ -658,17 +740,19 @@ impl<'a> Walker<'a> {
             s: e,
             i: 0,
             depth: 0,
+            dead: false,
             root,
             locals,
             reads,
             steps: &mut self.steps,
         };
-        let v = p.expr()?;
+        let v = p.test()?;
         p.ws();
         if p.i < e.len() {
             return Err(p.unsupported());
         }
         match v {
+            _ if truth => Ok(Value::Bool(truthy(&v))),
             Cow::Borrowed(v) => {
                 p.charge(weight(v))?;
                 Ok(v.clone())
@@ -750,7 +834,7 @@ impl<'a> Walker<'a> {
             // before anything scans the line (even trimming a long indent)
             self.step(n, 0, 1 + n.raw.len() / LINE_BYTES)?;
             let s = n.raw.trim();
-            if s.starts_with("##") {
+            if s.starts_with("##") && !self.lang {
                 continue;
             }
             let lead = n.raw.len() - n.raw.trim_start().len();
@@ -772,14 +856,14 @@ impl<'a> Walker<'a> {
                     "unexpected indentation: this line takes no block".into(),
                 )),
             };
-            let stmt = classify(&l);
+            let stmt = classify(&l, self.lang);
             if !matches!(stmt, Stmt::Command) {
                 self.modified = true;
             }
             match stmt {
                 Stmt::Var(name, e, off) => {
                     no_children(self)?;
-                    let v = self.eval(e).map_err(|x| {
+                    let v = self.eval(e, false).map_err(|x| {
                         self.diag(
                             x.code,
                             n,
@@ -851,8 +935,22 @@ impl<'a> Walker<'a> {
                         self.env.locals.pop();
                     }
                 }
+                Stmt::If(e, off) => {
+                    let v = self.eval(e, true).map_err(|x| {
+                        self.diag(
+                            x.code,
+                            n,
+                            at(off + x.at),
+                            format!("`{}`: {}", clip(e), x.msg),
+                        )
+                    })?;
+                    if v == Value::Bool(true) {
+                        let lines = self.block(c, dest, mode)?;
+                        out.extend(lines);
+                    }
+                }
                 Stmt::Foreach(i, v, e, off) => {
-                    let list = self.eval(e).map_err(|x| {
+                    let list = self.eval(e, false).map_err(|x| {
                         self.diag(
                             x.code,
                             n,
@@ -909,7 +1007,7 @@ impl<'a> Walker<'a> {
                         ));
                     }
                     // without a block it is a command (`say find the <key>:`), as in the reference
-                    if !comment && !n.children.is_empty() && l.ends_with(">:") {
+                    if !comment && !n.children.is_empty() && l.ends_with(">:") && !self.lang {
                         return Err(syntax(
                             self,
                             format!(
@@ -959,6 +1057,9 @@ struct Parser<'s, 'e> {
     s: &'s str,
     i: usize,
     depth: usize,
+    /// Parsing the operand `and`/`or` short-circuits past: syntax is still checked (as Python
+    /// compiles the whole expression), nothing is looked up, computed or charged.
+    dead: bool,
     root: &'e Map<String, Value>,
     locals: &'e [(String, Value)],
     reads: &'e mut BTreeSet<String>,
@@ -972,7 +1073,8 @@ fn is_word(b: u8) -> bool {
 /// Approximate size of a value in bytes (what a copy of it costs).
 fn weight(v: &Value) -> usize {
     match v {
-        Value::String(s) => s.len(),
+        // every value costs at least 8: a list of 10k `""` is not free to scan
+        Value::String(s) => 8 + s.len(),
         Value::Array(a) => a.iter().map(weight).sum::<usize>() + 8,
         Value::Object(m) => m.iter().map(|(k, v)| k.len() + weight(v)).sum::<usize>() + 8,
         _ => 8,
@@ -1066,7 +1168,7 @@ impl<'e> Parser<'_, 'e> {
             self.i,
             Code::TemplateExpr,
             format!(
-                "unsupported syntax `{}`: templates evaluate names, numbers, strings, `[..]`, parentheses and `+ - *` (port the rest to a generator)",
+                "unsupported syntax `{}`: templates evaluate names, numbers, strings, f-strings, `[..]`, parentheses, `+ - *`, comparisons, `in`, `and`/`or`/`not` and a few calls (port the rest to a generator)",
                 &rest[..n]
             ),
         )
@@ -1081,8 +1183,123 @@ impl<'e> Parser<'_, 'e> {
         Err(self.unsupported())
     }
 
-    fn expr(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
+    /// The keyword `word` at the cursor (whole word): consumed.
+    fn kw(&mut self, word: &str) -> bool {
+        self.ws();
+        let end = self.i + word.len();
+        let hit = self.s[self.i..].starts_with(word)
+            && !self.s.as_bytes().get(end).is_some_and(|c| is_word(*c));
+        if hit {
+            self.i = end;
+        }
+        hit
+    }
+
+    /// `f` parsed with [`Parser::dead`] set when `skip`.
+    fn skipping<T>(&mut self, skip: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let was = self.dead;
+        self.dead |= skip;
+        let r = f(self);
+        self.dead = was;
+        r
+    }
+
+    /// A whole expression (Python's `or_test`): `or` and `and` return an operand and skip
+    /// the right one when the left decides.
+    fn test(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
         self.enter()?;
+        let mut v = self.and()?;
+        while self.kw("or") {
+            let skip = !self.dead && truthy(&v);
+            let r = self.skipping(skip, Self::and)?;
+            if !skip {
+                v = r;
+            }
+        }
+        self.depth -= 1;
+        Ok(v)
+    }
+
+    fn and(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
+        let mut v = self.not()?;
+        while self.kw("and") {
+            let skip = !self.dead && !truthy(&v);
+            let r = self.skipping(skip, Self::not)?;
+            if !skip {
+                v = r;
+            }
+        }
+        Ok(v)
+    }
+
+    fn not(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
+        if !self.kw("not") {
+            return self.comparison();
+        }
+        self.enter()?;
+        let v = self.not()?;
+        self.depth -= 1;
+        Ok(Cow::Owned(Value::Bool(!truthy(&v))))
+    }
+
+    /// The comparison operator at the cursor, consumed.
+    fn comp_op(&mut self) -> Option<&'static str> {
+        self.ws();
+        let op = match &self.s.as_bytes()[self.i..] {
+            [b'=', b'=', ..] => "==",
+            [b'!', b'=', ..] => "!=",
+            [b'<', b'=', ..] => "<=",
+            [b'>', b'=', ..] => ">=",
+            [b'<', b'<', ..] | [b'>', b'>', ..] => return None,
+            [b'<', ..] => "<",
+            [b'>', ..] => ">",
+            _ => {
+                let at = self.i;
+                if self.kw("in") {
+                    return Some("in");
+                }
+                if self.kw("not") && self.kw("in") {
+                    return Some("not in");
+                }
+                self.i = at;
+                return None;
+            }
+        };
+        self.i += op.len();
+        Some(op)
+    }
+
+    /// `a op b`, one operator: it reads both sides, so it costs their size ([`COPY_BYTES`]),
+    /// a dict's key lookup only the key.
+    fn comparison(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
+        let a = self.arith()?;
+        self.ws();
+        let at = self.i;
+        let Some(op) = self.comp_op() else {
+            return Ok(a);
+        };
+        let b = self.arith()?;
+        self.ws();
+        let chain = self.i;
+        if self.comp_op().is_some() {
+            return Err(self.err(
+                chain,
+                Code::TemplateExpr,
+                "chained comparisons are not supported (join them with `and`)",
+            ));
+        }
+        if self.dead {
+            return Ok(Cow::Owned(Value::Null));
+        }
+        match (op, &*b) {
+            ("in" | "not in", Value::Object(_)) => self.charge(weight(&a))?,
+            _ => self.charge(weight(&a) + weight(&b))?,
+        }
+        let r = compare(op, &a, &b).map_err(|m| self.err(at, Code::TemplateExpr, m))?;
+        Ok(Cow::Owned(Value::Bool(r)))
+    }
+
+    fn arith(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
         let mut v = self.term()?;
         loop {
             self.ws();
@@ -1093,20 +1310,22 @@ impl<'e> Parser<'_, 'e> {
             };
             self.i += 1;
             let r = self.term()?;
-            v = self.arith(at, op, &v, &r)?;
+            v = self.binary(at, op, &v, &r)?;
         }
-        self.depth -= 1;
         Ok(v)
     }
 
     /// `a op b`, charged by the size of the result.
-    fn arith(
+    fn binary(
         &mut self,
         at: usize,
         op: u8,
         a: &Value,
         b: &Value,
     ) -> Result<Cow<'e, Value>, ExprErr> {
+        if self.dead {
+            return Ok(Cow::Owned(Value::Null));
+        }
         let v = arith(op, a, b).map_err(|(code, m)| self.err(at, code, m))?;
         self.charge(weight(&v))?;
         Ok(Cow::Owned(v))
@@ -1122,7 +1341,7 @@ impl<'e> Parser<'_, 'e> {
             }
             self.i += 1;
             let r = self.unary()?;
-            v = self.arith(at, b'*', &v, &r)?;
+            v = self.binary(at, b'*', &v, &r)?;
         }
         Ok(v)
     }
@@ -1137,6 +1356,9 @@ impl<'e> Parser<'_, 'e> {
         self.i += 1;
         let v = self.unary()?;
         self.depth -= 1;
+        if self.dead {
+            return Ok(Cow::Owned(Value::Null));
+        }
         let bad = |v: &Value| format!("bad operand type for unary {}: '{}'", op as char, ty(v));
         match (num(&v), op) {
             (Some(Num::I(i)), b'-') => i
@@ -1154,15 +1376,23 @@ impl<'e> Parser<'_, 'e> {
         let mut v = self.primary()?;
         loop {
             self.ws();
-            if self.peek() != Some(b'[') {
-                return Ok(v);
-            }
             let at = self.i;
+            match self.peek() {
+                Some(b'[') => {}
+                Some(b'.') => {
+                    v = self.method(v)?;
+                    continue;
+                }
+                _ => return Ok(v),
+            }
             self.enter()?;
             self.i += 1;
-            let k = self.expr()?;
+            let k = self.test()?;
             self.expect(b']')?;
             self.depth -= 1;
+            if self.dead {
+                continue;
+            }
             v = match v {
                 Cow::Borrowed(v) => index(v, &k).map(Cow::Borrowed),
                 // computed values are small (numbers, short strings): not subscriptable anyway
@@ -1170,6 +1400,142 @@ impl<'e> Parser<'_, 'e> {
             }
             .map_err(|m| self.err(at, Code::TemplateExpr, m))?;
         }
+    }
+
+    /// `(` [expr] `)` at the cursor: the argument, if any (one at most).
+    fn args(&mut self) -> Result<Option<Cow<'e, Value>>, ExprErr> {
+        self.expect(b'(')?;
+        self.enter()?;
+        self.ws();
+        let a = match self.peek() {
+            Some(b')') => None,
+            _ => Some(self.test()?),
+        };
+        self.expect(b')')?;
+        self.depth -= 1;
+        Ok(a)
+    }
+
+    /// `name(arg)` (`recv` = `None`) or `recv.name(arg)`, from [`call`]: it reads its inputs
+    /// and builds its result, so it costs both.
+    fn call(
+        &mut self,
+        at: usize,
+        name: &str,
+        recv: Option<&Value>,
+        arg: Option<&Value>,
+    ) -> Result<Cow<'e, Value>, ExprErr> {
+        if self.dead {
+            return Ok(Cow::Owned(Value::Null));
+        }
+        self.charge(recv.map_or(0, weight) + arg.map_or(0, weight))?;
+        let r = call(name, recv, arg).map_err(|(code, m)| self.err(at, code, m))?;
+        self.charge(weight(&r))?;
+        Ok(Cow::Owned(r))
+    }
+
+    /// `.name(..)` on `v`, the cursor on the `.`.
+    fn method(&mut self, v: Cow<'e, Value>) -> Result<Cow<'e, Value>, ExprErr> {
+        let at = self.i;
+        self.i += 1;
+        self.ws();
+        let b = self.s.as_bytes();
+        let end = self.i + b[self.i..].iter().take_while(|c| is_word(**c)).count();
+        let name = &self.s[self.i..end];
+        if !METHODS.contains(&name) {
+            return Err(self.err(
+                at,
+                Code::TemplateExpr,
+                format!(
+                    "unsupported method `.{name}`: templates call only {}",
+                    METHODS.join(", ")
+                ),
+            ));
+        }
+        self.i = end;
+        let arg = self.args()?;
+        self.call(at, name, Some(&v), arg.as_deref())
+    }
+
+    /// `f'..{expr}..'`, the cursor on the quote: holes are whole expressions (Python 3.12, so
+    /// their strings may reuse the quote), printed like `str()`; `{{`/`}}` are braces.
+    fn fstring(&mut self, at: usize) -> Result<Cow<'e, Value>, ExprErr> {
+        let q = self.s.as_bytes()[self.i] as char;
+        self.i += 1;
+        let mut out = String::new();
+        // checked before anything is copied: a huge literal fails here, not after building
+        let push = |p: &Self, out: &mut String, s: &str| match out.len() + s.len() {
+            n if n > MAX_VALUE_BYTES => Err(p.err(
+                at,
+                Code::TemplateLimit,
+                format!("string longer than {MAX_VALUE_BYTES} bytes"),
+            )),
+            _ => {
+                if !p.dead {
+                    out.push_str(s);
+                }
+                Ok(())
+            }
+        };
+        loop {
+            let rest = &self.s[self.i..];
+            let Some(j) = rest.find([q, '\\', '{', '}']) else {
+                return Err(self.err(at, Code::TemplateExpr, "unterminated string"));
+            };
+            push(self, &mut out, &rest[..j])?;
+            let c = rest.as_bytes()[j];
+            self.i += j + 1;
+            match c {
+                b'\\' => {
+                    return Err(self.err(
+                        self.i - 1,
+                        Code::TemplateExpr,
+                        "escape sequences in strings are not supported",
+                    ));
+                }
+                b'{' | b'}' if self.peek() == Some(c) => {
+                    self.i += 1;
+                    push(self, &mut out, if c == b'{' { "{" } else { "}" })?;
+                }
+                b'}' => {
+                    return Err(self.err(
+                        self.i - 1,
+                        Code::TemplateExpr,
+                        "single '}' is not allowed in an f-string",
+                    ));
+                }
+                b'{' => {
+                    let v = self.test()?;
+                    self.ws();
+                    match self.peek() {
+                        Some(b'}') => self.i += 1,
+                        Some(b'!' | b':') => {
+                            return Err(self.err(
+                                self.i,
+                                Code::TemplateExpr,
+                                "f-string conversions and format specs are not supported",
+                            ));
+                        }
+                        _ => return Err(self.unsupported()),
+                    }
+                    if !self.dead {
+                        let s = match &*v {
+                            Value::String(s) => Cow::Borrowed(s.as_str()),
+                            v => Cow::Owned(
+                                py_str(v).map_err(|m| self.err(at, Code::TemplateExpr, m))?,
+                            ),
+                        };
+                        push(self, &mut out, &s)?;
+                    }
+                }
+                _ => break, // the closing quote
+            }
+        }
+        if self.dead {
+            return Ok(Cow::Owned(Value::Null));
+        }
+        self.charge(out.len())?;
+        Ok(Cow::Owned(Value::String(out)))
     }
 
     fn primary(&mut self) -> Result<Cow<'e, Value>, ExprErr> {
@@ -1222,16 +1588,40 @@ impl<'e> Parser<'_, 'e> {
                 let end = at + b[at..].iter().take_while(|c| is_word(**c)).count();
                 let w = &self.s[at..end];
                 if matches!(b.get(end), Some(b'\'' | b'"')) {
+                    if w == "f" {
+                        self.i = end;
+                        return self.fstring(at);
+                    }
                     return Err(self.err(
                         at,
                         Code::TemplateExpr,
-                        format!("unsupported string prefix `{w}` (f-strings are not evaluated)"),
+                        format!("unsupported string prefix `{w}` (only `f`)"),
                     ));
                 }
                 if KEYWORDS.contains(&w) {
                     return Err(self.unsupported());
                 }
                 self.i = end;
+                self.ws();
+                if self.peek() == Some(b'(') {
+                    // a scope value of that name would shadow the builtin, as in Python
+                    if !BUILTINS.contains(&w) || (!self.dead && self.get(w).is_some()) {
+                        return Err(self.err(
+                            at,
+                            Code::TemplateExpr,
+                            format!(
+                                "unsupported call `{w}(..)`: templates call only {} and the methods {}",
+                                BUILTINS.join(", "),
+                                METHODS.join(", ")
+                            ),
+                        ));
+                    }
+                    let arg = self.args()?;
+                    return self.call(at, w, None, arg.as_deref());
+                }
+                if self.dead {
+                    return Ok(Cow::Owned(Value::Null));
+                }
                 self.get(w).ok_or_else(|| {
                     self.err(at, Code::TemplateExpr, format!("name '{w}' is not defined"))
                 })
@@ -1239,7 +1629,7 @@ impl<'e> Parser<'_, 'e> {
             Some(b'(') => {
                 self.enter()?;
                 self.i += 1;
-                let v = self.expr()?;
+                let v = self.test()?;
                 self.expect(b')')?;
                 self.depth -= 1;
                 Ok(v)
@@ -1252,6 +1642,15 @@ impl<'e> Parser<'_, 'e> {
 enum Num {
     I(i64),
     F(f64),
+}
+
+impl Num {
+    fn f(self) -> f64 {
+        match self {
+            Num::I(i) => i as f64,
+            Num::F(f) => f,
+        }
+    }
 }
 
 fn num(v: &Value) -> Option<Num> {
@@ -1300,11 +1699,7 @@ fn arith(op: u8, a: &Value, b: &Value) -> Result<Value, (Code, String)> {
             .ok_or((Code::TemplateExpr, "integer overflow".into()));
         }
         (Some(x), Some(y)) => {
-            let f = |n: Num| match n {
-                Num::I(i) => i as f64,
-                Num::F(f) => f,
-            };
-            let (x, y) = (f(x), f(y));
+            let (x, y) = (x.f(), y.f());
             match op {
                 b'+' => x + y,
                 b'-' => x - y,
@@ -1344,6 +1739,198 @@ fn index<'v>(v: &'v Value, k: &Value) -> Result<&'v Value, String> {
         (Value::Object(_), k) => Err(format!("KeyError: {} (keys are strings)", ty(k))),
         (v, _) => Err(format!("'{}' object is not subscriptable here", ty(v))),
     }
+}
+
+/// Python's truthiness.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(m) => !m.is_empty(),
+    }
+}
+
+/// Python's `<` family: numbers (bools are 0/1) and strings (code point order = UTF-8 byte
+/// order); `None` = the types do not order.
+fn py_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
+        _ => match (num(a)?, num(b)?) {
+            (Num::I(x), Num::I(y)) => Some(x.cmp(&y)),
+            (x, y) => x.f().partial_cmp(&y.f()),
+        },
+    }
+}
+
+/// Python's `==`: `1 == 1.0 == True`, containers element-wise, other types differ (no error).
+fn py_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| py_eq(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| py_eq(v, w)))
+        }
+        (Value::Null, Value::Null) => true,
+        (Value::String(x), Value::String(y)) => x == y,
+        _ => {
+            num(a).is_some() && num(b).is_some() && py_cmp(a, b) == Some(std::cmp::Ordering::Equal)
+        }
+    }
+}
+
+/// `x in hay`: substring, list element, dict key.
+fn contains(hay: &Value, x: &Value) -> Result<bool, String> {
+    match (hay, x) {
+        (Value::String(h), Value::String(x)) => Ok(h.contains(x.as_str())),
+        (Value::String(_), x) => Err(format!(
+            "'in <string>' requires string as left operand, not {}",
+            ty(x)
+        )),
+        (Value::Array(h), x) => Ok(h.iter().any(|e| py_eq(e, x))),
+        (Value::Object(m), Value::String(k)) => Ok(m.contains_key(k)),
+        (Value::Object(_), Value::Array(_) | Value::Object(_)) => {
+            Err(format!("unhashable type: '{}'", ty(x)))
+        }
+        // JSON keys are strings: no other value is one
+        (Value::Object(_), _) => Ok(false),
+        (h, _) => Err(format!("argument of type '{}' is not iterable", ty(h))),
+    }
+}
+
+fn compare(op: &str, a: &Value, b: &Value) -> Result<bool, String> {
+    use std::cmp::Ordering::{Greater, Less};
+    let ord = || {
+        py_cmp(a, b).ok_or_else(|| {
+            format!(
+                "'{op}' not supported between instances of '{}' and '{}'",
+                ty(a),
+                ty(b)
+            )
+        })
+    };
+    Ok(match op {
+        "==" => py_eq(a, b),
+        "!=" => !py_eq(a, b),
+        "<" => ord()? == Less,
+        "<=" => ord()? != Greater,
+        ">" => ord()? == Greater,
+        ">=" => ord()? != Less,
+        "in" => contains(b, a)?,
+        _ => !contains(b, a)?,
+    })
+}
+
+/// String methods a template may call (one argument for the first two, none for the rest).
+const METHODS: &[&str] = &["startswith", "endswith", "capitalize", "upper", "lower"];
+/// Builtins a template may call, with one argument.
+const BUILTINS: &[&str] = &["len", "str", "int"];
+
+/// `recv.name(arg)` ([`METHODS`]) or `name(arg)` ([`BUILTINS`]), as Python computes them on
+/// JSON data; strings stay under [`MAX_VALUE_BYTES`].
+fn call(name: &str, recv: Option<&Value>, arg: Option<&Value>) -> Result<Value, (Code, String)> {
+    fn expr<T>(m: String) -> Result<T, (Code, String)> {
+        Err((Code::TemplateExpr, m))
+    }
+    let long = |n: usize| match n > MAX_VALUE_BYTES {
+        true => Err((
+            Code::TemplateLimit,
+            format!("string longer than {MAX_VALUE_BYTES} bytes"),
+        )),
+        false => Ok(()),
+    };
+    let Some(recv) = recv else {
+        let Some(x) = arg else {
+            return expr(format!(
+                "{name}() takes exactly one argument here (0 given)"
+            ));
+        };
+        return match (name, x) {
+            ("len", Value::String(s)) => Ok(Value::from(s.chars().count())),
+            ("len", Value::Array(a)) => Ok(Value::from(a.len())),
+            ("len", Value::Object(m)) => Ok(Value::from(m.len())),
+            ("len", x) => expr(format!("object of type '{}' has no len()", ty(x))),
+            ("str", x) => py_str(x).or_else(expr).map(Value::String),
+            (_, Value::String(s)) => {
+                // ponytail: ASCII digits and a sign; Python also takes `_` and other digits
+                let t = s.trim();
+                let d = t.strip_prefix(['+', '-']).unwrap_or(t);
+                match !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) {
+                    true => t
+                        .parse::<i64>()
+                        .map(Value::from)
+                        .or_else(|_| expr("integer too large".into())),
+                    false => expr(format!(
+                        "invalid literal for int() with base 10: '{}'",
+                        clip(s)
+                    )),
+                }
+            }
+            (_, x) => match num(x) {
+                Some(Num::I(i)) => Ok(Value::from(i)),
+                // in range: the cast saturates nothing
+                Some(Num::F(f)) if f.abs() < 9.2e18 => Ok(Value::from(f.trunc() as i64)),
+                Some(Num::F(_)) => expr("integer too large".into()),
+                None => expr(format!(
+                    "int() argument must be a string or a real number, not '{}'",
+                    ty(x)
+                )),
+            },
+        };
+    };
+    let Value::String(s) = recv else {
+        return expr(format!("'{}' object has no attribute '{name}'", ty(recv)));
+    };
+    match (name, arg) {
+        ("startswith" | "endswith", Some(Value::String(p))) => Ok(Value::Bool(match name {
+            "startswith" => s.starts_with(p.as_str()),
+            _ => s.ends_with(p.as_str()),
+        })),
+        ("startswith" | "endswith", Some(x)) => {
+            expr(format!("{name} first arg must be str here, not {}", ty(x)))
+        }
+        ("startswith" | "endswith", None) => expr(format!(
+            "{name}() takes exactly one argument here (0 given)"
+        )),
+        (_, Some(_)) => expr(format!("{name}() takes no arguments (1 given)")),
+        _ => {
+            long(s.len())?;
+            let r = match name {
+                "upper" => s.to_uppercase(),
+                "lower" => s.to_lowercase(),
+                _ => capitalize(s).or_else(expr)?,
+            };
+            long(r.len())?;
+            Ok(Value::String(r))
+        }
+    }
+}
+
+/// Python's `str.capitalize`: the first char titlecased, the rest lowercased in the context of
+/// the whole string (a final sigma). Rust has uppercase only: a first char whose titlecase may
+/// differ (digraphs, Georgian, anything uppercasing to several chars) is an error.
+fn capitalize(s: &str) -> Result<String, String> {
+    let Some(c) = s.chars().next() else {
+        return Ok(String::new());
+    };
+    let mut up = c.to_uppercase();
+    let (Some(u), None) = (up.next(), up.next()) else {
+        return Err(format!(
+            "capitalize() of a string starting with {c:?} is not supported"
+        ));
+    };
+    if matches!(c, '\u{1C4}'..='\u{1CC}' | '\u{1F1}'..='\u{1F3}' | '\u{10D0}'..='\u{10FF}') {
+        return Err(format!(
+            "capitalize() of a string starting with {c:?} is not supported"
+        ));
+    }
+    let lower = s.to_lowercase();
+    // `c` lowercases alone the same way (a first char is never a final sigma)
+    let skip: usize = c.to_lowercase().map(char::len_utf8).sum();
+    Ok(format!("{u}{}", &lower[skip..]))
 }
 
 /// Python's `str()` of a JSON value; lists and objects have no single-line form here.
@@ -1402,13 +1989,14 @@ mod tests {
             },
             files: vec![],
             dests: BTreeMap::new(),
+            lang: false,
             modified: false,
             unpacked: false,
             lines: 0,
             bytes: 0,
             steps: 0,
         };
-        w.eval(e).map_err(|x| x.msg).and_then(|v| py_str(&v))
+        w.eval(e, false).map_err(|x| x.msg).and_then(|v| py_str(&v))
     }
 
     #[test]
@@ -1452,11 +2040,14 @@ mod tests {
         for bad in [
             "i / 2",
             "i if t else 0",
-            "a.upper()",
-            "f'{a}'",
-            "i == 7",
+            "a.strip()",
+            "a.upper",
+            "r'{a}'",
+            "i is 7",
+            "1 < i < 9",
             "i ** 2",
-            "len(l)",
+            "max(l)",
+            "i << 1",
             "l[3]",
             "m['q']",
             "a - 'b'",
@@ -1537,5 +2128,299 @@ mod tests {
             ]
         );
         assert!(x.files[0].line_map[1].computed && !x.files[0].line_map[0].computed);
+    }
+
+    /// Expected values from CPython 3.12 (`str(eval(e, scope))`).
+    fn table() -> Value {
+        json!({"z": 0, "f": 0.0, "e": "", "l": [], "m": {}, "n": null, "one": 1, "s": "x",
+            "big": [1], "big2": [1.0], "d": {"k": 1}, "d2": {"k": 1.0}, "t": true})
+    }
+
+    #[test]
+    fn truthiness_and_short_circuit() {
+        for (x, want) in [
+            ("z or 'y'", "y"),
+            ("s or nope", "x"), // never evaluated: no NameError
+            ("z and nope", "0"),
+            ("one and s", "x"),
+            ("e or l or 'last'", "last"),
+            ("z or e or n", "None"),
+            ("e and d['nope']", ""),
+            ("s or d['nope'] or nope.upper()", "x"),
+            ("not z", "True"),
+            ("not s", "False"),
+            ("not not big", "True"),
+            ("not f", "True"),
+            ("not m", "True"),
+            ("not n", "True"),
+            ("not d", "False"),
+            ("not 'a' in s", "True"),
+            ("1 + 1 == 2 and 'k' in d", "True"),
+            ("(z or one) * 3", "3"),
+        ] {
+            assert_eq!(ev(x, table()).as_deref(), Ok(want), "{x}");
+        }
+        // a skipped operand is still parsed: syntax and unsupported constructs are errors
+        for bad in [
+            "s or (1 +)",
+            "s or a.strip()",
+            "z and max(l)",
+            "s or f'{s!r}'",
+        ] {
+            assert!(ev(bad, table()).is_err(), "{bad}");
+        }
+        assert!(
+            ev("s and d['nope']", table())
+                .unwrap_err()
+                .contains("KeyError")
+        );
+    }
+
+    #[test]
+    fn comparisons_and_membership() {
+        for (x, want) in [
+            ("1 == 1.0", "True"),
+            ("t == 1", "True"),
+            ("'1' == 1", "False"),
+            ("'1' != 1", "True"),
+            ("big == big2", "True"),
+            ("d == d2", "True"),
+            ("l == m", "False"),
+            ("n == n", "True"),
+            ("n == 0", "False"),
+            ("2 < 2.5", "True"),
+            ("'a' < 'b'", "True"),
+            ("'B' < 'a'", "True"),
+            ("'é' > 'z'", "True"),
+            ("t >= 1", "True"),
+            ("one <= 1", "True"),
+            ("'b' in 'abc'", "True"),
+            ("'' in ''", "True"),
+            ("1 in big", "True"),
+            ("1.0 in big", "True"),
+            ("t in big", "True"),
+            ("'k' in d", "True"),
+            ("'q' not in d", "True"),
+            ("1 in d", "False"),
+        ] {
+            assert_eq!(ev(x, table()).as_deref(), Ok(want), "{x}");
+        }
+        for (bad, msg) in [
+            (
+                "'a' < 1",
+                "'<' not supported between instances of 'str' and 'int'",
+            ),
+            ("n < 1", "'NoneType' and 'int'"),
+            ("d <= d", "'<=' not supported"),
+            ("1 in 'abc'", "requires string as left operand, not int"),
+            ("l in d", "unhashable type: 'list'"),
+            ("1 in 5", "argument of type 'int' is not iterable"),
+            ("1 in n", "'NoneType' is not iterable"),
+            ("1 < 2 < 3", "chained"),
+        ] {
+            let e = ev(bad, table()).unwrap_err();
+            assert!(e.contains(msg), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn methods_and_builtins() {
+        for (x, want) in [
+            ("'abc'.startswith('ab')", "True"),
+            ("'abc'.endswith('bc')", "True"),
+            ("'hello WORLD'.capitalize()", "Hello world"),
+            ("'éCOLE'.capitalize()", "École"),
+            ("'ΑΣ'.capitalize()", "Ας"),
+            ("''.capitalize()", ""),
+            ("'ß'.upper()", "SS"),
+            ("'ABC'.lower()", "abc"),
+            ("len('héé')", "3"),
+            ("len(big)", "1"),
+            ("len(d)", "1"),
+            ("str(1.0)", "1.0"),
+            ("str(t)", "True"),
+            ("int('  -12 ')", "-12"),
+            ("int(2.9)", "2"),
+            ("int(-2.9)", "-2"),
+            ("int(t)", "1"),
+            ("'a'.upper().startswith('A')", "True"),
+            ("str(len(s)) + 'x'", "1x"),
+            ("s .upper()", "X"),
+            ("len ( s )", "1"),
+        ] {
+            assert_eq!(ev(x, table()).as_deref(), Ok(want), "{x}");
+        }
+        for (bad, msg) in [
+            ("1 .upper()", "'int' object has no attribute 'upper'"),
+            (
+                "int('1.5')",
+                "invalid literal for int() with base 10: '1.5'",
+            ),
+            ("int('x')", "invalid literal"),
+            ("len(1)", "object of type 'int' has no len()"),
+            ("'a'.startswith(1)", "first arg must be str"),
+            ("'a'.upper(1)", "takes no arguments"),
+            ("'ǆa'.capitalize()", "not supported"),
+            ("str(l)", "cannot print a list"),
+            ("len()", "exactly one argument"),
+            ("len(s, s)", "unsupported syntax `,`"),
+            ("'a'.strip()", "unsupported method `.strip`"),
+            ("print(s)", "unsupported call `print(..)`"),
+        ] {
+            let e = ev(bad, table()).unwrap_err();
+            assert!(e.contains(msg), "{bad}: {e}");
+        }
+        // a scope value shadows the builtin, as in Python: calling it is not supported
+        assert!(ev("len(s)", json!({"len": 1, "s": "x"})).is_err());
+    }
+
+    #[test]
+    fn f_strings() {
+        for (x, want) in [
+            ("f'a{s}b'", "axb"),
+            ("f\"{d['k']}\"", "1"),
+            ("f'{d['k']}'", "1"), // Python 3.12: a hole may reuse the quote
+            ("f'{{x}}'", "{x}"),
+            ("f'{one + 1}-{s.upper()}'", "2-X"),
+            ("f''", ""),
+            ("f'{f\"{s}\"}'", "x"),
+            ("f'{ s }'", "x"),
+            ("f'{t}{f}{n}'", "True0.0None"),
+            ("f'{s}' + f'{one}'", "x1"),
+            ("f'{\"}\"}'", "}"),
+        ] {
+            assert_eq!(ev(x, table()).as_deref(), Ok(want), "{x}");
+        }
+        for (bad, msg) in [
+            ("f'{s!r}'", "conversions and format specs"),
+            ("f'{s:>3}'", "conversions and format specs"),
+            ("f'{s=}'", "unsupported syntax"),
+            ("f'{'", "unterminated string"),
+            ("f'{s'", "string prefix"),
+            ("f'{}'", "unsupported syntax"),
+            ("f'}'", "single '}'"),
+            ("f'abc", "unterminated string"),
+            ("f'{l}'", "cannot print a list"),
+            ("f'\\n'", "escape sequences"),
+            ("F'{s}'", "string prefix"),
+        ] {
+            let e = ev(bad, table()).unwrap_err();
+            assert!(e.contains(msg), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn hostile_expressions_are_coded_errors() {
+        let s = || table();
+        let deep =
+            |open: &str, close: &str| format!("{}1{}", open.repeat(5000), close.repeat(5000));
+        for e in [
+            deep("(", ")"),
+            deep("f'{", "}'"),
+            deep("not ", ""),
+            deep("[", "]"),
+            deep("len(", ")"),
+            deep("-", ""),
+            "(".repeat(5000),
+            "f'{".repeat(5000),
+        ] {
+            let x = ev(&e, s());
+            assert!(x.is_err(), "{}", clip(&e));
+        }
+        assert!(
+            ev(&deep("(", ")"), s())
+                .unwrap_err()
+                .contains("nests deeper")
+        );
+        assert!(
+            ev(&deep("f'{", "}'"), s())
+                .unwrap_err()
+                .contains("nests deeper")
+        );
+        assert!(
+            ev(&deep("not ", ""), s())
+                .unwrap_err()
+                .contains("nests deeper")
+        );
+        // method chains are a loop, not recursion
+        let chain = format!("s{}", ".upper()".repeat(5000));
+        assert_eq!(ev(&chain, s()).as_deref(), Ok("X"));
+        // a 1 MB f-string literal fails by the value cap, before it is built
+        let mb = format!("f'{}{{s}}'", "x".repeat(1 << 20));
+        assert!(ev(&mb, s()).unwrap_err().contains("longer than"));
+    }
+
+    fn lang(text: &str, scope: Value) -> Result<Expansion, Diagnostic> {
+        expand(
+            text,
+            &scope,
+            &RelPath::parse("src/m/texts/en_US.lang").unwrap(),
+            &RelPath::parse("texts/en_US.lang").unwrap(),
+        )
+    }
+
+    #[test]
+    fn lang_templates() {
+        // the function headers, `UNPACK:*` and `functiontree` are text in a `.lang`; `##` stays
+        let plain = "UNPACK:SUBFUNCTION\nfunction <a>:\ndefinefunction <b>:\n## note\na=b\t## c\n";
+        let x = lang(plain, json!({})).unwrap();
+        assert!(!x.modified && x.files.is_empty());
+        assert!(!has_lang_subfunctions(plain));
+        assert!(!has_lang_subfunctions(
+            "key=Press <E>:\nk2=`eval` x\n# for <i 0..2>:\n"
+        ));
+        assert!(has_lang_subfunctions("foreach <i v l>:\n  k=v\n"));
+        assert!(has_lang_subfunctions("k=`eval:1`\n"));
+        let x = lang(
+            "## head\nfor <i 0..2>:\n    k.`eval:i`=`eval:i * 2`\nif <'a' in s and not z>:\n  ok=`eval:s.capitalize()`\nif <z>:\n  no=1\n",
+            json!({"s": "abc", "z": 0}),
+        )
+        .unwrap();
+        assert_eq!(x.files.len(), 1);
+        assert_eq!(x.files[0].dest.as_str(), "texts/en_US.lang");
+        assert_eq!(x.files[0].text, "## head\nk.0=0\nk.1=2\nok=Abc");
+        // a header with a block is still an error (unexpected indentation), as in the reference
+        let e = lang("function <a>:\n  x=1\nfor <i 0..1>:\n  y=1", json!({})).unwrap_err();
+        assert_eq!(
+            (e.code, e.span.unwrap().line),
+            (Code::TemplateSyntax, Some(1))
+        );
+    }
+
+    #[test]
+    fn if_blocks() {
+        let x = run(
+            "UNPACK:SUBFUNCTION\nforeach <i b blocks>:\n    if <b.startswith('a:')>:\n        definefunction <f`eval:i`>:\n            say `eval:b`\n    if <i == 0>:",
+            json!({"blocks": ["a:x", "b:y", "a:z"]}),
+        )
+        .unwrap();
+        let t: Vec<_> = x
+            .files
+            .iter()
+            .map(|f| (f.dest.as_str(), f.text.as_str()))
+            .collect();
+        assert_eq!(
+            t,
+            [
+                ("functions/m/t/f0.mcfunction", "say a:x"),
+                ("functions/m/t/f2.mcfunction", "say a:z")
+            ]
+        );
+        // the reference matches `if <(.+)>:` greedily: `>` inside the condition is fine
+        let x = run("if <2 > 1 >:\n  say y", json!({})).unwrap();
+        assert_eq!(x.files[0].text, "say y");
+        // `var` inside an `if` ends with it (lexical)
+        let e = run("if <1>:\n  var v = 1\nsay `eval:v`", json!({})).unwrap_err();
+        assert_eq!(
+            (e.code, e.span.unwrap().line),
+            (Code::TemplateExpr, Some(3))
+        );
+        // the condition's error points into it
+        let e = run("say a\nif <1 < 'a'>:\n  say b", json!({})).unwrap_err();
+        let sp = e.span.unwrap();
+        assert_eq!(
+            (e.code, sp.line, sp.column),
+            (Code::TemplateExpr, Some(2), Some(7))
+        );
     }
 }

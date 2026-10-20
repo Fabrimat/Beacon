@@ -1,0 +1,2 @@
+for <i 0..`eval:waves`>:
+    golem.wave`eval:i`=`eval:label` wave `eval:i`

@@ -398,11 +398,18 @@ struct Scanned {
 /// through its expansion ([`scan_template`]); one that does not expand (a syntax error) has no
 /// symbols and carries its diagnostic.
 fn scan_file(path: &RelPath, dest: Option<&RelPath>, text: &str, scope: &Value) -> Scanned {
-    let base = dest
-        .and_then(|d| d.as_str().strip_prefix("BP/"))
-        .and_then(|d| RelPath::parse(d).ok())
-        .filter(|_| classify(path) == FileClass::McFunction && template::has_subfunctions(text));
-    let Some(base) = base else {
+    let class = classify(path);
+    let split = dest.and_then(|d| {
+        let d = d.as_str();
+        let pack = d.get(..3).filter(|p| matches!(*p, "BP/" | "RP/"))?;
+        Some((pack, RelPath::parse(&d[3..]).ok()?))
+    });
+    let base = split.filter(|(pack, _)| match class {
+        FileClass::McFunction => *pack == "BP/" && template::has_subfunctions(text),
+        FileClass::Lang => template::has_lang_subfunctions(text),
+        _ => false,
+    });
+    let Some((pack, base)) = base else {
         return Scanned {
             occs: scan(path, dest, text),
             ..Scanned::default()
@@ -410,7 +417,7 @@ fn scan_file(path: &RelPath, dest: Option<&RelPath>, text: &str, scope: &Value) 
     };
     match template::expand(text, scope, path, &base) {
         Ok(x) if x.modified => {
-            let (occs, anchors) = scan_template(text, &x.files, &base);
+            let (occs, anchors) = scan_template(text, &x.files, &base, pack);
             Scanned {
                 occs,
                 anchors,
@@ -467,6 +474,7 @@ fn scan_template(
     text: &str,
     files: &[template::Expanded],
     base: &RelPath,
+    pack: &str,
 ) -> (Vec<Occurrence>, Vec<Option<ByteRange>>) {
     let src_starts = line_starts(text);
     let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
@@ -478,12 +486,17 @@ fn scan_template(
     let headers = header_names(text);
     let mut all: Vec<(Occurrence, Option<ByteRange>)> = Vec::new();
     for f in files {
-        let Ok(dest) = RelPath::parse(&format!("BP/{}", f.dest)) else {
+        let Ok(dest) = RelPath::parse(&format!("{pack}{}", f.dest)) else {
             continue;
+        };
+        let found = if classify(&dest) == FileClass::Lang {
+            scan_lang(&f.text, true)
+        } else {
+            scan_mcfunction(&f.text, Some(&dest))
         };
         let out_starts = line_starts(&f.text);
         let mut same_at: Option<(usize, usize)> = None;
-        for mut o in scan_mcfunction(&f.text, Some(&dest)) {
+        for mut o in found {
             let mut anchor = None;
             if let Some(r) = o.range {
                 o.range = None;
@@ -999,8 +1012,14 @@ impl SymbolTable {
         }
         for i in &routed.items {
             module_out.entry(&i.module).or_insert(&i.dest.output);
-            let Body::Passthrough(src) = &i.body else {
-                continue;
+            // an expanded `.lang` template left `items` as text; scan its source at its route
+            let lang_tpl = matches!(i.body, Body::Text(_))
+                && i.dest.path.as_str().ends_with(".lang")
+                && classify(&i.origin) == FileClass::Lang;
+            let src = match &i.body {
+                Body::Passthrough(src) => src,
+                _ if lang_tpl => &i.origin,
+                _ => continue,
             };
             if classify(src) == FileClass::Other {
                 continue;

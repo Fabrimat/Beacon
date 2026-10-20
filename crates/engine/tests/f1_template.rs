@@ -1,5 +1,5 @@
-//! `.mcfunction` templates: reference parity (fixtures), every diagnostic class, caps, and the
-//! build stage (untrusted, collisions, ledger, determinism).
+//! `.mcfunction` and `.lang` templates: reference parity (fixtures), every diagnostic class,
+//! caps, and the build stage (untrusted, collisions, ledger, lang merge, determinism).
 
 mod b1_common;
 use b1_common::{errors, has, opts, project, rp, session, write};
@@ -39,29 +39,33 @@ fn tree(dir: &Path) -> BTreeMap<String, String> {
 
 #[test]
 fn fixtures_match_the_reference() {
-    for case in ["init", "warp", "story", "xp_bar"] {
+    for case in [
+        "init",
+        "warp",
+        "story",
+        "xp_bar",
+        "letters",
+        "lang_keys",
+        "lang_if",
+    ] {
         let dir = fixtures().join(case);
         let scope: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("scope.json")).unwrap())
                 .unwrap();
+        // `.lang` cases: `texts/<name>.lang`, written in place
+        let (sub, out) = match dir.join("texts").is_dir() {
+            true => ("texts", "texts".to_owned()),
+            false => ("functions", format!("functions/{case}")),
+        };
         let mut got = BTreeMap::new();
-        for (name, text) in tree(&dir.join("functions")) {
-            let src = rp(&format!("src/{case}/functions/{name}"));
-            let x = expand(
-                &text,
-                &scope,
-                &src,
-                &rp(&format!("functions/{case}/{name}")),
-            )
-            .unwrap_or_else(|d| panic!("{case}: {d:?}"));
+        for (name, text) in tree(&dir.join(sub)) {
+            let src = rp(&format!("src/{case}/{sub}/{name}"));
+            let x = expand(&text, &scope, &src, &rp(&format!("{out}/{name}")))
+                .unwrap_or_else(|d| panic!("{case}: {d:?}"));
             assert!(x.modified, "{case}");
             for f in x.files {
                 assert_eq!(f.line_map.len(), f.text.split('\n').count(), "{}", f.dest);
-                let rel = f
-                    .dest
-                    .as_str()
-                    .strip_prefix(&format!("functions/{case}/"))
-                    .unwrap();
+                let rel = f.dest.as_str().strip_prefix(&format!("{out}/")).unwrap();
                 got.insert(rel.to_owned(), f.text);
             }
         }
@@ -111,7 +115,6 @@ fn syntax_diagnostics() {
     assert_eq!(syn("for <i 0..2>:\n  function <same>:\n    say a"), (2, 3)); // defined twice
     assert_eq!(syn("var a = 1\n  say a"), (1, 1));
     for unsupported in [
-        "if <x>:\n  say a",
         "functiontree <f><@s s 0..4>:\n  say a",
         "UNPACK:HERE",
         "> print(1)",
@@ -141,8 +144,13 @@ fn expression_diagnostics() {
         (l, col)
     };
     assert_eq!(expr("# c\n  # d\nsay `eval:nope`", json!({})), (3, 11));
-    assert_eq!(expr("say `eval: f'{a}'`", json!({"a": 1})), (1, 12));
-    assert_eq!(expr("say `eval:a.upper()`", json!({"a": "x"})), (1, 12));
+    assert_eq!(expr("say `eval: f'{a!r}'`", json!({"a": 1})), (1, 16));
+    assert_eq!(expr("say `eval:a.strip()`", json!({"a": "x"})), (1, 12));
+    assert_eq!(
+        expr("say a\nif <a < 1>:\n  say b", json!({"a": "x"})),
+        (2, 7)
+    );
+    assert_eq!(expr("if <x>:\n  say a", json!({})), (1, 5));
     assert_eq!(expr("say `eval:a / 2`", json!({"a": 2})), (1, 13));
     assert_eq!(expr("say `eval:m['k']`", json!({"m": {}})), (1, 12));
     assert_eq!(expr("say `eval:l`", json!({"l": [1]})), (1, 11));
@@ -407,4 +415,134 @@ fn long_lines_cost_steps() {
         ),
         json!({}),
     );
+}
+
+#[test]
+fn new_constructs_stay_bounded() {
+    // every value weighs something: scanning or copying 10k empty strings is not free
+    let empties = || json!({ "big": vec![""; 10_000] });
+    limit_fast(
+        "for <a 0..10000>:\n  if <'z' in big>:\n    say x",
+        empties(),
+    );
+    limit_fast(
+        "for <a 0..10000>:\n  if <big != big>:\n    say x",
+        empties(),
+    );
+    limit_fast(&"var t = big\n".repeat(100_000), empties());
+    // an `if` with a long condition inside nested loops
+    let cond = vec!["s == s"; 2000].join(" and ");
+    limit_fast(
+        &format!("for <a 0..10000>:\n  for <b 0..100>:\n    if <{cond}>:\n      say x"),
+        json!({ "s": "x".repeat(200_000) }),
+    );
+    // `in` over a large list, in a loop
+    let big: Vec<u32> = (0..10_000).collect();
+    limit_fast(
+        "for <a 0..10000>:\n  if <9999 in big and 'k' not in big>:\n    say x",
+        json!({ "big": big }),
+    );
+    // a 1 MB f-string literal, and one doubled in a loop
+    limit_fast(&format!("say `eval:f'{}'`", "x".repeat(1 << 20)), json!({}));
+    let doubling = format!("var s = 'ab'\n{}", "var s = f'{s}{s}'\n".repeat(30));
+    limit_fast(&doubling, json!({}));
+    // 5k parentheses in an `if`, 5k `not`s, an unterminated hole: coded, no stack overflow
+    let (c, ..) = fail(
+        &format!("if <{}1{}>:\n  say a", "(".repeat(5000), ")".repeat(5000)),
+        json!({}),
+    );
+    assert_eq!(c, Code::TemplateLimit);
+    let (c, ..) = fail(
+        &format!("if <{}1>:\n  say a", "not ".repeat(5000)),
+        json!({}),
+    );
+    assert_eq!(c, Code::TemplateLimit);
+    let (c, ..) = fail("say `eval:f'{1'`", json!({}));
+    assert_eq!(c, Code::TemplateExpr);
+    // a dict key lookup reads only the key: cheap in a loop
+    let m: serde_json::Map<String, Value> = (0..10_000)
+        .map(|i| (format!("{i:0>100}"), json!(i)))
+        .collect();
+    let out = run(
+        "for <i 0..10000>:\n  if <'k' in m or i == 0>:\n    say `eval:i`",
+        json!({ "m": m }),
+    )
+    .unwrap();
+    assert_eq!(out[0].1, "say 0");
+}
+
+const LANG: &str = "## generated\nforeach <i c crops>:\n    item.demo:`eval:c`=`eval:c.capitalize()`\nplain.key=x\n";
+
+fn rp_lang(root: &Path) -> String {
+    std::fs::read_to_string(root.join("out/main/RP/texts/en_US.lang")).unwrap()
+}
+
+#[test]
+fn lang_templates_merge_and_report_duplicates_at_the_source() {
+    let p = project(&[
+        ("src/t/texts/en_US.lang", LANG),
+        ("src/t/scope.json", "{\"crops\": [\"wheat\", \"carrot\"]}"),
+    ]);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut o = opts(p.path(), None);
+    o.trusted = false;
+    let mut s = session(o, p.path(), &runs);
+    let r = s.build();
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    let text = rp_lang(p.path());
+    for l in [
+        "item.demo:sword=Sword",
+        "## generated",
+        "item.demo:wheat=Wheat",
+        "item.demo:carrot=Carrot",
+        "plain.key=x",
+    ] {
+        assert!(text.lines().any(|x| x == l), "{l}: {text}");
+    }
+    // determinism: a fresh session writes the same bytes
+    let again = session(opts(p.path(), None), p.path(), &runs).build();
+    assert!(errors(&again).is_empty());
+    assert_eq!(rp_lang(p.path()), text);
+
+    // one key generated twice: at the template's source line, and the template ships nothing
+    write(
+        p.path(),
+        "src/t/texts/en_US.lang",
+        "a=1\nfor <i 0..2>:\n    same.key=`eval:i`\n",
+    );
+    let r = s.check();
+    let d = errors(&r);
+    assert_eq!(d.len(), 1, "{d:?}");
+    let span = d[0].span.as_ref().unwrap();
+    assert_eq!(
+        (d[0].code, span.path.as_str(), span.line),
+        (Code::LangDuplicateKey, "src/t/texts/en_US.lang", Some(3))
+    );
+
+    // a generated key another module defines: the lang merge reports it
+    write(p.path(), "src/t/scope.json", "{\"crops\": [\"sword\"]}");
+    write(p.path(), "src/t/texts/en_US.lang", LANG);
+    let r = s.check();
+    assert!(
+        errors(&r).iter().any(|d| d.code == Code::LangDuplicateKey),
+        "{:?}",
+        r.diagnostics
+    );
+
+    // a plain `.lang` that only looks like a template elsewhere is left alone
+    write(
+        p.path(),
+        "src/t/texts/en_US.lang",
+        "k=Press <E>:\n  odd.indent=1\nfunction <x>:\n",
+    );
+    let r = s.build();
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    assert!(rp_lang(p.path()).contains("  odd.indent=1"));
+
+    // lines that read as `var`/`>`/`assert` do not make a `.lang` a template: byte for byte
+    let plain = "var x=3\n> note\nassert foo=1\n\n  k=v \n";
+    write(p.path(), "src/t/texts/en_US.lang", plain);
+    let r = s.build();
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    assert!(rp_lang(p.path()).contains(plain), "{}", rp_lang(p.path()));
 }

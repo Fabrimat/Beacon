@@ -1160,13 +1160,15 @@ phase-3 row:
   (concurrent `stop` entries first, as `MapTs.apply`), case-insensitive source lookup with a
   portability warning, `UNPACK:SUBFUNCTION` folders, the content-guide fields stripped like the
   filter does, `text_replacer` on fragments and script sources (import specifiers kept),
-  subfunctions syntax in `.mcfunction` sources translated or frozen, oracle-gated (Beacon
+  subfunctions syntax in `.mcfunction` and `.lang` sources translated or frozen, oracle-gated (Beacon
   expands the supported subset at build time: a source whose expansion, from a scope rebuilt from
   the static layers `scope.json` + `settings.scope` -> `_group_scope.json` -> `_scope.json`,
   equals the legacy output stays a source and its module gets a `scope.json` of the names it
-  reads (`MigrateTranslated`); anything else, such as an unsupported construct, a scope computed
-  in `_map.py`, conflicting values in one module, or any `.lang`, is frozen from the legacy
-  expansion with the reason listed to port), data-dir `package.json` moved to the root with `file:`
+  reads (`MigrateTranslated`); a `.lang` template is held against the whole legacy file, so only
+  one created by a single source qualifies, a `.lang` merged with other sources or a base file
+  is frozen as it cannot be attributed; anything else, such as an unsupported construct (a dict
+  `foreach`), a scope computed in `_map.py`, or conflicting values in one module, is frozen from
+  the legacy expansion with the reason listed to port), data-dir `package.json` moved to the root with `file:`
   packages vendored under `vendor/`, `scriptModules` from the legacy manifest's `module_name`
   dependencies, `packMeta.packDependencies` from the legacy BP/RP dependency directions.
 - **Build changes made for migration**: bundler externals are exactly `@minecraft/server` plus
@@ -1548,8 +1550,10 @@ Text generation for `.mcfunction` ([BACKLOG B10](BACKLOG.md)), built-in and data
   Dimension-Clash 0 diffs (`init.mcfunction` kept as a source); The-Great-Adventure 11 sources
   translated (the two big story templates, 403 and 396 files, among them) and 12 frozen (scopes
   computed in `_map.py`), still 1 cosmetic diff per edition.
-- **Not yet** (slice 2): `.lang`, `if`, comparisons and `in/and/or/not`, a method allowlist,
-  f-strings.
+- **Slice 2** added `.lang` templates (expander and migrate), `if`, comparisons and
+  `in/and/or/not`, the method allowlist (`startswith`, `endswith`, `capitalize`, `upper`,
+  `lower`) and f-strings. **Still not**: `foreach` over a dict (frozen with a reason; no key
+  order guarantee), scopes computed in `_map.py`, `functiontree` / `UNPACK:HERE`, `assert`, `>`.
 - Found and fixed on the way: a quadratic command-kind scan in `symbols.rs` (one 640 KB
   `.mcfunction` line took ~140 s from an untrusted project) is now linear.
 

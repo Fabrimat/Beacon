@@ -103,6 +103,22 @@
 			}
 		]
 	},
+	"RP/texts/fr_FR.lang": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/fr_FR.lang",
+				"status": "Created."
+			}
+		]
+	},
+	"RP/texts/de_DE.lang": {
+		"sources": [
+			{
+				"path": "data/system_template/golem/de_DE.lang",
+				"status": "Created."
+			}
+		]
+	},
 	"BP/spawn_rules/golem_red.json": {
 		"sources": [
 			{

@@ -1,0 +1,6 @@
+{
+  "crops": ["wheat", "carrot", "beetROOT"],
+  "rounds": 3,
+  "areas": [{"key": "farm", "name": "Farm"}, {"key": "mine", "name": "Mine"}],
+  "difficulties": [{"key": "easy", "name": "Easy"}, {"key": "hard", "name": "Hard"}]
+}

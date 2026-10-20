@@ -1,5 +1,6 @@
 {
 	"label": "Golem",
 	"stack": 8,
-	"waves": 3
+	"waves": 3,
+	"icons": {"alpha": "a.png", "beta": "b.png"}
 }

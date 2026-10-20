@@ -1,0 +1,13 @@
+question.demo.q1=Two plus two?
+hint.demo.q1=Count fingers
+question.demo.q2=Three times three?
+nohint.demo.q2=No hint
+question.demo.q3=Half of ten?
+hint.demo.q3=Split it
+nohint.demo.q3=No hint
+book_1.page0=Once upon a time
+book_1.page1=skip
+book_2.page2=The end
+book.long=3 pages
+debug.hidden=true
+book.count=3 pages, {sic}

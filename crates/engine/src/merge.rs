@@ -266,9 +266,7 @@ fn lang(
             .lines()
             .enumerate()
         {
-            let t = line.trim();
-            if let (false, Some((k, _))) = (t.starts_with('#'), t.split_once('=')) {
-                let k = k.trim();
+            if let Some(k) = lang_key(line) {
                 if let Some(prev) = seen.get(k) {
                     diags.push(
                         Diagnostic::new(
@@ -286,6 +284,15 @@ fn lang(
         }
     }
     Body::Text(lines.iter().map(|l| format!("{l}\n")).collect())
+}
+
+/// The key a `.lang` line defines (`key=value`; not a `#` comment).
+pub(crate) fn lang_key(line: &str) -> Option<&str> {
+    let t = line.trim();
+    match t.starts_with('#') {
+        true => None,
+        false => t.split_once('=').map(|(k, _)| k.trim()),
+    }
 }
 
 /// Removes `//` and `/* */` comments outside strings (newlines kept for line numbers).

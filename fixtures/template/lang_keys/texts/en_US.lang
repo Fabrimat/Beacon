@@ -1,0 +1,17 @@
+## Synthetic lang template: keys from loops
+menu.title=Crop Market
+# a comment keeps `eval:untouched`
+foreach <i crop crops>:
+    item.demo:`eval:crop`_seed=`eval:crop.capitalize()` Seeds
+    var label = crop.upper()
+    tag.demo.`eval:i`=`eval:label` (`eval:len(crop)` letters)
+
+for <round 1..`eval:rounds + 1`>:
+    bar.demo.round`eval:round`=Round `eval:round` of `eval:rounds`
+foreach <_ area areas>:
+    foreach <_ diff difficulties>:
+        bar.demo.`eval:area['key']`.`eval:diff['key']`=`eval:area['name']` - `eval:diff['name']`
+function <not_a_header>:
+definefunction <neither>:
+key.with.lt=Press <E>:
+footer=Done	##

@@ -1,0 +1,19 @@
+foreach <i q questions>:
+    question.demo.`eval:q['id']`=`eval:q['text']`
+    if <'hint' in q and 'hint_alt' in q>:
+        hint.demo.`eval:q['id']`=`eval:q['hint']`
+    if <not 'hint' in q or q['id'] == 'q3'>:
+        nohint.demo.`eval:q['id']`=No hint
+foreach <i page pages>:
+    if <i < 2 >:
+        book_1.page`eval:i`=`eval:page`
+    if <i >= 1 and page != 'skip'>:
+        book_2.page`eval:i`=`eval:page`
+if <len(pages) > 2 and pages[0].startswith('Once')>:
+    book.long=`eval:str(len(pages))` pages
+if <not show_debug>:
+    debug.hidden=true
+if <''>:
+    never.shown=1
+if <show_debug or f'{len(pages)}' == '3'>:
+    book.count=`eval:f'{len(pages)} pages, {{sic}}'`

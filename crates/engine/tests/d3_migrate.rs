@@ -93,7 +93,7 @@ fn round_trip_equals_the_real_output() {
         &plan,
     );
     assert_eq!(rep.diffs, [], "{rep:?}");
-    assert_eq!(rep.compared, 17, "{rep:?}"); // every BP/RP file, manifests without identities
+    assert_eq!(rep.compared, 19, "{rep:?}"); // every BP/RP file, manifests without identities
     // a translated subfunctions source is a plain copy; the build expands it from the module scope
     let src = out.join("src/golem");
     assert_eq!(
@@ -106,14 +106,26 @@ fn round_trip_equals_the_real_output() {
     let scope: serde_json::Value =
         serde_json::from_slice(&std::fs::read(src.join("scope.json")).unwrap()).unwrap();
     assert_eq!(scope, serde_json::json!({"label": "Golem", "waves": 3}));
-    // the unsupported one (`if`) keeps its expansion from the legacy output, children included
+    // `if` is expanded too (B10 slice 2): the gated one is a plain copy as well
     assert_eq!(
-        std::fs::read_to_string(src.join("bp/functions/golem/gated.mcfunction")).unwrap(),
-        "say start
-say has waves
-say end"
+        std::fs::read(src.join("gated.mcfunction")).unwrap(),
+        std::fs::read(
+            fixtures().join("system_template/data/system_template/golem/gated.mcfunction")
+        )
+        .unwrap()
     );
-    assert!(!src.join("bp/functions/golem/waves").exists());
+    assert!(!src.join("bp/functions/golem").exists());
+    // a `.lang` template is translated the same way; the dict `foreach` one keeps the expansion
+    assert_eq!(
+        std::fs::read(src.join("fr_FR.lang")).unwrap(),
+        std::fs::read(fixtures().join("system_template/data/system_template/golem/fr_FR.lang"))
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(src.join("rp/texts/de_DE.lang")).unwrap(),
+        "golem.icon0=alpha
+golem.icon1=beta"
+    );
     assert!(!out.join("src/_generated").exists());
     // the legacy project is untouched and nothing escaped `out`
     assert!(!fixtures().join("system_template/src").exists());
@@ -209,7 +221,7 @@ fn placement_decisions() {
             .any(|e| e.path == "data/st_notes/golem.txt")
     );
     assert!(r.flattened.iter().any(|e| e.path == "BP/items/paint.json"));
-    // to_port: the list comprehension / fan-out of golem
+    // to_port: the list comprehension / fan-out of golem (`gated`'s `if` now translates)
     assert_eq!(
         r.to_port
             .iter()
@@ -222,26 +234,41 @@ fn placement_decisions() {
             ),
             (
                 ToPortKind::SubfunctionSource,
-                "data/system_template/golem/gated.mcfunction".to_string()
+                "data/system_template/golem/de_DE.lang".to_string()
             )
         ]
     );
-    let gated = r
+    let de = r
         .to_port
         .iter()
-        .find(|t| t.path.as_str().ends_with("gated.mcfunction"));
-    assert!(gated.unwrap().why.contains("BCN022"), "{gated:?}");
+        .find(|t| t.path.as_str().ends_with("de_DE.lang"));
+    let why = &de.unwrap().why;
+    assert!(why.contains("iterating a dict"), "{why}");
+    assert!(why.contains("`icons`"), "{why}");
     // translated: copied, its scope names written, the legacy expansion not imported
     assert!(has(
         "src/golem/waves.mcfunction",
         &format!("{d}/golem/waves.mcfunction")
     ));
     assert!(has("src/golem/scope.json", "<write>"));
+    assert!(has(
+        "src/golem/fr_FR.lang",
+        &format!("{d}/golem/fr_FR.lang")
+    ));
+    assert!(!has(
+        "src/golem/de_DE.lang",
+        &format!("{d}/golem/de_DE.lang")
+    ));
     assert!(!c.iter().any(|(t, _)| t.contains("waves/boss")));
     assert!(
         plan.changes
             .iter()
             .any(|c| matches!(c, Change::Note(n) if n.code == Code::MigrateTranslated && n.message.contains("waves.mcfunction")))
+    );
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| matches!(c, Change::Note(n) if n.code == Code::MigrateTranslated && n.message.contains("fr_FR.lang")))
     );
 }
 
@@ -264,6 +291,7 @@ fn plan_is_deterministic() {
         })
         .unwrap();
     assert!(md.contains("GeneratorCandidate"));
+    assert!(md.contains("de_DE.lang"));
     assert!(!md.contains(&t.path().display().to_string()));
 }
 
@@ -533,13 +561,13 @@ fn templates_with_conflicting_scope_values_fall_back() {
     let eval = system_template::ingest(&p, &ev).unwrap();
     let plan = migrate::plan(&p, &eval, &o).unwrap();
     let c = copies(&plan);
-    // `sub/more` sorts first: it owns `waves = 5`; `waves.mcfunction` (3) is frozen
-    assert!(c.iter().any(|(to, _)| to == "src/golem/more.mcfunction"));
+    // `gated` sorts first: it owns `waves = 3`; `sub/more` (5) is frozen, `waves` (3) agrees
+    assert!(c.iter().any(|(to, _)| to == "src/golem/waves.mcfunction"));
     assert!(
         c.iter()
-            .any(|(to, _)| to == "src/golem/bp/functions/golem/waves.mcfunction")
+            .any(|(to, _)| to == "src/golem/bp/functions/golem/more.mcfunction")
     );
-    assert!(!c.iter().any(|(to, _)| to == "src/golem/waves.mcfunction"));
+    assert!(!c.iter().any(|(to, _)| to == "src/golem/more.mcfunction"));
     let scope = plan.changes.iter().find_map(|c| match c {
         Change::Write {
             to,
@@ -547,12 +575,15 @@ fn templates_with_conflicting_scope_values_fall_back() {
         } if to.as_str() == "src/golem/scope.json" => Some(v.clone()),
         _ => None,
     });
-    assert_eq!(scope, Some(serde_json::json!({"waves": 5})));
+    assert_eq!(
+        scope,
+        Some(serde_json::json!({"label": "Golem", "waves": 3}))
+    );
     let why = plan
         .report
         .to_port
         .iter()
-        .find(|t| t.path.as_str().ends_with("golem/waves.mcfunction"))
+        .find(|t| t.path.as_str().ends_with("golem/sub/more.mcfunction"))
         .map(|t| t.why.clone())
         .unwrap();
     assert!(why.contains("scope name `waves`"), "{why}");
@@ -568,6 +599,210 @@ fn templates_with_conflicting_scope_values_fall_back() {
     assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
     let rep = write::oracle_compare(&ev, &t.path().join("built").join(OUTPUT), &plan);
     assert_eq!(rep.diffs, [], "{rep:?}");
+}
+
+/// A `.lang` and an `.mcfunction` template of one module disagree on a scope name (a nested
+/// `_scope.json` overrides the system's): whichever comes later is frozen from the legacy
+/// output with a note naming the name; the migrated project still builds equal.
+#[test]
+fn lang_and_mcfunction_templates_with_conflicting_scope_fall_back() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, ev) = (t.path().join("proj"), t.path().join("ev"));
+    copy_tree(&fixtures().join("system_template"), &proj);
+    copy_tree(&fixtures().join("system_template.expected"), &ev);
+    let sub = proj.join("data/system_template/golem/sub");
+    std::fs::write(
+        sub.join("_scope.json"),
+        "{\"label\": \"Other\", \"waves\": 5}",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join("more.mcfunction"),
+        "say `eval:label`
+",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join("zz.lang"),
+        "k=`eval:waves`
+",
+    )
+    .unwrap();
+    std::fs::write(ev.join("BP/functions/golem/more.mcfunction"), "say Other").unwrap();
+    std::fs::write(ev.join("RP/texts/zz.lang"), "k=5").unwrap();
+    let log = ev.join("system_template_log.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+    for (out, src) in [
+        ("BP/functions/golem/more.mcfunction", "sub/more.mcfunction"),
+        ("RP/texts/zz.lang", "sub/zz.lang"),
+    ] {
+        l[out] = serde_json::json!({"sources": [
+            {"path": format!("data/system_template/golem/{src}"), "status": "Created."}]});
+    }
+    std::fs::write(&log, l.to_string()).unwrap();
+
+    let p = migrate::detect(&proj).unwrap();
+    let o = MigrateOptions {
+        out: t.path().join("out"),
+        evaluated: Some(ev.clone()),
+        ..Default::default()
+    };
+    let eval = system_template::ingest(&p, &ev).unwrap();
+    let plan = migrate::plan(&p, &eval, &o).unwrap();
+    let c = copies(&plan);
+    // `fr_FR.lang` owns `label = Golem` and `waves = 3`; the nested scope disagrees on both
+    assert!(c.iter().any(|(to, _)| to == "src/golem/fr_FR.lang"));
+    for frozen in [
+        "src/golem/rp/texts/zz.lang",
+        "src/golem/bp/functions/golem/more.mcfunction",
+    ] {
+        let (to, _) = c
+            .iter()
+            .find(|(to, _)| to == frozen)
+            .unwrap_or_else(|| panic!("{frozen}"));
+        assert!(to.contains("/bp/") || to.contains("/rp/"));
+    }
+    assert!(
+        !c.iter()
+            .any(|(to, _)| to == "src/golem/more.mcfunction" || to == "src/golem/zz.lang")
+    );
+    for (src, name) in [("sub/zz.lang", "waves"), ("sub/more.mcfunction", "label")] {
+        let why = plan
+            .report
+            .to_port
+            .iter()
+            .find(|t| t.path.as_str().ends_with(&format!("golem/{src}")))
+            .map(|t| t.why.clone())
+            .unwrap();
+        assert!(why.contains(&format!("scope name `{name}`")), "{why}");
+    }
+
+    migrate::apply(&p, &plan, &o).unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let bo = BuildOptions {
+        out: Some(t.path().join("built")),
+        trusted: true,
+        ..Default::default()
+    };
+    let r = session(bo, &o.out, &runs).build();
+    assert!(errors(&r).is_empty(), "{:?}", r.diagnostics);
+    let rep = write::oracle_compare(&ev, &t.path().join("built").join(OUTPUT), &plan);
+    assert_eq!(rep.diffs, [], "{rep:?}");
+}
+
+/// Lang templates Beacon's build would not accept as the legacy tool wrote them stay frozen
+/// even when the oracle's key-map comparison agrees: a key emitted twice, a single-`#` line;
+/// and a template whose `.lang` merges several sources (the common `en_US.lang`).
+#[test]
+fn lang_templates_that_beacon_would_not_build_or_cannot_attribute_freeze() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, ev) = (t.path().join("proj"), t.path().join("ev"));
+    copy_tree(&fixtures().join("system_template"), &proj);
+    copy_tree(&fixtures().join("system_template.expected"), &ev);
+    let g = proj.join("data/system_template/golem");
+    std::fs::write(
+        g.join("dup.lang"),
+        "for <i 0..2>:
+    k=v
+",
+    )
+    .unwrap();
+    std::fs::write(
+        g.join("hash.lang"),
+        "k=`eval:1`
+#x=y
+",
+    )
+    .unwrap();
+    // the appended-to `en_US.lang` of the fixture (golem created it, ruby appended)
+    std::fs::write(
+        g.join("en_US.lang"),
+        "if <waves>:
+    a=b
+    c=d
+",
+    )
+    .unwrap();
+    // the oracle's key map equals the raw source's (literal keys under `if`): the fragment
+    // split alone would accept it, so the placement must refuse the template
+    std::fs::write(
+        ev.join("RP/texts/en_US.lang"),
+        "a=b
+c=d
+
+item.stf:ruby.name=Ruby
+item.stf:sapphire.name=Sapphire",
+    )
+    .unwrap();
+    std::fs::write(
+        ev.join("RP/texts/dup.lang"),
+        "k=v
+k=v",
+    )
+    .unwrap();
+    std::fs::write(
+        ev.join("RP/texts/hash.lang"),
+        "k=1
+#x=y",
+    )
+    .unwrap();
+    let log = ev.join("system_template_log.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+    for n in ["dup", "hash"] {
+        l[format!("RP/texts/{n}.lang")] = serde_json::json!({"sources": [
+            {"path": format!("data/system_template/golem/{n}.lang"), "status": "Created."}]});
+    }
+    std::fs::write(&log, l.to_string()).unwrap();
+    let p = migrate::detect(&proj).unwrap();
+    let o = MigrateOptions {
+        out: t.path().join("out"),
+        evaluated: Some(ev.clone()),
+        ..Default::default()
+    };
+    let eval = system_template::ingest(&p, &ev).unwrap();
+    let plan = migrate::plan(&p, &eval, &o).unwrap();
+    let why = |name: &str| {
+        plan.report
+            .to_port
+            .iter()
+            .find(|t| t.path.as_str().ends_with(name))
+            .map(|t| t.why.clone())
+            .unwrap_or_else(|| panic!("no to_port for {name}"))
+    };
+    assert!(
+        why("golem/dup.lang").contains("defined twice"),
+        "{}",
+        why("golem/dup.lang")
+    );
+    assert!(
+        why("golem/hash.lang").contains("single `#`"),
+        "{}",
+        why("golem/hash.lang")
+    );
+    assert!(
+        why("golem/en_US.lang").contains("merges 2 source(s) or a base file"),
+        "{}",
+        why("golem/en_US.lang")
+    );
+    let c = copies(&plan);
+    assert!(
+        !c.iter()
+            .any(|(to, _)| to == "src/golem/dup.lang" || to == "src/golem/hash.lang")
+    );
+    // placement: the merged lang is pre-merged, the template is not copied live
+    assert!(!c.iter().any(|(_, from)| from.ends_with("golem/en_US.lang")));
+    assert!(
+        c.iter()
+            .any(|(to, f)| to == "src/_merged/rp/texts/en_US.lang" && f == "<write>")
+    );
+    assert!(
+        plan.report
+            .flattened
+            .iter()
+            .any(|e| e.path == "RP/texts/en_US.lang" && e.why.contains("subfunctions syntax")),
+        "{:?}",
+        plan.report.flattened
+    );
 }
 
 /// `UNPACK:SUBFUNCTION` whose output folder repeats the file stem in the path

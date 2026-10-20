@@ -91,7 +91,15 @@ impl Client {
     }
 
     fn start_as(document_changes: bool, trust: bool) -> Client {
+        Client::start_with(document_changes, trust, &[])
+    }
+
+    /// `extra`: files added to the project copy before the daemon starts.
+    fn start_with(document_changes: bool, trust: bool, extra: &[(&str, &str)]) -> Client {
         let (ws, dir) = copy_fixture();
+        for (rel, text) in extra {
+            fs::write(dir.join(rel), text).unwrap();
+        }
         let run = tempfile::tempdir().unwrap();
         let opts = daemon::DaemonOptions {
             project: dir.clone(),
@@ -464,6 +472,44 @@ fn ids_in_a_template_resolve_through_its_source_and_a_broken_buffer_recovers() {
     c.change(CONVOY, 3, &src);
     assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
     assert_eq!(c.references(at, false).len(), 13);
+    c.shutdown();
+}
+
+const LANG_TPL: &str = "src/vehicles/texts/en_gb.lang";
+
+#[test]
+fn a_key_in_a_lang_template_is_found_and_renamed_at_its_source() {
+    let src = "item.spawn_egg.entity.demo:car.name=Car `eval:1`
+";
+    let mut c = Client::start_with(false, false, &[(LANG_TPL, src)]);
+    let at = c.at(CAR, "demo:car", 0, 0);
+    let uses = c.references(at.clone(), false);
+    let hits: Vec<_> = uses
+        .iter()
+        .map(|l| slice_of(&c.root, l, &[]))
+        .filter(|(rel, _)| rel == LANG_TPL)
+        .collect();
+    assert_eq!(hits, vec![(LANG_TPL.to_owned(), "demo:car".to_owned())]);
+    assert_eq!(uses.len(), 14);
+    // an open buffer re-expands; a broken one drops the key
+    c.open(LANG_TPL, 1, src);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    assert_eq!(c.references(at.clone(), false).len(), 14);
+    c.change(
+        LANG_TPL,
+        2,
+        &format!(
+            "{src}  x=y
+"
+        ),
+    );
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    assert_eq!(c.references(at.clone(), false).len(), 13);
+    c.change(LANG_TPL, 3, src);
+    assert_eq!(c.call("workspace/nope", json!({})).unwrap_err().0, -32601);
+    let edit = c.rename(at, "demo:truck").unwrap();
+    let text = edit.to_string();
+    assert!(text.contains(&c.uri(LANG_TPL)), "{text}");
     c.shutdown();
 }
 
