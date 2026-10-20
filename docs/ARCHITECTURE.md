@@ -1554,6 +1554,12 @@ Text generation for `.mcfunction` ([BACKLOG B10](BACKLOG.md)), built-in and data
   `in/and/or/not`, the method allowlist (`startswith`, `endswith`, `capitalize`, `upper`,
   `lower`) and f-strings. **Still not**: `foreach` over a dict (frozen with a reason; no key
   order guarantee), scopes computed in `_map.py`, `functiontree` / `UNPACK:HERE`, `assert`, `>`.
+  Measured on the local production copies after slice 2 (same results: Dimension-Clash 0
+  diffs, The-Great-Adventure 1 cosmetic diff per edition, `check` ~0.9 s and `build` ~1.0 s warm
+  on 2942 files): **none of the 14 `.lang` templates of The-Great-Adventure translate**, because
+  each one feeds a merged `RP/texts/<lang>.lang` (35 sources for en_US) and migrate cannot tell
+  one source's expansion from the others, so they stay frozen. Translating them needs per-source
+  attribution inside a merged lang output (open, BACKLOG B10).
 - Found and fixed on the way: a quadratic command-kind scan in `symbols.rs` (one 640 KB
   `.mcfunction` line took ~140 s from an untrusted project) is now linear.
 

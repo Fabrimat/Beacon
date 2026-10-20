@@ -100,7 +100,7 @@ Via protocol, not embedding (both upstreams appear to be GPL-3.0, to verify). Pl
 
 ## B10. Text generation for non-JSON, non-TS files (needed)
 
-**Status: slice 1 built (ARCHITECTURE 14.6): `.mcfunction`, built-in expander, symbols and migrate. Slice 2 (`.lang`, `if`, methods, f-strings) pending.** Needed, not speculative. Requested by the team on 2026-10-19 after the phase-3
+**Status: slices 1 and 2 built (ARCHITECTURE 14.6): `.mcfunction` and `.lang` expander, `if`/comparisons/methods/f-strings, symbols, migrate. Open: migrating `.lang` templates that feed a merged output (per-source attribution), dict `foreach`, `_map.py` computed scopes.** Needed, not speculative. Requested by the team on 2026-10-19 after the phase-3
 migrations. A way to *generate* `.mcfunction`, `.lang` and other text files from compact
 source, the way the subfunctions / system_template text templating did: loops
 (`for <i 1..11 1>:`), inline expressions (`eval:`), nested function definitions, function
