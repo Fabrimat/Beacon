@@ -66,6 +66,11 @@ Review notes, required if revived:
 - In-game chat, coordinates, and other players' names are inside the window.
 - ScreenCaptureKit permission is broader than one window on older macOS.
 - Default to text state (inspector); pixels are the exception.
+- Clean view before every capture or game check (user requirement, 2026-11-06): if the world is
+  paused (pause menu) or the chat is open, the software closes it first (Esc), then captures, so
+  frames are never a menu or a chat box. A check that needs the chat (the `<namespace> loaded`
+  line) reads it first, then closes it. Needs the same input channel as the inspector (B4); no
+  such channel exists yet, so Play today does not touch the game window.
 
 ## B4. Game inspector
 
