@@ -46,6 +46,7 @@
       "additionalProperties": { "enum": ["error", "skip", "merge"] },
       "description": "Module-relative glob -> merge policy; overrides onConflict."
     },
-    "autoTextures": { "type": "boolean", "default": true, "description": "Derive texture entries from sibling pngs." }
+    "autoTextures": { "type": "boolean", "default": true, "description": "Derive texture entries from sibling pngs." },
+    "scriptSources": { "type": "boolean", "default": false, "description": "The module holds game-script sources and the data they import: only .ts/.js files are used (entries, bundle); every other file is left unrouted, no convention rule, no warning." }
   }
 }

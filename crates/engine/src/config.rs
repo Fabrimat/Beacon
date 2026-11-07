@@ -352,6 +352,11 @@ pub struct ModuleJson {
     /// Derive `item_texture.json` / `terrain_texture.json` entries from sibling pngs.
     #[serde(default = "yes")]
     pub auto_textures: bool,
+    /// Game-script sources plus the data files they import (`migrate` writes it for
+    /// `src/_scripts`): only `.ts` / `.js` take part in routing; any other file is left alone,
+    /// so a script's `import x from "./a.json"` keeps resolving without shipping `a.json`.
+    #[serde(default)]
+    pub script_sources: bool,
 }
 
 impl Default for ModuleJson {

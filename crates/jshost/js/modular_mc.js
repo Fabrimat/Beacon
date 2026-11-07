@@ -53,6 +53,64 @@
   const basename = (p) => { p = trim(p); return p.slice(p.lastIndexOf("/") + 1); };
   const extname = (p) => { const b = basename(p), i = b.lastIndexOf("."); return i <= 0 ? "" : b.slice(i); };
 
+  // ---- `URL` and `Deno.{readDirSync,readTextFileSync}`: file: URLs rooted at the project
+  // (`import.meta.url` = `file:///<module path>`), resolution may not leave that root.
+  class URL {
+    constructor(input, base) {
+      input = String(input);
+      let path;
+      if (/^file:\/\//i.test(input)) path = input.replace(/^file:\/\/[^/]*/i, "");
+      else if (/^[a-z][a-z0-9+.-]*:/i.test(input)) throw new TypeError(`Invalid URL: ${input}`);
+      else {
+        if (base === undefined) throw new TypeError(`Invalid URL: ${input}`);
+        const bp = new URL(base).pathname;
+        path = input.startsWith("/") ? input : bp.slice(0, bp.lastIndexOf("/") + 1) + input;
+      }
+      path = path.replace(/[?#].*$/, "");
+      const out = [];
+      for (const s of path.split("/")) {
+        if (s === "" || s === ".") continue;
+        if (s !== "..") { out.push(s); continue; }
+        if (!out.length) throw new RangeError(`URL escapes the project root: ${input}`);
+        out.pop();
+      }
+      const last = path.slice(path.lastIndexOf("/") + 1);
+      const dir = path.endsWith("/") || last === "." || last === ".." || !out.length;
+      this.pathname = "/" + out.join("/") + (dir && out.length ? "/" : "");
+      this.protocol = "file:";
+      this.href = "file://" + this.pathname;
+    }
+    toString() { return this.href; }
+    toJSON() { return this.href; }
+  }
+  globalThis.URL = URL;
+  const hostPath = (p) => {
+    if (p instanceof URL) p = p.pathname;
+    else if (typeof p !== "string") throw new TypeError("expected a path or URL");
+    else if (/^file:/i.test(p)) p = new URL(p).pathname;
+    try { return decodeURIComponent(p); } catch { return p; }
+  };
+  const deno = {
+    readDirSync(p) {
+      p = hostPath(p);
+      const names = H.listDir(p);
+      if (!names.length && !H.exists(p)) throw new Error(`No such directory: ${p}`);
+      return names.map((n) => {
+        const isDirectory = n.endsWith("/");
+        return { name: isDirectory ? n.slice(0, -1) : n, isFile: !isDirectory, isDirectory, isSymlink: false };
+      }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    },
+    readTextFileSync(p) {
+      p = hostPath(p);
+      const t = H.readText(p);
+      if (t === null) throw new Error(`Not valid UTF-8: ${p}`);
+      return t;
+    },
+  };
+  globalThis.Deno = new Proxy(Object.freeze(deno), {
+    get: (t, k) => { if (k in t) return t[k]; throw new Error(`Deno.${String(k)} is not supported by Beacon`); },
+  });
+
   // ---- JSONC (comments and trailing commas), string-aware
   const jsonc = (text) => {
     let o = "", i = 0;

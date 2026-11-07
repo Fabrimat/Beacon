@@ -155,6 +155,7 @@ pub fn evaluate_modular_mc(
                     let js = closure.mods[p.as_str()].0.as_str();
                     let d = Module::declare(c.clone(), p.as_str(), js)?;
                     d.meta()?.set("main", false)?;
+                    d.meta()?.set("url", format!("file:///{p}"))?;
                     let (m, pr) = d.eval()?;
                     pr.finish::<()>()?;
                     let f: Function = mmc.get(f)?;
@@ -266,6 +267,7 @@ impl Loader for Wrap {
     ) -> rquickjs::Result<Module<'js>> {
         let m = Fs(self.0.clone()).load(c, name, a)?;
         m.meta()?.set("main", false)?; // Deno: only the entry module has `import.meta.main`
+        m.meta()?.set("url", format!("file:///{name}"))?;
         Ok(m)
     }
 }

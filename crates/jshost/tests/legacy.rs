@@ -209,7 +209,7 @@ fn one_map(map: &str, extra: &[(&str, &[u8])]) -> tempfile::TempDir {
 
 #[test]
 fn deno_reference_is_unsupported() {
-    let d = one_map("export const MAP = Deno.readTextFileSync('x');", &[]);
+    let d = one_map("export const MAP = Deno.writeTextFileSync('x', 'y');", &[]);
     let ev = eval_at(d.path(), "data", &[], migrate_limits());
     assert_eq!(ev.diagnostics.len(), 1, "{:?}", ev.diagnostics);
     assert_eq!(ev.diagnostics[0].code, Code::MigrateUnsupported);
@@ -218,7 +218,11 @@ fn deno_reference_is_unsupported() {
             .message
             .contains("data/modular_mc/m/_map.ts")
     );
-    assert!(ev.diagnostics[0].message.contains("Deno"));
+    assert!(
+        ev.diagnostics[0].message.contains("Deno"),
+        "{:?}",
+        ev.diagnostics
+    );
 }
 
 #[test]
@@ -503,4 +507,58 @@ fn stop_entries_apply_before_the_rest_of_their_map() {
     assert_eq!(o.body, Body::Passthrough(rel("data/modular_mc/m/new.txt")));
     let applied: Vec<_> = o.contributors.iter().map(|c| c.applied).collect();
     assert_eq!(applied, [Applied::Created, Applied::Overwrote]);
+}
+
+#[test]
+fn url_and_deno_read_shims_walk_the_project() {
+    let d = one_map(
+        r#"
+const ROOT = new URL("./RP/", import.meta.url);
+const MAP: any[] = [];
+function walk(rel: string) {
+  const url = new URL(rel === "" ? "." : rel + "/", ROOT);
+  for (const e of Deno.readDirSync(url)) {
+    if (e.isDirectory) {
+      MAP.push({ source: "s.txt", target: `BP/${rel}${e.name}.txt` });
+      walk(rel + e.name + "/");
+    }
+  }
+}
+walk("");
+let extra = "fallback";
+try { extra = JSON.parse(Deno.readTextFileSync(new URL("../../git_metadata/meta.json", import.meta.url))).v; } catch { MAP.push({ source: "s.txt", target: "BP/fell_back.txt" }); }
+export { MAP };
+"#,
+        &[
+            ("data/modular_mc/m/s.txt", b"s"),
+            ("data/modular_mc/m/RP/a/x.txt", b"1"),
+            ("data/modular_mc/m/RP/a/b/y.txt", b"2"),
+            ("data/modular_mc/m/RP/c/z.txt", b"3"),
+        ],
+    );
+    let ev = eval_at(d.path(), "data", &[], migrate_limits());
+    assert!(ev.diagnostics.is_empty(), "{:?}", ev.diagnostics);
+    assert_eq!(
+        ev.outputs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["BP/a.txt", "BP/a/b.txt", "BP/c.txt", "BP/fell_back.txt"]
+    );
+}
+
+#[test]
+fn url_and_deno_cannot_leave_the_root() {
+    for js in [
+        r#"new URL("../../../..", import.meta.url)"#,
+        r#"new URL("file:///../x")"#,
+        r#"Deno.readDirSync("../")"#,
+        r#"Deno.readDirSync(new URL("../../../../", import.meta.url))"#,
+        r#"Deno.readTextFileSync("../outside.txt")"#,
+        r#"Deno.readTextFileSync("C:/Windows/win.ini")"#,
+        r#"Deno.readDirSync("data/modular_mc/m/nope")"#,
+        r#"Deno.readDirSync("node_modules")"#,
+        r#"new URL("http://example.com/")"#,
+    ] {
+        let d = one_map(&format!("{js}; export const MAP = [];"), &[]);
+        let ev = eval_at(d.path(), "data", &[], migrate_limits());
+        assert_eq!(ev.diagnostics.len(), 1, "{js}: {:?}", ev.diagnostics);
+    }
 }

@@ -450,6 +450,9 @@ fn route_module(
             push_item(r, file, module, output, pack, rest, policy(Merge::Error));
             continue;
         }
+        if mj.script_sources && !(fname.ends_with(".ts") || fname.ends_with(".js")) {
+            continue;
+        }
         let routed = match paths.iter().find(|(g, ..)| g.is_match(rel)) {
             Some((_, pack, dir)) => Some((*pack, format!("{dir}/{fname}"), policy(Merge::Error))),
             None => route_file(name, namespace, rel).map(|(p, d, m)| (p, d, policy(m))),

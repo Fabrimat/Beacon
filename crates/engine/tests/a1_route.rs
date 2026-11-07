@@ -262,3 +262,19 @@ fn on_conflict_merge_only_for_json_and_lang() {
     assert_eq!(m("en.lang"), Merge::LangLines);
     assert_eq!(m("s.ogg"), Merge::Error);
 }
+
+#[test]
+fn script_sources_leave_data_files_unrouted_and_silent() {
+    let (_d, cfg, idx) = project(&[
+        ("src/_s/module.json", r#"{"scriptSources":true}"#),
+        ("src/_s/a/hub.dialogue.json", "{}"),
+        ("src/_s/a/data.arena.json", "{}"),
+        ("src/_s/a/tool.mjs", ""),
+        ("src/_s/a/code.ts", ""),
+        ("src/_s/scripts/main.ts", ""),
+    ]);
+    let r = route(&cfg, &idx);
+    assert!(r.items.is_empty(), "{:?}", r.items);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert_eq!(r.script_entries.values().map(Vec::len).sum::<usize>(), 1);
+}

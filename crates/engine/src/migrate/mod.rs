@@ -369,6 +369,21 @@ pub fn detect(root: &Path) -> Result<LegacyProject, Vec<Diagnostic>> {
             path.display()
         )));
     }
+    // Both defined: a definition no profile runs is a leftover, not part of the project
+    // (Blue Planet keeps `system_template` defined with its data folder emptied out).
+    let kinds = if kinds.len() > 1 {
+        let run = |k: &LegacyKind| {
+            config.regolith.profiles.values().any(|p| {
+                p.filters
+                    .iter()
+                    .any(|f| f.filter.as_deref() == Some(k.filter_name()))
+            })
+        };
+        let used: Vec<LegacyKind> = kinds.iter().copied().filter(run).collect();
+        if used.is_empty() { kinds } else { used }
+    } else {
+        kinds
+    };
     let data = config
         .regolith
         .data_path
@@ -435,6 +450,34 @@ mod tests {
             ".modular_mc/main.js"
         );
         assert!(p.config.extra.contains_key("$schema"));
+    }
+
+    #[test]
+    fn a_defined_but_never_run_filter_is_not_a_kind() {
+        let dir = std::env::temp_dir().join(format!("beacon-detect-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let cfg = |profiles: &str| {
+            format!(
+                r#"{{"regolith":{{"dataPath":"./data","filterDefinitions":{{"modular_mc":{{}},"system_template":{{}}}},"profiles":{profiles}}}}}"#
+            )
+        };
+        let run = |profiles: &str| {
+            std::fs::write(dir.join("config.json"), cfg(profiles)).unwrap();
+            detect(&dir).unwrap().kinds
+        };
+        assert_eq!(
+            run(r#"{"p":{"filters":[{"filter":"modular_mc"}]}}"#),
+            [LegacyKind::ModularMc]
+        );
+        assert_eq!(
+            run(r#"{"p":{"filters":[{"filter":"modular_mc"},{"filter":"system_template"}]}}"#),
+            [LegacyKind::ModularMc, LegacyKind::SystemTemplate]
+        );
+        assert_eq!(
+            run(r#"{}"#),
+            [LegacyKind::ModularMc, LegacyKind::SystemTemplate]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

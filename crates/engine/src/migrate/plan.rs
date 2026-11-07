@@ -44,6 +44,32 @@ pub const OUTPUT: &str = "main";
 const RESERVED: [&str; 4] = ["_base", "_merged", "_scripts", "_generated"];
 const CODE_EXT: [&str; 6] = [".ts", ".js", ".mjs", ".cjs", ".mts", ".cts"];
 
+/// The relative `.json` module specifiers of a script (`from "./a.json"`, `import "./a.json"`,
+/// `import("./a.json")`).
+fn json_specifiers(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    for q in ['"', '\''] {
+        let end = format!(".json{q}");
+        let mut at = 0;
+        while let Some(i) = text[at..].find(&end) {
+            let stop = at + i + ".json".len();
+            at = stop + 1;
+            let Some(open) = text[..stop].rfind(q) else {
+                continue;
+            };
+            let spec = &text[open + 1..stop];
+            let before = text[..open].trim_end().trim_end_matches('(').trim_end();
+            if (spec.starts_with("./") || spec.starts_with("../"))
+                && !spec.contains('\n')
+                && (before.ends_with("from") || before.ends_with("import"))
+            {
+                out.push(spec.to_owned());
+            }
+        }
+    }
+    out
+}
+
 fn rel(s: &str) -> RelPath {
     RelPath::parse(s).expect("static path")
 }
@@ -975,6 +1001,41 @@ impl Planner<'_> {
         (replaced, stand_ins)
     }
 
+    /// JSON files the game scripts import (`import x from "./a.json"`), resolved against the
+    /// importing file: data the maps never export but the bundle needs, so they travel with the
+    /// scripts under `src/_scripts/` (the relative paths keep working).
+    fn imported_json(&self, code: &[RelPath]) -> BTreeSet<RelPath> {
+        let known: BTreeSet<&RelPath> = self.idx.files().into_iter().collect();
+        let mut out = BTreeSet::new();
+        for f in code {
+            let Some(text) = self.read(f).and_then(|b| String::from_utf8(b).ok()) else {
+                continue;
+            };
+            for spec in json_specifiers(&text) {
+                let dir = f
+                    .parent()
+                    .map(|p| p.as_str().to_owned())
+                    .unwrap_or_default();
+                let mut parts: Vec<&str> = dir.split('/').filter(|x| !x.is_empty()).collect();
+                for seg in spec.split('/') {
+                    match seg {
+                        "." | "" => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        s => parts.push(s),
+                    }
+                }
+                if let Ok(to) = RelPath::parse(&parts.join("/"))
+                    && known.contains(&to)
+                {
+                    out.insert(to);
+                }
+            }
+        }
+        out
+    }
+
     /// Script sources under `src/_scripts/` (data-dir layout) and the barrel.
     fn scripts(&mut self, data: &RelPath) -> bool {
         let mut barrel = String::new();
@@ -998,6 +1059,8 @@ impl Planner<'_> {
                 .cloned()
                 .chain(self.eval.scripts.iter().cloned())
                 .collect();
+            let json = self.imported_json(&code);
+            let code: Vec<RelPath> = code.into_iter().chain(json).collect();
             for f in code {
                 match mirror(&f) {
                     Some(to) => {
@@ -1442,7 +1505,23 @@ pub(super) fn plan(
             serde_json::from_slice(&strip_comments(b)).ok()
         })
     };
-    let (bpm, rpm) = (read_manifest(0), read_manifest(1));
+    // A manifest a Regolith filter generates (`generate_manifest`) is not in the sources: with
+    // `--oracle`, a legacy manifest without identity is replaced by the built one, so the
+    // lockfile keeps the shipped UUIDs.
+    let with_identity = |i: usize| -> Option<Value> {
+        let m = read_manifest(i);
+        if m.as_ref().is_some_and(|m| m["header"]["uuid"].is_string()) {
+            return m;
+        }
+        let built = opts.oracle.as_ref().and_then(|o| {
+            let b = std::fs::read(o.join(["BP", "RP"][i]).join("manifest.json")).ok()?;
+            let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&b);
+            let built: Value = serde_json::from_slice(&strip_comments(b)).ok()?;
+            built["header"]["uuid"].is_string().then_some(built)
+        });
+        built.or(m)
+    };
+    let (bpm, rpm) = (with_identity(0), with_identity(1));
     let (targets, tdiags) = map_profiles(&project.config, Some(&project.root));
     let editions: BTreeSet<&str> = targets
         .as_object()
@@ -1712,6 +1791,9 @@ pub(super) fn plan(
         }
         // registries come from the migrated files, never derived from sibling textures
         mj.insert("autoTextures".into(), json!(false));
+        if m == "_scripts" {
+            mj.insert("scriptSources".into(), json!(true));
+        }
         if let Ok(to) = RelPath::parse(&format!("src/{m}/module.json")) {
             let body = Body::Json(Value::Object(mj));
             let change = Change::Write {
@@ -2835,6 +2917,14 @@ pub fn render_report(r: &Report, notes: &[Diagnostic]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_specifiers_are_the_relative_json_imports() {
+        let t = "import a from \"./a.json\";\nimport b from '../b.json'\nconst c = await import(\"../../c.json\");\nimport \"./d.json\";\nimport e from \"pkg/e.json\";\nconst s = \"./not_an_import.json\";\n";
+        let mut got = json_specifiers(t);
+        got.sort();
+        assert_eq!(got, ["../../c.json", "../b.json", "./a.json", "./d.json"]);
+    }
 
     #[test]
     fn det_uuid_is_v4_shaped_and_stable() {
